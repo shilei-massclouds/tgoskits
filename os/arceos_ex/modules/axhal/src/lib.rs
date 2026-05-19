@@ -11,11 +11,14 @@ pub use ax_cpu::asm;
 #[cfg(all(target_os = "none", target_arch = "riscv64", feature = "defplat"))]
 extern crate ax_plat_riscv64_generic;
 
+pub mod boot;
 pub mod console {
     pub use ax_plat::console::{read_bytes, write_bytes, write_text_bytes};
 }
 
 pub mod checkpoint;
+#[cfg(target_arch = "riscv64")]
+mod entry;
 pub mod mem;
 
 pub mod power {

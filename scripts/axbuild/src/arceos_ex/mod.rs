@@ -16,6 +16,7 @@ const DEFAULT_ARCH: &str = "riscv64";
 const DEFAULT_TEST_GROUP: &str = "std";
 const OVERLAY_MANIFEST_ENV: &str = "AXBUILD_WORKSPACE_MANIFEST";
 const DEFAULT_PLATFORM_ENV: &str = "AXBUILD_DEFAULT_PLATFORM_PACKAGE_RISCV64";
+const CHECKPOINT_SBI_CHAR_ENV: &str = "ARCEOS_EX_CHECKPOINT_SBI_CHAR";
 const GENERIC_PLATFORM_PACKAGE: &str = "ax-plat-riscv64-generic";
 const GENERIC_PLATFORM_PATH: &str = "components/axplat_crates/platforms/axplat-riscv64-generic";
 
@@ -293,6 +294,17 @@ fn patch_workspace_dependencies(manifest: &mut toml::Value) -> anyhow::Result<()
         GENERIC_PLATFORM_PACKAGE.to_string(),
         path_dependency("0.1.0", GENERIC_PLATFORM_PATH),
     );
+    if env_flag(CHECKPOINT_SBI_CHAR_ENV) {
+        dependencies.insert(
+            "ax-hal".to_string(),
+            path_dependency_with_package_features(
+                "ax-hal-ex",
+                "0.1.0",
+                "os/arceos_ex/modules/axhal",
+                &["checkpoint-sbi-char"],
+            ),
+        );
+    }
     Ok(())
 }
 
@@ -316,4 +328,35 @@ fn path_dependency_with_package(package: &str, version: &str, path: &str) -> tom
         toml::Value::String(package.to_string()),
     );
     toml::Value::Table(table)
+}
+
+fn path_dependency_with_package_features(
+    package: &str,
+    version: &str,
+    path: &str,
+    features: &[&str],
+) -> toml::Value {
+    let mut table = match path_dependency_with_package(package, version, path) {
+        toml::Value::Table(table) => table,
+        _ => unreachable!(),
+    };
+    table.insert(
+        "features".to_string(),
+        toml::Value::Array(
+            features
+                .iter()
+                .map(|feature| toml::Value::String((*feature).to_string()))
+                .collect(),
+        ),
+    );
+    toml::Value::Table(table)
+}
+
+fn env_flag(key: &str) -> bool {
+    env::var_os(key).is_some_and(|value| {
+        matches!(
+            value.to_string_lossy().trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "y" | "on"
+        )
+    })
 }
