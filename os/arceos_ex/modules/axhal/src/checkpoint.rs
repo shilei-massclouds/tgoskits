@@ -7,6 +7,10 @@
 #[repr(u8)]
 pub enum Checkpoint {
     BootArgsReady = b'A',
+    InterruptStreamPrepared = b'1',
+    KernelImagePrepared = b'2',
+    RootStreamPrepared = b'3',
+    KernelImageReady = b'4',
     BootCpuPrepared = b'B',
     RawDtbReady = b'C',
     EarlyVmReady = b'D',

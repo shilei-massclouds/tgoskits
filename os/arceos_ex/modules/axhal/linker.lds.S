@@ -13,7 +13,8 @@ SECTIONS
 
     .text : AT(ADDR(.text) - LOAD_OFFSET) ALIGN(4K) {
         _stext = .;
-        KEEP(*(.text.boot))
+        KEEP(*(.text.boot.entry))
+        KEEP(*(.text.boot .text.boot.*))
         *(.text .text.*)
         . = ALIGN(4K);
         _etext = .;
@@ -40,9 +41,11 @@ SECTIONS
     .data : AT(ADDR(.data) - LOAD_OFFSET) ALIGN(4K) {
         _sdata = .;
         *(.data.boot_page_table)
+        KEEP(*(.data.boot_args))
         . = ALIGN(4K);
-        *(.data .data.*)
+        __global_pointer$ = . + 0x800;
         *(.sdata .sdata.*)
+        *(.data .data.*)
         *(.got .got.*)
 
         . = ALIGN(0x10);

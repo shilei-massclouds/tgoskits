@@ -1,7 +1,12 @@
-use core::sync::atomic::{AtomicUsize, Ordering};
+const BOOT_ARG_UNSET: usize = usize::MAX;
 
-static BOOT_HARTID: AtomicUsize = AtomicUsize::new(0);
-static DTB_PA: AtomicUsize = AtomicUsize::new(0);
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".data.boot_args")]
+pub static mut __arceos_ex_boot_hartid: usize = BOOT_ARG_UNSET;
+
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".data.boot_args")]
+pub static mut __arceos_ex_dtb_pa: usize = BOOT_ARG_UNSET;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BootArgs {
@@ -19,13 +24,17 @@ impl BootArgs {
 }
 
 pub fn init_boot_args(boot_hartid: usize, dtb_pa: usize) {
-    BOOT_HARTID.store(boot_hartid, Ordering::Relaxed);
-    DTB_PA.store(dtb_pa, Ordering::Relaxed);
+    unsafe {
+        core::ptr::write_volatile(&raw mut __arceos_ex_boot_hartid, boot_hartid);
+        core::ptr::write_volatile(&raw mut __arceos_ex_dtb_pa, dtb_pa);
+    }
 }
 
 pub fn boot_args() -> BootArgs {
-    BootArgs::new(
-        BOOT_HARTID.load(Ordering::Relaxed),
-        DTB_PA.load(Ordering::Relaxed),
-    )
+    unsafe {
+        BootArgs::new(
+            core::ptr::read_volatile(&raw const __arceos_ex_boot_hartid),
+            core::ptr::read_volatile(&raw const __arceos_ex_dtb_pa),
+        )
+    }
 }
