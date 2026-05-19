@@ -120,7 +120,6 @@ impl OverlayWorkspace {
             ".cargo",
             "components",
             "drivers",
-            "os",
             "platform",
             "scripts",
             "test-suit",
@@ -128,6 +127,7 @@ impl OverlayWorkspace {
         ] {
             link_dir(workspace_root, &overlay_root, entry)?;
         }
+        prepare_os_overlay(workspace_root, &overlay_root)?;
         write_overlay_manifest(workspace_root, &overlay_root)?;
         Ok(Self {
             manifest_path: overlay_root.join("Cargo.toml"),
@@ -152,8 +152,12 @@ fn link_dir(workspace_root: &Path, overlay_root: &Path, name: &str) -> anyhow::R
         return Ok(());
     }
     let target = overlay_root.join(name);
+    link_path(&source, &target)
+}
+
+fn link_path(source: &Path, target: &Path) -> anyhow::Result<()> {
     #[cfg(unix)]
-    std::os::unix::fs::symlink(&source, &target).with_context(|| {
+    std::os::unix::fs::symlink(source, target).with_context(|| {
         format!(
             "failed to symlink {} -> {}",
             target.display(),
@@ -161,13 +165,74 @@ fn link_dir(workspace_root: &Path, overlay_root: &Path, name: &str) -> anyhow::R
         )
     })?;
     #[cfg(windows)]
-    std::os::windows::fs::symlink_dir(&source, &target).with_context(|| {
-        format!(
-            "failed to symlink {} -> {}",
-            target.display(),
-            source.display()
-        )
-    })?;
+    {
+        if source.is_dir() {
+            std::os::windows::fs::symlink_dir(source, target)
+        } else {
+            std::os::windows::fs::symlink_file(source, target)
+        }
+        .with_context(|| {
+            format!(
+                "failed to symlink {} -> {}",
+                target.display(),
+                source.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn prepare_os_overlay(workspace_root: &Path, overlay_root: &Path) -> anyhow::Result<()> {
+    let source = workspace_root.join("os");
+    if !source.exists() {
+        return Ok(());
+    }
+
+    let target = overlay_root.join("os");
+    fs::create_dir_all(&target)
+        .with_context(|| format!("failed to create {}", target.display()))?;
+    link_children_except(&source, &target, &["arceos"])?;
+    prepare_arceos_overlay(&source.join("arceos"), &target.join("arceos"))
+}
+
+fn prepare_arceos_overlay(source: &Path, target: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(target).with_context(|| format!("failed to create {}", target.display()))?;
+    link_children_except(source, target, &["ulib"])?;
+    prepare_arceos_ulib_overlay(&source.join("ulib"), &target.join("ulib"))
+}
+
+fn prepare_arceos_ulib_overlay(source: &Path, target: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(target).with_context(|| format!("failed to create {}", target.display()))?;
+    link_children_except(source, target, &["arceos-rust"])?;
+    prepare_arceos_rust_overlay(&source.join("arceos-rust"), &target.join("arceos-rust"))
+}
+
+fn prepare_arceos_rust_overlay(source: &Path, target: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(target).with_context(|| format!("failed to create {}", target.display()))?;
+    link_children_except(source, target, &["lib"])?;
+    prepare_real_dir_with_links(&source.join("lib"), &target.join("lib"))
+}
+
+fn prepare_real_dir_with_links(source: &Path, target: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(target).with_context(|| format!("failed to create {}", target.display()))?;
+    link_children_except(source, target, &[])
+}
+
+fn link_children_except(source: &Path, target: &Path, excluded: &[&str]) -> anyhow::Result<()> {
+    for entry in
+        fs::read_dir(source).with_context(|| format!("failed to read {}", source.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read entry in {}", source.display()))?;
+        let name = entry.file_name();
+        if excluded
+            .iter()
+            .any(|excluded| name.to_string_lossy() == *excluded)
+        {
+            continue;
+        }
+        link_path(&entry.path(), &target.join(name))?;
+    }
     Ok(())
 }
 

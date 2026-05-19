@@ -31,3 +31,6 @@ vsock = ["net-ng"]
 
 [dependencies]
 ax-hal = { workspace = true }
+ax-log = { workspace = true }
+ax-plat = { workspace = true }
+ax-crate-interface = { workspace = true }
