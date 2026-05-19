@@ -79,12 +79,16 @@ pub struct AppContext {
 
 impl AppContext {
     pub(crate) fn new() -> anyhow::Result<Self> {
+        Self::new_with_tool_config(ToolConfig::default())
+    }
+
+    pub(crate) fn new_with_tool_config(tool_config: ToolConfig) -> anyhow::Result<Self> {
         let workspace_root = find_workspace_root();
         crate::support::logging::init_logging(&workspace_root)?;
 
         info!("Workspace root: {}", workspace_root.display());
 
-        let tool = Tool::new(ToolConfig::default()).context("failed to initialize ostool")?;
+        let tool = Tool::new(tool_config).context("failed to initialize ostool")?;
         Ok(Self {
             tool,
             build_config_path: None,

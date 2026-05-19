@@ -3,9 +3,10 @@
 
 use clap::{Args, Parser, Subcommand};
 
-use crate::{arceos::ArceOS, axvisor::Axvisor, starry::Starry};
+use crate::{arceos::ArceOS, arceos_ex::ArceOSEx, axvisor::Axvisor, starry::Starry};
 
 pub mod arceos;
+pub mod arceos_ex;
 pub mod axvisor;
 mod backtrace;
 mod board;
@@ -78,6 +79,11 @@ enum Commands {
         #[command(subcommand)]
         command: arceos::Command,
     },
+    /// arceos_ex build commands
+    ArceosEx {
+        #[command(subcommand)]
+        command: arceos::Command,
+    },
     /// StarryOS build commands
     Starry {
         #[command(subcommand)]
@@ -100,6 +106,7 @@ async fn run_root_cli(cli: Cli) -> anyhow::Result<()> {
         Commands::Backtrace { command } => backtrace::execute(command),
         Commands::Axvisor { command } => Axvisor::new()?.execute(command).await,
         Commands::Arceos { command } => ArceOS::new()?.execute(command).await,
+        Commands::ArceosEx { command } => ArceOSEx::new()?.execute(command).await,
         Commands::Starry { command } => Starry::new()?.execute(command).await,
     }
 }

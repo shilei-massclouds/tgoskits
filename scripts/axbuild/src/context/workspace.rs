@@ -1,5 +1,6 @@
 use std::{
     collections::HashSet,
+    env,
     path::{Path, PathBuf},
 };
 
@@ -34,7 +35,16 @@ pub(crate) fn find_workspace_root() -> PathBuf {
 }
 
 pub(crate) fn workspace_manifest_path() -> anyhow::Result<PathBuf> {
+    if let Some(path) = workspace_manifest_path_override() {
+        return Ok(path);
+    }
     Ok(workspace_root_path()?.join("Cargo.toml"))
+}
+
+fn workspace_manifest_path_override() -> Option<PathBuf> {
+    env::var_os("AXBUILD_WORKSPACE_MANIFEST")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 pub(crate) fn axbuild_tmp_dir(workspace_root: &Path) -> PathBuf {

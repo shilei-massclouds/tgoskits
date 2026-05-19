@@ -1,0 +1,26 @@
+[package]
+name = "ax-plat-riscv64-generic-ex"
+version = "0.1.0"
+repository = "https://github.com/rcore-os/tgoskits"
+description = "arceos_ex generic RISC-V64 SBI/FDT platform"
+keywords = ["arceos", "os", "hal", "embedded", "riscv"]
+categories = ["embedded", "no-std", "hardware-support", "os"]
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[features]
+default = []
+fp-simd = ["ax-cpu/fp-simd"]
+irq = ["ax-plat/irq"]
+rtc = []
+smp = ["ax-plat/smp"]
+
+[dependencies]
+ax-cpu.workspace = true
+ax-plat.workspace = true
+log.workspace = true
+sbi-rt = { version = "0.0.3", features = ["legacy"] }
+
+[package.metadata.docs.rs]
+targets = ["riscv64gc-unknown-none-elf"]

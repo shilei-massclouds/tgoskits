@@ -1,0 +1,22 @@
+arch = "riscv64"
+platform = "riscv64-generic"
+package = "ax-plat-riscv64-generic-ex"
+
+[plat]
+max-cpu-num = 1
+phys-memory-base = 0x8000_0000
+phys-memory-size = 0x0800_0000
+kernel-base-paddr = 0x8020_0000
+kernel-base-vaddr = "0xffff_ffc0_8020_0000"
+phys-virt-offset = "0xffff_ffc0_0000_0000"
+phys-bus-offset = 0
+kernel-aspace-base = "0xffff_ffc0_0000_0000"
+kernel-aspace-size = "0x0000_003f_ffff_f000"
+boot-stack-size = 0x40000
+
+[devices]
+mmio-ranges = []
+virtio-mmio-ranges = []
+timer-frequency = 10_000_000
+timer-irq = "0x8000_0000_0000_0005"
+ipi-irq = "0x8000_0000_0000_0001"

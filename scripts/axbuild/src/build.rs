@@ -436,7 +436,7 @@ pub(crate) fn prepare_std_build_env(
 ) -> anyhow::Result<()> {
     let arch = target_arch_name(target)?;
     let platform_package = default_platform_package(arch);
-    let platform_config = resolve_platform_config_by_package(platform_package, metadata)?;
+    let platform_config = resolve_platform_config_by_package(&platform_package, metadata)?;
     let out_config = generated_axconfig_path("arceos-rust", target)?;
     generate_axconfig(
         &crate::context::workspace_root_path()?,
@@ -813,7 +813,7 @@ fn resolve_platform_package(
         }
     }
 
-    Ok(default_platform_package(arch).to_string())
+    Ok(default_platform_package(arch))
 }
 
 fn target_arch_name(target: &str) -> anyhow::Result<&'static str> {
@@ -830,14 +830,28 @@ fn target_arch_name(target: &str) -> anyhow::Result<&'static str> {
     }
 }
 
-fn default_platform_package(arch: &str) -> &'static str {
-    match arch {
+fn default_platform_package(arch: &str) -> String {
+    if let Some(platform) = default_platform_package_override(arch) {
+        return platform;
+    }
+    let platform = match arch {
         "x86_64" => "ax-plat-x86-pc",
         "aarch64" => "ax-plat-aarch64-qemu-virt",
         "riscv64" => "ax-plat-riscv64-qemu-virt",
         "loongarch64" => "ax-plat-loongarch64-qemu-virt",
         _ => unreachable!("unsupported arch"),
-    }
+    };
+    platform.to_string()
+}
+
+fn default_platform_package_override(arch: &str) -> Option<String> {
+    let key = format!(
+        "AXBUILD_DEFAULT_PLATFORM_PACKAGE_{}",
+        arch.to_ascii_uppercase()
+    );
+    std::env::var_os(key)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string_lossy().into_owned())
 }
 
 fn explicit_myplat_platform_package(package: &str, arch: &str) -> Option<&'static str> {

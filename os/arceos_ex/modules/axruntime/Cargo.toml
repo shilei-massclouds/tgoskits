@@ -1,0 +1,33 @@
+[package]
+name = "ax-runtime-ex"
+version = "0.1.0"
+repository = "https://github.com/rcore-os/tgoskits"
+edition.workspace = true
+authors.workspace = true
+description = "arceos_ex runtime library"
+license.workspace = true
+
+[features]
+default = []
+alloc = []
+dma = ["paging"]
+buddy-slab = ["alloc"]
+ipi = []
+irq = ["ax-hal/irq"]
+multitask = []
+paging = ["ax-hal/paging"]
+rtc = []
+smp = ["alloc", "ax-hal/smp"]
+tls = ["ax-hal/tls"]
+plat-dyn = ["ax-hal/plat-dyn", "paging", "buddy-slab"]
+ax-driver = []
+display = ["ax-driver"]
+fs = ["ax-driver"]
+fs-ng = ["ax-driver"]
+input = ["ax-driver"]
+net = ["ax-driver"]
+net-ng = ["ax-driver"]
+vsock = ["net-ng"]
+
+[dependencies]
+ax-hal = { workspace = true }

@@ -165,6 +165,10 @@ impl ArceOS {
         Ok(Self { app })
     }
 
+    pub(crate) fn from_app(app: AppContext) -> Self {
+        Self { app }
+    }
+
     pub async fn execute(&mut self, command: Command) -> anyhow::Result<()> {
         match command {
             Command::Build(args) => self.build(args).await,

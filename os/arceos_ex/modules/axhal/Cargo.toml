@@ -1,0 +1,33 @@
+[package]
+name = "ax-hal-ex"
+version = "0.1.0"
+repository = "https://github.com/rcore-os/tgoskits"
+edition.workspace = true
+authors.workspace = true
+description = "arceos_ex hardware abstraction layer"
+license.workspace = true
+
+[features]
+default = []
+smp = ["ax-plat-riscv64-generic-ex?/smp"]
+irq = ["ax-plat-riscv64-generic-ex?/irq"]
+fp-simd = ["ax-cpu/fp-simd", "ax-plat-riscv64-generic-ex?/fp-simd"]
+rtc = ["ax-plat-riscv64-generic-ex?/rtc"]
+paging = []
+tls = ["ax-cpu/tls"]
+uspace = ["paging", "ax-cpu/uspace"]
+hv = ["paging"]
+myplat = []
+plat-dyn = []
+defplat = ["dep:ax-plat-riscv64-generic-ex"]
+ipi = ["irq"]
+starry-kcov = []
+axvisor-linker = []
+
+[dependencies]
+ax-cpu.workspace = true
+ax-plat.workspace = true
+log.workspace = true
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+ax-plat-riscv64-generic-ex = { workspace = true, optional = true }
