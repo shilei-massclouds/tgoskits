@@ -1,6 +1,6 @@
 arch = "riscv64"
 platform = "riscv64-generic"
-package = "ax-plat-riscv64-generic-ex"
+package = "ax-plat-riscv64-generic"
 
 [plat]
 max-cpu-num = 1

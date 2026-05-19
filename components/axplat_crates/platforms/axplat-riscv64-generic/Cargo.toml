@@ -1,8 +1,8 @@
 [package]
-name = "ax-plat-riscv64-generic-ex"
+name = "ax-plat-riscv64-generic"
 version = "0.1.0"
 repository = "https://github.com/rcore-os/tgoskits"
-description = "arceos_ex generic RISC-V64 SBI/FDT platform"
+description = "Generic RISC-V64 SBI/FDT platform"
 keywords = ["arceos", "os", "hal", "embedded", "riscv"]
 categories = ["embedded", "no-std", "hardware-support", "os"]
 edition.workspace = true

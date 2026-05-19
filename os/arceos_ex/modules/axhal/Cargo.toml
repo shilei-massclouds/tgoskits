@@ -9,17 +9,17 @@ license.workspace = true
 
 [features]
 default = []
-smp = ["ax-plat-riscv64-generic-ex?/smp"]
-irq = ["ax-plat-riscv64-generic-ex?/irq"]
-fp-simd = ["ax-cpu/fp-simd", "ax-plat-riscv64-generic-ex?/fp-simd"]
-rtc = ["ax-plat-riscv64-generic-ex?/rtc"]
+smp = ["ax-plat-riscv64-generic?/smp"]
+irq = ["ax-plat-riscv64-generic?/irq"]
+fp-simd = ["ax-cpu/fp-simd", "ax-plat-riscv64-generic?/fp-simd"]
+rtc = ["ax-plat-riscv64-generic?/rtc"]
 paging = []
 tls = ["ax-cpu/tls"]
 uspace = ["paging", "ax-cpu/uspace"]
 hv = ["paging"]
 myplat = []
 plat-dyn = []
-defplat = ["dep:ax-plat-riscv64-generic-ex"]
+defplat = ["dep:ax-plat-riscv64-generic"]
 ipi = ["irq"]
 starry-kcov = []
 axvisor-linker = []
@@ -30,4 +30,4 @@ ax-plat.workspace = true
 log.workspace = true
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
-ax-plat-riscv64-generic-ex = { workspace = true, optional = true }
+ax-plat-riscv64-generic = { workspace = true, optional = true }

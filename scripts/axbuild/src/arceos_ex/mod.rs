@@ -16,7 +16,8 @@ const DEFAULT_ARCH: &str = "riscv64";
 const DEFAULT_TEST_GROUP: &str = "std";
 const OVERLAY_MANIFEST_ENV: &str = "AXBUILD_WORKSPACE_MANIFEST";
 const DEFAULT_PLATFORM_ENV: &str = "AXBUILD_DEFAULT_PLATFORM_PACKAGE_RISCV64";
-const GENERIC_PLATFORM_PACKAGE: &str = "ax-plat-riscv64-generic-ex";
+const GENERIC_PLATFORM_PACKAGE: &str = "ax-plat-riscv64-generic";
+const GENERIC_PLATFORM_PATH: &str = "components/axplat_crates/platforms/axplat-riscv64-generic";
 
 pub struct ArceOSEx {
     arceos: ArceOS,
@@ -194,7 +195,7 @@ fn patch_workspace_members(manifest: &mut toml::Value) -> anyhow::Result<()> {
     for member in [
         "os/arceos_ex/modules/axhal",
         "os/arceos_ex/modules/axruntime",
-        "components/axplat_crates/platforms/axplat-riscv64-generic-ex",
+        GENERIC_PLATFORM_PATH,
     ] {
         if !members.iter().any(|value| value.as_str() == Some(member)) {
             members.push(toml::Value::String(member.to_string()));
@@ -221,18 +222,11 @@ fn patch_workspace_dependencies(manifest: &mut toml::Value) -> anyhow::Result<()
     );
     dependencies.insert(
         "ax-plat-riscv64-qemu-virt".to_string(),
-        path_dependency_with_package(
-            GENERIC_PLATFORM_PACKAGE,
-            "0.1.0",
-            "components/axplat_crates/platforms/axplat-riscv64-generic-ex",
-        ),
+        path_dependency_with_package(GENERIC_PLATFORM_PACKAGE, "0.1.0", GENERIC_PLATFORM_PATH),
     );
     dependencies.insert(
         GENERIC_PLATFORM_PACKAGE.to_string(),
-        path_dependency(
-            "0.1.0",
-            "components/axplat_crates/platforms/axplat-riscv64-generic-ex",
-        ),
+        path_dependency("0.1.0", GENERIC_PLATFORM_PATH),
     );
     Ok(())
 }
