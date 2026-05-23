@@ -20,6 +20,7 @@ pub mod checkpoint;
 #[cfg(target_arch = "riscv64")]
 mod entry;
 pub mod mem;
+pub mod task;
 
 pub mod power {
     pub use ax_plat::power::system_off;

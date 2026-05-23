@@ -1,6 +1,7 @@
 use crate::checkpoint::Checkpoint;
 
 const BOOT_STACK_SIZE: usize = 4096 * 16;
+const PT_SIZE_ON_STACK: usize = 36 * core::mem::size_of::<usize>();
 const SSTATUS_FS_VS_MASK: usize = (0b11 << 13) | (0b11 << 9);
 
 #[used]
@@ -61,12 +62,26 @@ unsafe extern "C" fn _start() -> ! {
         li      a0, {checkpoint_boot_cpu_prepared}
         call    {early_checkpoint}
 
+        .option push
+        .option norelax
+        la      tp, {init_task}
+        .option pop
+        li      a0, {checkpoint_init_task_prepared}
+        call    {early_checkpoint}
+
+        la      sp, boot_stack_top
+        li      t0, {pt_size_on_stack}
+        sub     sp, sp, t0
+        li      a0, {checkpoint_init_stack_prepared}
+        call    {early_checkpoint}
+
 4:
         j       4b
         ",
         boot_hartid = sym crate::boot::__arceos_ex_boot_hartid,
         dtb_pa = sym crate::boot::__arceos_ex_dtb_pa,
         boot_cpu_hartid = sym crate::boot::__arceos_ex_boot_cpu_hartid,
+        init_task = sym crate::task::__arceos_ex_init_task,
         early_checkpoint = sym early_checkpoint,
         checkpoint_boot_args_ready = const Checkpoint::BootArgsReady as usize,
         checkpoint_interrupt_stream_prepared = const Checkpoint::InterruptStreamPrepared as usize,
@@ -74,6 +89,9 @@ unsafe extern "C" fn _start() -> ! {
         checkpoint_root_stream_prepared = const Checkpoint::RootStreamPrepared as usize,
         checkpoint_kernel_image_ready = const Checkpoint::KernelImageReady as usize,
         checkpoint_boot_cpu_prepared = const Checkpoint::BootCpuPrepared as usize,
+        checkpoint_init_task_prepared = const Checkpoint::InitTaskPrepared as usize,
+        checkpoint_init_stack_prepared = const Checkpoint::InitStackPrepared as usize,
+        pt_size_on_stack = const PT_SIZE_ON_STACK,
         sstatus_fs_vs_mask = const SSTATUS_FS_VS_MASK,
     )
 }

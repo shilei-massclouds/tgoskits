@@ -6,17 +6,19 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum Checkpoint {
-    BootArgsReady = b'A',
+    BootArgsReady       = b'A',
     InterruptStreamPrepared = b'1',
     KernelImagePrepared = b'2',
-    RootStreamPrepared = b'3',
-    KernelImageReady = b'4',
-    BootCpuPrepared = b'B',
-    RawDtbReady = b'C',
-    EarlyVmReady = b'D',
-    VmOnline = b'E',
-    EntryPreludeReady = b'F',
-    SwapperVmOnline = b'G',
+    RootStreamPrepared  = b'3',
+    KernelImageReady    = b'4',
+    BootCpuPrepared     = b'B',
+    InitTaskPrepared    = b'T',
+    InitStackPrepared   = b'S',
+    RawDtbReady         = b'C',
+    EarlyVmReady        = b'D',
+    VmOnline            = b'E',
+    EntryPreludeReady   = b'F',
+    SwapperVmOnline     = b'G',
     EntrySuccessorReady = b'H',
 }
 
