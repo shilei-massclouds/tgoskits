@@ -4,6 +4,22 @@ const BOOT_STACK_SIZE: usize = 4096 * 16;
 const PT_SIZE_ON_STACK: usize = 36 * core::mem::size_of::<usize>();
 const SSTATUS_FS_VS_MASK: usize = (0b11 << 13) | (0b11 << 9);
 
+core::arch::global_asm!(
+    r#"
+    .pushsection .text.boot, "ax"
+    .balign 4
+    .globl __arceos_ex_early_event_entry
+__arceos_ex_early_event_entry:
+1:
+    j       1b
+    .popsection
+"#
+);
+
+unsafe extern "C" {
+    fn __arceos_ex_early_event_entry();
+}
+
 #[used]
 #[unsafe(link_section = ".bss.stack")]
 static mut BOOT_STACK: [u8; BOOT_STACK_SIZE] = [0; BOOT_STACK_SIZE];
@@ -75,6 +91,14 @@ unsafe extern "C" fn _start() -> ! {
         li      a0, {checkpoint_init_stack_prepared}
         call    {early_checkpoint}
 
+        .option push
+        .option norelax
+        la      t0, {early_event_entry}
+        .option pop
+        csrw    stvec, t0
+        li      a0, {checkpoint_event_stream_prepared}
+        call    {early_checkpoint}
+
 4:
         j       4b
         ",
@@ -82,6 +106,7 @@ unsafe extern "C" fn _start() -> ! {
         dtb_pa = sym crate::boot::__arceos_ex_dtb_pa,
         boot_cpu_hartid = sym crate::boot::__arceos_ex_boot_cpu_hartid,
         init_task = sym crate::task::__arceos_ex_init_task,
+        early_event_entry = sym __arceos_ex_early_event_entry,
         early_checkpoint = sym early_checkpoint,
         checkpoint_boot_args_ready = const Checkpoint::BootArgsReady as usize,
         checkpoint_interrupt_stream_prepared = const Checkpoint::InterruptStreamPrepared as usize,
@@ -91,6 +116,7 @@ unsafe extern "C" fn _start() -> ! {
         checkpoint_boot_cpu_prepared = const Checkpoint::BootCpuPrepared as usize,
         checkpoint_init_task_prepared = const Checkpoint::InitTaskPrepared as usize,
         checkpoint_init_stack_prepared = const Checkpoint::InitStackPrepared as usize,
+        checkpoint_event_stream_prepared = const Checkpoint::EventStreamPrepared as usize,
         pt_size_on_stack = const PT_SIZE_ON_STACK,
         sstatus_fs_vs_mask = const SSTATUS_FS_VS_MASK,
     )
