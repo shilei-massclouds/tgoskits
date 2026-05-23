@@ -19,7 +19,7 @@ pub enum Checkpoint {
     RawDtbReady         = b'C',
     FixMapReady         = b'7',
     EarlyVmReady        = b'D',
-    VmOnline            = b'E',
+    VmReady             = b'E',
     EntryPreludeReady   = b'F',
     SwapperVmOnline     = b'G',
     EntrySuccessorReady = b'H',

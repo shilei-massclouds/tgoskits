@@ -13,6 +13,10 @@ const PTE_D: usize = 1 << 7;
 const PTE_TABLE: usize = PTE_V;
 const PTE_KERNEL_LEAF: usize = PTE_V | PTE_R | PTE_W | PTE_X | PTE_G | PTE_A | PTE_D;
 
+pub const RISCV_SATP_MODE_SV39: usize = 8usize << 60;
+pub const PHYS_VIRT_OFFSET: usize =
+    ax_config::plat::KERNEL_BASE_VADDR - ax_config::plat::KERNEL_BASE_PADDR;
+
 #[repr(C, align(4096))]
 pub struct Sv39PageTable {
     entries: [usize; SV39_ENTRY_COUNT],

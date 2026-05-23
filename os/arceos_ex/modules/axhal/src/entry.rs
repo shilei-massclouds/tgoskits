@@ -119,6 +119,41 @@ unsafe extern "C" fn _start() -> ! {
         li      a0, {checkpoint_early_vm_ready}
         call    {early_checkpoint}
 
+        sfence.vma
+        .option push
+        .option norelax
+        la      t0, {trampoline_pg_dir}
+        .option pop
+        srli    t0, t0, 12
+        li      t1, {satp_mode_sv39}
+        or      t0, t0, t1
+        csrw    satp, t0
+        sfence.vma
+
+        la      t0, 6f
+        li      t1, {phys_virt_offset}
+        add     t0, t0, t1
+        jr      t0
+6:
+        .option push
+        .option norelax
+        la      t0, {early_pg_dir}
+        .option pop
+        li      t1, {phys_virt_offset}
+        sub     t0, t0, t1
+        srli    t0, t0, 12
+        li      t1, {satp_mode_sv39}
+        or      t0, t0, t1
+        csrw    satp, t0
+        sfence.vma
+
+        .option push
+        .option norelax
+        la      gp, __global_pointer$
+        .option pop
+        li      a0, {checkpoint_vm_ready}
+        call    {early_checkpoint}
+
 4:
         j       4b
 5:
@@ -133,6 +168,8 @@ unsafe extern "C" fn _start() -> ! {
         raw_dtb_preset_setup = sym crate::raw_dtb::__arceos_ex_raw_dtb_preset_setup,
         fixmap_preset = sym crate::fixmap::__arceos_ex_fixmap_preset,
         early_vm_setup = sym crate::vm::__arceos_ex_early_vm_setup,
+        trampoline_pg_dir = sym crate::vm::__arceos_ex_trampoline_pg_dir,
+        early_pg_dir = sym crate::vm::__arceos_ex_early_pg_dir,
         early_checkpoint = sym early_checkpoint,
         checkpoint_boot_args_ready = const Checkpoint::BootArgsReady as usize,
         checkpoint_interrupt_stream_prepared = const Checkpoint::InterruptStreamPrepared as usize,
@@ -147,6 +184,9 @@ unsafe extern "C" fn _start() -> ! {
         checkpoint_raw_dtb_ready = const Checkpoint::RawDtbReady as usize,
         checkpoint_fixmap_ready = const Checkpoint::FixMapReady as usize,
         checkpoint_early_vm_ready = const Checkpoint::EarlyVmReady as usize,
+        checkpoint_vm_ready = const Checkpoint::VmReady as usize,
+        satp_mode_sv39 = const crate::vm::RISCV_SATP_MODE_SV39,
+        phys_virt_offset = const crate::vm::PHYS_VIRT_OFFSET,
         pt_size_on_stack = const PT_SIZE_ON_STACK,
         sstatus_fs_vs_mask = const SSTATUS_FS_VS_MASK,
     )
