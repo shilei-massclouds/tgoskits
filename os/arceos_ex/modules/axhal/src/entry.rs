@@ -51,17 +51,29 @@ unsafe extern "C" fn _start() -> ! {
         li      a0, {checkpoint_kernel_image_ready}
         call    {early_checkpoint}
 
+        .option push
+        .option norelax
+        la      t0, {boot_hartid}
+        ld      t1, 0(t0)
+        la      t0, {boot_cpu_hartid}
+        sd      t1, 0(t0)
+        .option pop
+        li      a0, {checkpoint_boot_cpu_prepared}
+        call    {early_checkpoint}
+
 4:
         j       4b
         ",
         boot_hartid = sym crate::boot::__arceos_ex_boot_hartid,
         dtb_pa = sym crate::boot::__arceos_ex_dtb_pa,
+        boot_cpu_hartid = sym crate::boot::__arceos_ex_boot_cpu_hartid,
         early_checkpoint = sym early_checkpoint,
         checkpoint_boot_args_ready = const Checkpoint::BootArgsReady as usize,
         checkpoint_interrupt_stream_prepared = const Checkpoint::InterruptStreamPrepared as usize,
         checkpoint_kernel_image_prepared = const Checkpoint::KernelImagePrepared as usize,
         checkpoint_root_stream_prepared = const Checkpoint::RootStreamPrepared as usize,
         checkpoint_kernel_image_ready = const Checkpoint::KernelImageReady as usize,
+        checkpoint_boot_cpu_prepared = const Checkpoint::BootCpuPrepared as usize,
         sstatus_fs_vs_mask = const SSTATUS_FS_VS_MASK,
     )
 }

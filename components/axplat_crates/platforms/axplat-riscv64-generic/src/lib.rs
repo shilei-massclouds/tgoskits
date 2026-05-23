@@ -10,7 +10,7 @@
 extern crate ax_plat;
 
 pub mod console {
-    use ax_plat::console::ConsoleIf;
+    use ax_plat::console::{ConsoleIf, ConsoleIrqEvent};
 
     struct ConsoleIfImpl;
 
@@ -20,6 +20,19 @@ pub mod console {
 
         fn read_bytes(_bytes: &mut [u8]) -> usize {
             0
+        }
+
+        #[cfg(feature = "irq")]
+        fn irq_num() -> Option<usize> {
+            None
+        }
+
+        #[cfg(feature = "irq")]
+        fn set_input_irq_enabled(_enabled: bool) {}
+
+        #[cfg(feature = "irq")]
+        fn handle_irq() -> ConsoleIrqEvent {
+            ConsoleIrqEvent::empty()
         }
     }
 }

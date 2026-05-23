@@ -14,6 +14,11 @@ use crate::{
 const OVERLAY_DIR_NAME: &str = "arceos-ex-workspace";
 const DEFAULT_ARCH: &str = "riscv64";
 const DEFAULT_TEST_GROUP: &str = "std";
+const DEFAULT_TEST_CASE: &str = "helloworld";
+const DEFAULT_PACKAGE: &str = "test-arceos-std-helloworld";
+const DEFAULT_BUILD_CONFIG: &str =
+    "test-suit/arceos/std/qemu-smp1/build-riscv64gc-unknown-none-elf.toml";
+const DEFAULT_QEMU_CONFIG: &str = "test-suit/arceos/std/qemu-smp1/helloworld/qemu-riscv64.toml";
 const OVERLAY_MANIFEST_ENV: &str = "AXBUILD_WORKSPACE_MANIFEST";
 const DEFAULT_PLATFORM_ENV: &str = "AXBUILD_DEFAULT_PLATFORM_PACKAGE_RISCV64";
 const CHECKPOINT_SBI_CHAR_ENV: &str = "ARCEOS_EX_CHECKPOINT_SBI_CHAR";
@@ -59,6 +64,9 @@ fn normalize_command(command: arceos::Command) -> anyhow::Result<arceos::Command
         }
         arceos::Command::Qemu(mut args) => {
             normalize_build_args(&mut args.build)?;
+            if args.qemu_config.is_none() {
+                args.qemu_config = Some(default_qemu_config());
+            }
             Ok(arceos::Command::Qemu(args))
         }
         arceos::Command::Uboot(mut args) => {
@@ -73,11 +81,25 @@ fn normalize_command(command: arceos::Command) -> anyhow::Result<arceos::Command
 }
 
 fn normalize_build_args(args: &mut arceos::ArgsBuild) -> anyhow::Result<()> {
+    if args.package.is_none() {
+        args.package = Some(DEFAULT_PACKAGE.to_string());
+    }
+    if args.config.is_none() {
+        args.config = Some(default_build_config());
+    }
     if args.arch.is_none() && args.target.is_none() {
         args.arch = Some(DEFAULT_ARCH.to_string());
     }
     ensure_riscv64_target(args.arch.as_deref(), args.target.as_deref())?;
     Ok(())
+}
+
+fn default_build_config() -> PathBuf {
+    PathBuf::from(DEFAULT_BUILD_CONFIG)
+}
+
+fn default_qemu_config() -> PathBuf {
+    PathBuf::from(DEFAULT_QEMU_CONFIG)
 }
 
 fn normalize_test_args(args: &mut arceos::test::ArgsTest) -> anyhow::Result<()> {
@@ -90,20 +112,26 @@ fn normalize_test_args(args: &mut arceos::test::ArgsTest) -> anyhow::Result<()> 
             if qemu.test_group.is_none() && !qemu.only_c && !qemu.only_rust {
                 qemu.test_group = Some(DEFAULT_TEST_GROUP.to_string());
             }
+            if qemu.test_case.is_none()
+                && qemu.package.is_empty()
+                && !qemu.list
+                && !qemu.only_c
+                && !qemu.only_rust
+            {
+                qemu.test_case = Some(DEFAULT_TEST_CASE.to_string());
+            }
         }
     }
     Ok(())
 }
 
 fn ensure_riscv64_target(arch: Option<&str>, target: Option<&str>) -> anyhow::Result<()> {
-    if let Some(arch) = arch
-        && arch != DEFAULT_ARCH
-    {
+    if arch.is_some_and(|arch| arch != DEFAULT_ARCH) {
+        let arch = arch.unwrap();
         bail!("arceos-ex supports only `{DEFAULT_ARCH}` arch, not `{arch}`");
     }
-    if let Some(target) = target
-        && !target.starts_with("riscv64")
-    {
+    if target.is_some_and(|target| !target.starts_with("riscv64")) {
+        let target = target.unwrap();
         bail!("arceos-ex supports only RISC-V64 targets, not `{target}`");
     }
     Ok(())
