@@ -15,6 +15,7 @@ pub enum Checkpoint {
     InitTaskPrepared    = b'T',
     InitStackPrepared   = b'S',
     EventStreamPrepared = b'5',
+    TrampolineVmReady   = b'6',
     RawDtbReady         = b'C',
     EarlyVmReady        = b'D',
     VmOnline            = b'E',

@@ -99,14 +99,28 @@ unsafe extern "C" fn _start() -> ! {
         li      a0, {checkpoint_event_stream_prepared}
         call    {early_checkpoint}
 
+        call    {trampoline_vm_setup}
+        beqz    a0, 5f
+        li      a0, {checkpoint_trampoline_vm_ready}
+        call    {early_checkpoint}
+
+        call    {raw_dtb_preset_setup}
+        beqz    a0, 5f
+        li      a0, {checkpoint_raw_dtb_ready}
+        call    {early_checkpoint}
+
 4:
         j       4b
+5:
+        j       5b
         ",
         boot_hartid = sym crate::boot::__arceos_ex_boot_hartid,
         dtb_pa = sym crate::boot::__arceos_ex_dtb_pa,
         boot_cpu_hartid = sym crate::boot::__arceos_ex_boot_cpu_hartid,
         init_task = sym crate::task::__arceos_ex_init_task,
         early_event_entry = sym __arceos_ex_early_event_entry,
+        trampoline_vm_setup = sym crate::vm::__arceos_ex_trampoline_vm_setup,
+        raw_dtb_preset_setup = sym crate::raw_dtb::__arceos_ex_raw_dtb_preset_setup,
         early_checkpoint = sym early_checkpoint,
         checkpoint_boot_args_ready = const Checkpoint::BootArgsReady as usize,
         checkpoint_interrupt_stream_prepared = const Checkpoint::InterruptStreamPrepared as usize,
@@ -117,6 +131,8 @@ unsafe extern "C" fn _start() -> ! {
         checkpoint_init_task_prepared = const Checkpoint::InitTaskPrepared as usize,
         checkpoint_init_stack_prepared = const Checkpoint::InitStackPrepared as usize,
         checkpoint_event_stream_prepared = const Checkpoint::EventStreamPrepared as usize,
+        checkpoint_trampoline_vm_ready = const Checkpoint::TrampolineVmReady as usize,
+        checkpoint_raw_dtb_ready = const Checkpoint::RawDtbReady as usize,
         pt_size_on_stack = const PT_SIZE_ON_STACK,
         sstatus_fs_vs_mask = const SSTATUS_FS_VS_MASK,
     )
