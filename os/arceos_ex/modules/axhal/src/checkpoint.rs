@@ -17,6 +17,7 @@ pub enum Checkpoint {
     EventStreamPrepared = b'5',
     TrampolineVmReady   = b'6',
     RawDtbReady         = b'C',
+    FixMapReady         = b'7',
     EarlyVmReady        = b'D',
     VmOnline            = b'E',
     EntryPreludeReady   = b'F',

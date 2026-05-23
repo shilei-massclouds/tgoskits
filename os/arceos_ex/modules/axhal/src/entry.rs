@@ -109,6 +109,11 @@ unsafe extern "C" fn _start() -> ! {
         li      a0, {checkpoint_raw_dtb_ready}
         call    {early_checkpoint}
 
+        call    {fixmap_preset}
+        beqz    a0, 5f
+        li      a0, {checkpoint_fixmap_ready}
+        call    {early_checkpoint}
+
 4:
         j       4b
 5:
@@ -121,6 +126,7 @@ unsafe extern "C" fn _start() -> ! {
         early_event_entry = sym __arceos_ex_early_event_entry,
         trampoline_vm_setup = sym crate::vm::__arceos_ex_trampoline_vm_setup,
         raw_dtb_preset_setup = sym crate::raw_dtb::__arceos_ex_raw_dtb_preset_setup,
+        fixmap_preset = sym crate::fixmap::__arceos_ex_fixmap_preset,
         early_checkpoint = sym early_checkpoint,
         checkpoint_boot_args_ready = const Checkpoint::BootArgsReady as usize,
         checkpoint_interrupt_stream_prepared = const Checkpoint::InterruptStreamPrepared as usize,
@@ -133,6 +139,7 @@ unsafe extern "C" fn _start() -> ! {
         checkpoint_event_stream_prepared = const Checkpoint::EventStreamPrepared as usize,
         checkpoint_trampoline_vm_ready = const Checkpoint::TrampolineVmReady as usize,
         checkpoint_raw_dtb_ready = const Checkpoint::RawDtbReady as usize,
+        checkpoint_fixmap_ready = const Checkpoint::FixMapReady as usize,
         pt_size_on_stack = const PT_SIZE_ON_STACK,
         sstatus_fs_vs_mask = const SSTATUS_FS_VS_MASK,
     )

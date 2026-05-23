@@ -19,6 +19,7 @@ pub mod console {
 pub mod checkpoint;
 #[cfg(target_arch = "riscv64")]
 mod entry;
+pub mod fixmap;
 pub mod mem;
 pub mod raw_dtb;
 pub mod task;
