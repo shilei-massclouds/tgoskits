@@ -18,6 +18,7 @@ __arceos_ex_early_event_entry:
 
 unsafe extern "C" {
     fn __arceos_ex_early_event_entry();
+    fn trap_vector_base();
 }
 
 #[used]
@@ -154,6 +155,31 @@ unsafe extern "C" fn _start() -> ! {
         li      a0, {checkpoint_vm_ready}
         call    {early_checkpoint}
 
+        la      t0, {formal_event_entry}
+        csrw    stvec, t0
+        csrw    sscratch, zero
+        li      a0, {checkpoint_event_stream_online}
+        call    {early_checkpoint}
+
+        .option push
+        .option norelax
+        la      tp, {init_task}
+        .option pop
+        li      a0, {checkpoint_init_task_online}
+        call    {early_checkpoint}
+
+        la      sp, boot_stack_top
+        li      t0, {pt_size_on_stack}
+        sub     sp, sp, t0
+        li      a0, {checkpoint_init_stack_ready}
+        call    {early_checkpoint}
+
+        li      a0, {checkpoint_soc_prepared}
+        call    {early_checkpoint}
+
+        li      a0, {checkpoint_entry_prelude_ready}
+        call    {early_checkpoint}
+
 4:
         j       4b
 5:
@@ -164,6 +190,7 @@ unsafe extern "C" fn _start() -> ! {
         boot_cpu_hartid = sym crate::boot::__arceos_ex_boot_cpu_hartid,
         init_task = sym crate::task::__arceos_ex_init_task,
         early_event_entry = sym __arceos_ex_early_event_entry,
+        formal_event_entry = sym trap_vector_base,
         trampoline_vm_setup = sym crate::vm::__arceos_ex_trampoline_vm_setup,
         raw_dtb_preset_setup = sym crate::raw_dtb::__arceos_ex_raw_dtb_preset_setup,
         fixmap_preset = sym crate::fixmap::__arceos_ex_fixmap_preset,
@@ -185,6 +212,11 @@ unsafe extern "C" fn _start() -> ! {
         checkpoint_fixmap_ready = const Checkpoint::FixMapReady as usize,
         checkpoint_early_vm_ready = const Checkpoint::EarlyVmReady as usize,
         checkpoint_vm_ready = const Checkpoint::VmReady as usize,
+        checkpoint_event_stream_online = const Checkpoint::EventStreamOnline as usize,
+        checkpoint_init_task_online = const Checkpoint::InitTaskOnline as usize,
+        checkpoint_init_stack_ready = const Checkpoint::InitStackReady as usize,
+        checkpoint_soc_prepared = const Checkpoint::SocPrepared as usize,
+        checkpoint_entry_prelude_ready = const Checkpoint::EntryPreludeReady as usize,
         satp_mode_sv39 = const crate::vm::RISCV_SATP_MODE_SV39,
         phys_virt_offset = const crate::vm::PHYS_VIRT_OFFSET,
         pt_size_on_stack = const PT_SIZE_ON_STACK,
