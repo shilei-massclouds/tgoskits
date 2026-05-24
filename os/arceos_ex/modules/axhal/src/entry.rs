@@ -254,6 +254,33 @@ unsafe extern "C" fn _start() -> ! {
         li      a0, {checkpoint_kernel_param_ready}
         call    {early_checkpoint}
 
+        call    {memblock_setup}
+        beqz    a0, 5f
+        li      a0, {checkpoint_memblock_ready}
+        call    {early_checkpoint}
+
+        call    {vm_enable}
+        beqz    a0, 5f
+        li      a0, {checkpoint_swapper_vm_online}
+        call    {early_checkpoint}
+        li      a0, {checkpoint_vm_online}
+        call    {early_checkpoint}
+        li      a0, {checkpoint_early_vm_destroyed}
+        call    {early_checkpoint}
+
+        call    {memblock_enable}
+        beqz    a0, 5f
+        li      a0, {checkpoint_memblock_online}
+        call    {early_checkpoint}
+
+        call    {early_dtb_cleanup}
+        beqz    a0, 5f
+        li      a0, {checkpoint_early_dtb_destroyed}
+        call    {early_checkpoint}
+
+        li      a0, {checkpoint_entry_successor_ready}
+        call    {early_checkpoint}
+
 4:
         j       4b
 5:
@@ -281,6 +308,10 @@ unsafe extern "C" fn _start() -> ! {
         early_ioremap_setup = sym crate::early_ioremap::__arceos_ex_early_ioremap_setup,
         sbi_setup = sym crate::sbi::__arceos_ex_sbi_setup,
         kernel_param_setup = sym crate::kernel_param::__arceos_ex_kernel_param_setup,
+        memblock_setup = sym crate::memblock::__arceos_ex_memblock_setup,
+        vm_enable = sym crate::vm::__arceos_ex_vm_enable,
+        memblock_enable = sym crate::memblock::__arceos_ex_memblock_enable,
+        early_dtb_cleanup = sym crate::early_dtb::__arceos_ex_early_dtb_cleanup,
         trampoline_pg_dir = sym crate::vm::__arceos_ex_trampoline_pg_dir,
         early_pg_dir = sym crate::vm::__arceos_ex_early_pg_dir,
         early_checkpoint = sym early_checkpoint,
@@ -321,6 +352,13 @@ unsafe extern "C" fn _start() -> ! {
         checkpoint_sbi_ready = const Checkpoint::SbiReady as usize,
         checkpoint_earlycon_online = const Checkpoint::EarlyConOnline as usize,
         checkpoint_kernel_param_ready = const Checkpoint::KernelParamReady as usize,
+        checkpoint_memblock_ready = const Checkpoint::MemBlockReady as usize,
+        checkpoint_swapper_vm_online = const Checkpoint::SwapperVmOnline as usize,
+        checkpoint_vm_online = const Checkpoint::VmOnline as usize,
+        checkpoint_early_vm_destroyed = const Checkpoint::EarlyVmDestroyed as usize,
+        checkpoint_memblock_online = const Checkpoint::MemBlockOnline as usize,
+        checkpoint_early_dtb_destroyed = const Checkpoint::EarlyDtbDestroyed as usize,
+        checkpoint_entry_successor_ready = const Checkpoint::EntrySuccessorReady as usize,
         satp_mode_sv39 = const crate::vm::RISCV_SATP_MODE_SV39,
         phys_virt_offset = const crate::vm::PHYS_VIRT_OFFSET,
         pt_size_on_stack = const PT_SIZE_ON_STACK,

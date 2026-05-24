@@ -33,6 +33,12 @@ pub static mut __arceos_ex_physical_memory_ranges: [PhysicalMemoryRange;
     MAX_PHYSICAL_MEMORY_RANGES] =
     [PhysicalMemoryRange { start: 0, size: 0 }; MAX_PHYSICAL_MEMORY_RANGES];
 
+// SAFETY: scalar lifecycle fact is written once when EntrySuccessorPhase
+// completes EarlyDtb.Cleanup.
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".bss.early_dtb")]
+pub static mut __arceos_ex_early_dtb_destroyed: usize = 0;
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __arceos_ex_early_dtb_preset() -> usize {
     let Some(dtb) = mapped_dtb() else {
@@ -69,6 +75,23 @@ pub unsafe extern "C" fn __arceos_ex_early_dtb_setup() -> usize {
     }
     if !memblock::preset_from_physical_memory() {
         return 0;
+    }
+
+    1
+}
+
+// SAFETY: exported C ABI entry is required so naked startup assembly can drive
+// EarlyDtb.Cleanup at the model boundary.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __arceos_ex_early_dtb_cleanup() -> usize {
+    if !memblock::resize_allowed() {
+        return 0;
+    }
+
+    // SAFETY: EarlyDtb.Cleanup runs once after all required early DTB facts have
+    // been consumed by MemBlock, KernelCmdline and platform facts.
+    unsafe {
+        core::ptr::write_volatile(&raw mut __arceos_ex_early_dtb_destroyed, 1);
     }
 
     1

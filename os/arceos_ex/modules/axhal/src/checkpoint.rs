@@ -43,7 +43,12 @@ pub enum Checkpoint {
     SbiReady             = b'y',
     EarlyConOnline       = b'l',
     KernelParamReady     = b'K',
+    MemBlockReady        = b'u',
+    VmOnline             = b'V',
     SwapperVmOnline      = b'G',
+    EarlyVmDestroyed     = b'x',
+    MemBlockOnline       = b'O',
+    EarlyDtbDestroyed    = b'q',
     EntrySuccessorReady  = b'H',
 }
 
