@@ -38,6 +38,11 @@ pub enum Checkpoint {
     KernelCmdlineReady   = b'a',
     MemBlockPrepared     = b'M',
     EarlyDtbReady        = b'R',
+    InitMmReady          = b'n',
+    EarlyIoremapReady    = b'r',
+    SbiReady             = b'y',
+    EarlyConOnline       = b'l',
+    KernelParamReady     = b'K',
     SwapperVmOnline      = b'G',
     EntrySuccessorReady  = b'H',
 }
@@ -64,8 +69,7 @@ pub fn emit(_byte: u8) {
 #[cfg(all(target_arch = "riscv64", feature = "checkpoint-sbi-char"))]
 #[inline(always)]
 fn emit_sbi_char(byte: u8) {
-    #[allow(deprecated)]
-    sbi_rt::legacy::console_putchar(byte as usize);
+    crate::sbi::legacy_console_putchar(byte);
 }
 
 #[macro_export]

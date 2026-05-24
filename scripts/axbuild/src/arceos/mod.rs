@@ -143,6 +143,7 @@ pub struct ArgsUboot {
 
 pub struct ArceOS {
     pub(super) app: AppContext,
+    qemu_append: Option<String>,
 }
 
 impl From<&ArgsBuild> for BuildCliArgs {
@@ -162,11 +163,20 @@ impl From<&ArgsBuild> for BuildCliArgs {
 impl ArceOS {
     pub fn new() -> anyhow::Result<Self> {
         let app = AppContext::new()?;
-        Ok(Self { app })
+        Ok(Self {
+            app,
+            qemu_append: None,
+        })
     }
 
-    pub(crate) fn from_app(app: AppContext) -> Self {
-        Self { app }
+    pub(crate) fn from_app_with_qemu_append(
+        app: AppContext,
+        qemu_append: impl Into<String>,
+    ) -> Self {
+        Self {
+            app,
+            qemu_append: Some(qemu_append.into()),
+        }
     }
 
     pub async fn execute(&mut self, command: Command) -> anyhow::Result<()> {
@@ -240,15 +250,23 @@ impl ArceOS {
         request: &ResolvedBuildRequest,
         cargo: &Cargo,
     ) -> anyhow::Result<Option<ostool::run::qemu::QemuConfig>> {
-        match request.qemu_config.as_deref() {
-            Some(path) => self
-                .app
-                .tool_mut()
-                .read_qemu_config_from_path_for_cargo(cargo, path)
-                .await
-                .map(Some),
-            None => Ok(None),
+        let qemu = match request.qemu_config.as_deref() {
+            Some(path) => Some(
+                self.app
+                    .tool_mut()
+                    .read_qemu_config_from_path_for_cargo(cargo, path)
+                    .await?,
+            ),
+            None => None,
+        };
+        Ok(qemu.map(|qemu| self.patch_qemu_config(qemu)))
+    }
+
+    pub(super) fn patch_qemu_config(&self, mut qemu: QemuConfig) -> QemuConfig {
+        if let Some(append) = self.qemu_append.as_deref() {
+            ensure_qemu_append(&mut qemu.args, append);
         }
+        qemu
     }
 
     async fn load_uboot_config(
@@ -299,6 +317,37 @@ impl ArceOS {
     }
 }
 
+fn ensure_qemu_append(args: &mut Vec<String>, append: &str) {
+    let append = append.trim();
+    if append.is_empty() {
+        return;
+    }
+
+    if let Some(index) = args.iter().position(|arg| arg == "-append") {
+        if let Some(existing) = args.get_mut(index + 1) {
+            append_missing_bootargs(existing, append);
+        } else {
+            args.push(append.to_string());
+        }
+        return;
+    }
+
+    args.push("-append".to_string());
+    args.push(append.to_string());
+}
+
+fn append_missing_bootargs(existing: &mut String, append: &str) {
+    for item in append.split_whitespace() {
+        if existing.split_whitespace().any(|arg| arg == item) {
+            continue;
+        }
+        if !existing.trim().is_empty() {
+            existing.push(' ');
+        }
+        existing.push_str(item);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,5 +382,29 @@ mod tests {
             workspace,
             Path::new("/workspace/test-suit/arceos/rust/fs/shell/disk.img")
         ));
+    }
+
+    #[test]
+    fn ensure_qemu_append_adds_missing_append_arg() {
+        let mut args = vec!["-nographic".to_string()];
+
+        ensure_qemu_append(&mut args, "earlycon=sbi");
+
+        assert_eq!(args, vec!["-nographic", "-append", "earlycon=sbi"]);
+    }
+
+    #[test]
+    fn ensure_qemu_append_extends_existing_append_arg_once() {
+        let mut args = vec![
+            "-append".to_string(),
+            "console=hvc0 earlycon=sbi".to_string(),
+        ];
+
+        ensure_qemu_append(&mut args, "earlycon=sbi loglevel=7");
+
+        assert_eq!(
+            args,
+            vec!["-append", "console=hvc0 earlycon=sbi loglevel=7"]
+        );
     }
 }

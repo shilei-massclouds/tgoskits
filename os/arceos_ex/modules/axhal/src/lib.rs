@@ -20,14 +20,20 @@ pub mod console {
 pub mod checkpoint;
 pub mod cpu;
 pub mod early_dtb;
+pub mod early_ioremap;
+pub mod earlycon;
 #[cfg(target_arch = "riscv64")]
 mod entry;
+pub mod fdt;
 pub mod fixmap;
+pub mod init_mm;
 pub mod interrupt;
+pub mod kernel_param;
 pub mod mem;
 pub mod memblock;
 pub mod printk;
 pub mod raw_dtb;
+pub mod sbi;
 pub mod stack;
 pub mod task;
 pub mod vm;

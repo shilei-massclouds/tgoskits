@@ -1,8 +1,10 @@
 use core::slice;
 
-use fdt_parser::{Fdt, Node};
-
-use crate::{boot, cmdline, fixmap, memblock, raw_dtb};
+use crate::{
+    boot, cmdline,
+    fdt::{Fdt, Node},
+    fixmap, memblock, raw_dtb,
+};
 
 const MAX_PHYSICAL_MEMORY_RANGES: usize = 4;
 const MAX_PLATFORM_HARTS: usize = 16;
@@ -36,7 +38,7 @@ pub unsafe extern "C" fn __arceos_ex_early_dtb_preset() -> usize {
     let Some(dtb) = mapped_dtb() else {
         return 0;
     };
-    let Ok(fdt) = Fdt::from_bytes(dtb) else {
+    let Some(fdt) = Fdt::from_bytes(dtb) else {
         return 0;
     };
 
@@ -55,15 +57,13 @@ pub unsafe extern "C" fn __arceos_ex_early_dtb_setup() -> usize {
     let Some(dtb) = mapped_dtb() else {
         return 0;
     };
-    let Ok(fdt) = Fdt::from_bytes(dtb) else {
+    let Some(fdt) = Fdt::from_bytes(dtb) else {
         return 0;
     };
 
     let bootargs = fdt
-        .find_nodes("/chosen")
-        .next()
-        .and_then(|node| node.find_property("bootargs"))
-        .map(|property| property.raw_value());
+        .find_node("/chosen")
+        .and_then(|node| node.property("bootargs"));
     if !cmdline::publish_kernel_cmdline(bootargs) {
         return 0;
     }
@@ -96,7 +96,7 @@ fn publish_platform_cpu_info(fdt: &Fdt<'_>, boot_hartid: usize) -> bool {
     let mut hart_count = 0;
     let mut boot_hart_found = false;
 
-    for node in fdt.all_nodes() {
+    for node in fdt.nodes() {
         if !is_cpu_node(&node) {
             continue;
         }
@@ -137,14 +137,14 @@ fn publish_physical_memory(fdt: &Fdt<'_>) -> bool {
         return false;
     };
     let mut range_count = 0;
-    for node in fdt.all_nodes() {
+    for node in fdt.nodes() {
         if !is_memory_node(&node) {
             continue;
         }
-        let Some(reg) = node.find_property("reg") else {
+        let Some(reg) = node.property("reg") else {
             return false;
         };
-        let mut raw = reg.raw_value();
+        let mut raw = reg;
         let Some(tuple_cells) = address_cells.checked_add(size_cells) else {
             return false;
         };
@@ -202,16 +202,15 @@ fn publish_physical_memory(fdt: &Fdt<'_>) -> bool {
 }
 
 fn is_cpu_node(node: &Node<'_>) -> bool {
-    if node.name() == "cpus" || !node.name().starts_with("cpu") {
+    if node.name == "cpus" || !node.name.starts_with("cpu") {
         return false;
     }
 
-    node.find_property("device_type")
-        .is_some_and(|property| property.raw_value() == b"cpu\0")
+    node.prop_str_eq("device_type", b"cpu")
 }
 
 fn cpu_address_cells(fdt: &Fdt<'_>) -> Option<usize> {
-    let cpus = fdt.find_nodes("/cpus").next()?;
+    let cpus = fdt.find_node("/cpus")?;
     let value = read_property_u32(&cpus, "#address-cells")?;
     usize::try_from(value)
         .ok()
@@ -219,8 +218,7 @@ fn cpu_address_cells(fdt: &Fdt<'_>) -> Option<usize> {
 }
 
 fn cpu_reg_hartid(node: &Node<'_>, address_cells: usize) -> Option<usize> {
-    let reg = node.find_property("reg")?;
-    let mut raw = reg.raw_value();
+    let mut raw = node.property("reg")?;
     let byte_len = address_cells.checked_mul(4)?;
     if raw.len() < byte_len {
         return None;
@@ -230,7 +228,7 @@ fn cpu_reg_hartid(node: &Node<'_>, address_cells: usize) -> Option<usize> {
 }
 
 fn root_address_size_cells(fdt: &Fdt<'_>) -> Option<(usize, usize)> {
-    let root = fdt.all_nodes().find(|node| node.name() == "/")?;
+    let root = fdt.find_node("/")?;
     let address_cells = usize::try_from(read_property_u32(&root, "#address-cells")?).ok()?;
     let size_cells = usize::try_from(read_property_u32(&root, "#size-cells")?).ok()?;
 
@@ -242,14 +240,11 @@ fn root_address_size_cells(fdt: &Fdt<'_>) -> Option<(usize, usize)> {
 }
 
 fn is_memory_node(node: &Node<'_>) -> bool {
-    node.name().starts_with("memory")
-        && node
-            .find_property("device_type")
-            .is_some_and(|property| property.raw_value() == b"memory\0")
+    node.name.starts_with("memory") && node.prop_str_eq("device_type", b"memory")
 }
 
 fn read_property_u32(node: &Node<'_>, name: &str) -> Option<u32> {
-    let raw = node.find_property(name)?.raw_value();
+    let raw = node.property(name)?;
     if raw.len() != 4 {
         return None;
     }

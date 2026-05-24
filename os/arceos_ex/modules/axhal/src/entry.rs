@@ -232,6 +232,28 @@ unsafe extern "C" fn _start() -> ! {
         li      a0, {checkpoint_early_dtb_ready}
         call    {early_checkpoint}
 
+        call    {init_mm_setup}
+        beqz    a0, 5f
+        li      a0, {checkpoint_init_mm_ready}
+        call    {early_checkpoint}
+
+        call    {early_ioremap_setup}
+        beqz    a0, 5f
+        li      a0, {checkpoint_early_ioremap_ready}
+        call    {early_checkpoint}
+
+        call    {sbi_setup}
+        beqz    a0, 5f
+        li      a0, {checkpoint_sbi_ready}
+        call    {early_checkpoint}
+
+        call    {kernel_param_setup}
+        beqz    a0, 5f
+        li      a0, {checkpoint_earlycon_online}
+        call    {early_checkpoint}
+        li      a0, {checkpoint_kernel_param_ready}
+        call    {early_checkpoint}
+
 4:
         j       4b
 5:
@@ -255,6 +277,10 @@ unsafe extern "C" fn _start() -> ! {
         boot_cpu_enable = sym crate::cpu::__arceos_ex_boot_cpu_enable,
         printk_buffer_preset = sym crate::printk::__arceos_ex_printk_buffer_preset,
         early_dtb_setup = sym crate::early_dtb::__arceos_ex_early_dtb_setup,
+        init_mm_setup = sym crate::init_mm::__arceos_ex_init_mm_setup,
+        early_ioremap_setup = sym crate::early_ioremap::__arceos_ex_early_ioremap_setup,
+        sbi_setup = sym crate::sbi::__arceos_ex_sbi_setup,
+        kernel_param_setup = sym crate::kernel_param::__arceos_ex_kernel_param_setup,
         trampoline_pg_dir = sym crate::vm::__arceos_ex_trampoline_pg_dir,
         early_pg_dir = sym crate::vm::__arceos_ex_early_pg_dir,
         early_checkpoint = sym early_checkpoint,
@@ -290,6 +316,11 @@ unsafe extern "C" fn _start() -> ! {
         checkpoint_kernel_cmdline_ready = const Checkpoint::KernelCmdlineReady as usize,
         checkpoint_memblock_prepared = const Checkpoint::MemBlockPrepared as usize,
         checkpoint_early_dtb_ready = const Checkpoint::EarlyDtbReady as usize,
+        checkpoint_init_mm_ready = const Checkpoint::InitMmReady as usize,
+        checkpoint_early_ioremap_ready = const Checkpoint::EarlyIoremapReady as usize,
+        checkpoint_sbi_ready = const Checkpoint::SbiReady as usize,
+        checkpoint_earlycon_online = const Checkpoint::EarlyConOnline as usize,
+        checkpoint_kernel_param_ready = const Checkpoint::KernelParamReady as usize,
         satp_mode_sv39 = const crate::vm::RISCV_SATP_MODE_SV39,
         phys_virt_offset = const crate::vm::PHYS_VIRT_OFFSET,
         pt_size_on_stack = const PT_SIZE_ON_STACK,

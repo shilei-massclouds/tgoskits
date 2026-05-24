@@ -18,3 +18,8 @@ pub unsafe extern "C" fn __arceos_ex_printk_buffer_preset() -> usize {
 
     1
 }
+
+pub fn is_prepared() -> bool {
+    // SAFETY: this reads the boot-time fact published by PrintkBuffer.Preset.
+    unsafe { core::ptr::read_volatile(&raw const __arceos_ex_printk_buffer_prepared) != 0 }
+}

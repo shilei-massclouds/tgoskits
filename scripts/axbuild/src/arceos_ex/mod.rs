@@ -24,6 +24,7 @@ const DEFAULT_PLATFORM_ENV: &str = "AXBUILD_DEFAULT_PLATFORM_PACKAGE_RISCV64";
 const CHECKPOINT_SBI_CHAR_ENV: &str = "ARCEOS_EX_CHECKPOINT_SBI_CHAR";
 const GENERIC_PLATFORM_PACKAGE: &str = "ax-plat-riscv64-generic";
 const GENERIC_PLATFORM_PATH: &str = "components/axplat_crates/platforms/axplat-riscv64-generic";
+const DEFAULT_QEMU_APPEND: &str = "earlycon=sbi";
 
 pub struct ArceOSEx {
     arceos: ArceOS,
@@ -46,7 +47,7 @@ impl ArceOSEx {
             ..ToolConfig::default()
         })?;
         Ok(Self {
-            arceos: ArceOS::from_app(app),
+            arceos: ArceOS::from_app_with_qemu_append(app, DEFAULT_QEMU_APPEND),
             _overlay: overlay,
         })
     }

@@ -41,3 +41,60 @@ pub fn kernel_cmdline_len() -> usize {
     // is a plain scalar checkpoint fact for later readers.
     unsafe { core::ptr::read_volatile(&raw const __arceos_ex_kernel_cmdline_len) }
 }
+
+pub fn kernel_cmdline_has_arg(expected: &[u8]) -> bool {
+    let len = kernel_cmdline_len();
+    if expected.is_empty() || len < expected.len() || len > MAX_KERNEL_CMDLINE_LEN {
+        return false;
+    }
+
+    let mut arg_start = 0;
+    while arg_start < len {
+        while arg_start < len
+            && read_cmdline_byte(arg_start).is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            arg_start += 1;
+        }
+        let mut arg_end = arg_start;
+        while arg_end < len
+            && read_cmdline_byte(arg_end).is_some_and(|byte| !byte.is_ascii_whitespace())
+        {
+            arg_end += 1;
+        }
+        if arg_end > arg_start && cmdline_arg_eq(arg_start, arg_end, expected) {
+            return true;
+        }
+        arg_start = arg_end.saturating_add(1);
+    }
+
+    false
+}
+
+fn cmdline_arg_eq(start: usize, end: usize, expected: &[u8]) -> bool {
+    if end - start != expected.len() {
+        return false;
+    }
+
+    for (offset, expected) in expected.iter().copied().enumerate() {
+        if read_cmdline_byte(start + offset) != Some(expected) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn read_cmdline_byte(index: usize) -> Option<u8> {
+    if index >= MAX_KERNEL_CMDLINE_LEN {
+        return None;
+    }
+
+    // SAFETY: `index` is bounded by the fixed command line storage size above.
+    Some(unsafe {
+        core::ptr::read_volatile(
+            (&raw const __arceos_ex_kernel_cmdline)
+                .cast::<u8>()
+                .add(index),
+        )
+    })
+}

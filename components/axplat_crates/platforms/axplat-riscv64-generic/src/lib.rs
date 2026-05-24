@@ -9,6 +9,46 @@
 #[macro_use]
 extern crate ax_plat;
 
+mod sbi {
+    const EID_SRST: usize = 0x5352_5354;
+    const FID_SYSTEM_RESET: usize = 0;
+    const RESET_TYPE_SHUTDOWN: usize = 0;
+    const RESET_REASON_NONE: usize = 0;
+
+    pub fn system_shutdown() -> ! {
+        let _ = sbi_call_2(
+            EID_SRST,
+            FID_SYSTEM_RESET,
+            RESET_TYPE_SHUTDOWN,
+            RESET_REASON_NONE,
+        );
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
+    #[inline(always)]
+    fn sbi_call_2(eid: usize, fid: usize, arg0: usize, arg1: usize) -> (usize, usize) {
+        let error: usize;
+        let value: usize;
+
+        // SAFETY: this is the RISC-V SBI ecall ABI boundary for platform
+        // shutdown; a0/a1 carry reset type and reason, a6/a7 carry fid/eid.
+        unsafe {
+            core::arch::asm!(
+                "ecall",
+                inlateout("a0") arg0 => error,
+                inlateout("a1") arg1 => value,
+                in("a6") fid,
+                in("a7") eid,
+                options(nostack)
+            );
+        }
+
+        (error, value)
+    }
+}
+
 pub mod console {
     use ax_plat::console::ConsoleIf;
     #[cfg(feature = "irq")]
@@ -83,10 +123,7 @@ pub mod power {
         fn cpu_boot(_cpu_id: usize, _stack_top_paddr: usize) {}
 
         fn system_off() -> ! {
-            sbi_rt::system_reset(sbi_rt::Shutdown, sbi_rt::NoReason);
-            loop {
-                core::hint::spin_loop();
-            }
+            crate::sbi::system_shutdown()
         }
 
         fn cpu_num() -> usize {

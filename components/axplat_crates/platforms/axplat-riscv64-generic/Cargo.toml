@@ -20,7 +20,6 @@ smp = ["ax-plat/smp"]
 ax-cpu.workspace = true
 ax-plat.workspace = true
 log.workspace = true
-sbi-rt = { version = "0.0.3", features = ["legacy"] }
 
 [package.metadata.docs.rs]
 targets = ["riscv64gc-unknown-none-elf"]

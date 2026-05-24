@@ -1032,7 +1032,7 @@ async fn build_and_run_c_test(
         features: build_config.build.features.clone(),
     };
     let output = cbuild::build_c_app(&workspace_root, &request, &input)?;
-    let qemu = qemu_config;
+    let qemu = arceos.patch_qemu_config(qemu_config);
     ensure_qemu_runtime_assets(arceos.app.workspace_root(), &qemu)?;
     arceos
         .app

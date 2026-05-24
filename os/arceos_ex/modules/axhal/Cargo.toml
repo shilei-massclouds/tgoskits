@@ -13,7 +13,7 @@ smp = ["ax-plat-riscv64-generic?/smp"]
 irq = ["ax-plat-riscv64-generic?/irq"]
 fp-simd = ["ax-cpu/fp-simd", "ax-plat-riscv64-generic?/fp-simd"]
 rtc = ["ax-plat-riscv64-generic?/rtc"]
-checkpoint-sbi-char = ["dep:sbi-rt"]
+checkpoint-sbi-char = []
 paging = []
 tls = ["ax-cpu/tls"]
 uspace = ["paging", "ax-cpu/uspace"]
@@ -31,8 +31,6 @@ ax-cpu.workspace = true
 ax-memory-addr.workspace = true
 ax-plat.workspace = true
 log.workspace = true
-fdt-parser = "0.4"
-sbi-rt = { version = "0.0.3", features = ["legacy"], optional = true }
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 ax-plat-riscv64-generic = { workspace = true, optional = true }
