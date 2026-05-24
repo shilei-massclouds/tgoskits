@@ -10,7 +10,9 @@
 extern crate ax_plat;
 
 pub mod console {
-    use ax_plat::console::{ConsoleIf, ConsoleIrqEvent};
+    use ax_plat::console::ConsoleIf;
+    #[cfg(feature = "irq")]
+    use ax_plat::console::ConsoleIrqEvent;
 
     struct ConsoleIfImpl;
 

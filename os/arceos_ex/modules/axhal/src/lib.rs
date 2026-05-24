@@ -17,11 +17,13 @@ pub mod console {
 }
 
 pub mod checkpoint;
+pub mod early_dtb;
 #[cfg(target_arch = "riscv64")]
 mod entry;
 pub mod fixmap;
 pub mod mem;
 pub mod raw_dtb;
+pub mod stack;
 pub mod task;
 pub mod vm;
 

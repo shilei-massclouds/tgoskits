@@ -31,6 +31,7 @@ ax-cpu.workspace = true
 ax-memory-addr.workspace = true
 ax-plat.workspace = true
 log.workspace = true
+fdt-parser = "0.4"
 sbi-rt = { version = "0.0.3", features = ["legacy"], optional = true }
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]

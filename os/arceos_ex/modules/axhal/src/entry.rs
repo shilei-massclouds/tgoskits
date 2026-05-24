@@ -180,6 +180,24 @@ unsafe extern "C" fn _start() -> ! {
         li      a0, {checkpoint_entry_prelude_ready}
         call    {early_checkpoint}
 
+        li      a0, {checkpoint_entry_prelude_destroyed}
+        call    {early_checkpoint}
+
+        la      a0, boot_stack
+        call    {init_stack_enable}
+        beqz    a0, 5f
+        li      a0, {checkpoint_init_stack_online}
+        call    {early_checkpoint}
+
+        call    {early_dtb_preset}
+        beqz    a0, 5f
+        li      a0, {checkpoint_platform_cpu_info_online}
+        call    {early_checkpoint}
+        li      a0, {checkpoint_physical_memory_online}
+        call    {early_checkpoint}
+        li      a0, {checkpoint_early_dtb_prepared}
+        call    {early_checkpoint}
+
 4:
         j       4b
 5:
@@ -195,6 +213,8 @@ unsafe extern "C" fn _start() -> ! {
         raw_dtb_preset_setup = sym crate::raw_dtb::__arceos_ex_raw_dtb_preset_setup,
         fixmap_preset = sym crate::fixmap::__arceos_ex_fixmap_preset,
         early_vm_setup = sym crate::vm::__arceos_ex_early_vm_setup,
+        init_stack_enable = sym crate::stack::__arceos_ex_init_stack_enable,
+        early_dtb_preset = sym crate::early_dtb::__arceos_ex_early_dtb_preset,
         trampoline_pg_dir = sym crate::vm::__arceos_ex_trampoline_pg_dir,
         early_pg_dir = sym crate::vm::__arceos_ex_early_pg_dir,
         early_checkpoint = sym early_checkpoint,
@@ -217,6 +237,11 @@ unsafe extern "C" fn _start() -> ! {
         checkpoint_init_stack_ready = const Checkpoint::InitStackReady as usize,
         checkpoint_soc_prepared = const Checkpoint::SocPrepared as usize,
         checkpoint_entry_prelude_ready = const Checkpoint::EntryPreludeReady as usize,
+        checkpoint_entry_prelude_destroyed = const Checkpoint::EntryPreludeDestroyed as usize,
+        checkpoint_init_stack_online = const Checkpoint::InitStackOnline as usize,
+        checkpoint_platform_cpu_info_online = const Checkpoint::PlatformCpuInfoOnline as usize,
+        checkpoint_physical_memory_online = const Checkpoint::PhysicalMemoryOnline as usize,
+        checkpoint_early_dtb_prepared = const Checkpoint::EarlyDtbPrepared as usize,
         satp_mode_sv39 = const crate::vm::RISCV_SATP_MODE_SV39,
         phys_virt_offset = const crate::vm::PHYS_VIRT_OFFSET,
         pt_size_on_stack = const PT_SIZE_ON_STACK,
