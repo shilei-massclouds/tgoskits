@@ -9,7 +9,7 @@ license.workspace = true
 
 [features]
 default = []
-alloc = []
+alloc = ["dep:ax-alloc"]
 dma = ["paging"]
 buddy-slab = ["alloc"]
 ipi = []
@@ -30,6 +30,7 @@ net-ng = ["ax-driver"]
 vsock = ["net-ng"]
 
 [dependencies]
+ax-alloc = { workspace = true, optional = true }
 ax-hal = { workspace = true }
 ax-log = { workspace = true }
 ax-plat = { workspace = true }

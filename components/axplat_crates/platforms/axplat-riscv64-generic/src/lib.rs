@@ -9,11 +9,27 @@
 #[macro_use]
 extern crate ax_plat;
 
+pub mod config {
+    //! Platform configuration module.
+    ax_config_macros::include_configs!(path_env = "AX_CONFIG_PATH", fallback = "axconfig.toml");
+    assert_str_eq!(
+        PACKAGE,
+        env!("CARGO_PKG_NAME"),
+        "`PACKAGE` field in the configuration does not match the Package name. Please check your \
+         configuration file."
+    );
+}
+
 mod sbi {
+    const EID_LEGACY_CONSOLE_PUTCHAR: usize = 1;
     const EID_SRST: usize = 0x5352_5354;
     const FID_SYSTEM_RESET: usize = 0;
     const RESET_TYPE_SHUTDOWN: usize = 0;
     const RESET_REASON_NONE: usize = 0;
+
+    pub fn legacy_console_putchar(byte: u8) {
+        let _ = sbi_call_1(EID_LEGACY_CONSOLE_PUTCHAR, 0, byte as usize);
+    }
 
     pub fn system_shutdown() -> ! {
         let _ = sbi_call_2(
@@ -25,6 +41,27 @@ mod sbi {
         loop {
             core::hint::spin_loop();
         }
+    }
+
+    #[inline(always)]
+    fn sbi_call_1(eid: usize, fid: usize, arg0: usize) -> (usize, usize) {
+        let error: usize;
+        let value: usize;
+
+        // SAFETY: this is the RISC-V SBI ecall ABI boundary for legacy console
+        // output; a0 carries one byte, a6/a7 carry fid/eid.
+        unsafe {
+            core::arch::asm!(
+                "ecall",
+                inlateout("a0") arg0 => error,
+                lateout("a1") value,
+                in("a6") fid,
+                in("a7") eid,
+                options(nostack)
+            );
+        }
+
+        (error, value)
     }
 
     #[inline(always)]
@@ -58,7 +95,11 @@ pub mod console {
 
     #[impl_plat_interface]
     impl ConsoleIf for ConsoleIfImpl {
-        fn write_bytes(_bytes: &[u8]) {}
+        fn write_bytes(bytes: &[u8]) {
+            for byte in bytes {
+                crate::sbi::legacy_console_putchar(*byte);
+            }
+        }
 
         fn read_bytes(_bytes: &mut [u8]) -> usize {
             0
@@ -129,5 +170,48 @@ pub mod power {
         fn cpu_num() -> usize {
             1
         }
+    }
+}
+
+pub mod time {
+    use ax_plat::time::{NANOS_PER_SEC, TimeIf};
+
+    const NANOS_PER_TICK: u64 = NANOS_PER_SEC / crate::config::devices::TIMER_FREQUENCY as u64;
+
+    struct TimeIfImpl;
+
+    #[impl_plat_interface]
+    impl TimeIf for TimeIfImpl {
+        fn current_ticks() -> u64 {
+            let ticks: usize;
+
+            // SAFETY: `rdtime` reads the RISC-V time CSR and has no memory side
+            // effects. It is the minimal timer source required by ax-std.
+            unsafe {
+                core::arch::asm!("rdtime {ticks}", ticks = out(reg) ticks, options(nomem, nostack));
+            }
+
+            ticks as u64
+        }
+
+        fn ticks_to_nanos(ticks: u64) -> u64 {
+            ticks.saturating_mul(NANOS_PER_TICK)
+        }
+
+        fn nanos_to_ticks(nanos: u64) -> u64 {
+            nanos / NANOS_PER_TICK
+        }
+
+        fn epochoffset_nanos() -> u64 {
+            0
+        }
+
+        #[cfg(feature = "irq")]
+        fn irq_num() -> usize {
+            crate::config::devices::TIMER_IRQ
+        }
+
+        #[cfg(feature = "irq")]
+        fn set_oneshot_timer(_deadline_ns: u64) {}
     }
 }

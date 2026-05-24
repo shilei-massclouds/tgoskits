@@ -7,10 +7,17 @@ use crate::{
 };
 
 const MAX_PHYSICAL_MEMORY_RANGES: usize = 4;
+const MAX_RESERVED_MEMORY_RANGES: usize = 8;
 const MAX_PLATFORM_HARTS: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PhysicalMemoryRange {
+    pub start: usize,
+    pub size: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReservedMemoryRange {
     pub start: usize,
     pub size: usize,
 }
@@ -32,6 +39,16 @@ pub static mut __arceos_ex_physical_memory_range_count: usize = 0;
 pub static mut __arceos_ex_physical_memory_ranges: [PhysicalMemoryRange;
     MAX_PHYSICAL_MEMORY_RANGES] =
     [PhysicalMemoryRange { start: 0, size: 0 }; MAX_PHYSICAL_MEMORY_RANGES];
+
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".bss.early_dtb")]
+pub static mut __arceos_ex_reserved_memory_range_count: usize = 0;
+
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".bss.early_dtb")]
+pub static mut __arceos_ex_reserved_memory_ranges: [ReservedMemoryRange;
+    MAX_RESERVED_MEMORY_RANGES] =
+    [ReservedMemoryRange { start: 0, size: 0 }; MAX_RESERVED_MEMORY_RANGES];
 
 // SAFETY: scalar lifecycle fact is written once when EntrySuccessorPhase
 // completes EarlyDtb.Cleanup.
@@ -71,6 +88,9 @@ pub unsafe extern "C" fn __arceos_ex_early_dtb_setup() -> usize {
         .find_node("/chosen")
         .and_then(|node| node.property("bootargs"));
     if !cmdline::publish_kernel_cmdline(bootargs) {
+        return 0;
+    }
+    if !publish_reserved_memory(&fdt) {
         return 0;
     }
     if !memblock::preset_from_physical_memory() {
@@ -224,6 +244,128 @@ fn publish_physical_memory(fdt: &Fdt<'_>) -> bool {
     true
 }
 
+fn publish_reserved_memory(fdt: &Fdt<'_>) -> bool {
+    let Some((root_address_cells, root_size_cells)) = root_address_size_cells(fdt) else {
+        return false;
+    };
+    let mut range_count = 0;
+
+    for range in fdt.mem_reservations() {
+        if range.size == 0 {
+            continue;
+        }
+        if !push_reserved_memory(&mut range_count, range.start, range.size) {
+            return false;
+        }
+    }
+
+    let (reserved_address_cells, reserved_size_cells) = fdt
+        .find_node("/reserved-memory")
+        .and_then(|node| {
+            let address_cells = usize::try_from(read_property_u32(&node, "#address-cells")?).ok()?;
+            let size_cells = usize::try_from(read_property_u32(&node, "#size-cells")?).ok()?;
+            Some((address_cells, size_cells))
+        })
+        .unwrap_or((root_address_cells, root_size_cells));
+
+    if !(reserved_address_cells == 1 || reserved_address_cells == 2)
+        || !(reserved_size_cells == 1 || reserved_size_cells == 2)
+    {
+        return false;
+    }
+
+    let mut in_reserved_memory = false;
+    for node in fdt.nodes() {
+        if node.depth <= 1 {
+            in_reserved_memory = node.depth == 1 && node_name_base(node.name) == "reserved-memory";
+            continue;
+        }
+        if !in_reserved_memory || node.depth != 2 {
+            continue;
+        }
+        let Some(reg) = node.property("reg") else {
+            continue;
+        };
+        if !publish_reserved_memory_reg(
+            reg,
+            reserved_address_cells,
+            reserved_size_cells,
+            &mut range_count,
+        ) {
+            return false;
+        }
+    }
+
+    // SAFETY: EarlyDtb.Setup is the only writer of FDT reserved-memory facts.
+    unsafe {
+        core::ptr::write_volatile(
+            &raw mut __arceos_ex_reserved_memory_range_count,
+            range_count,
+        );
+    }
+
+    true
+}
+
+fn publish_reserved_memory_reg(
+    mut raw: &[u8],
+    address_cells: usize,
+    size_cells: usize,
+    range_count: &mut usize,
+) -> bool {
+    let Some(tuple_cells) = address_cells.checked_add(size_cells) else {
+        return false;
+    };
+    let Some(tuple_bytes) = tuple_cells.checked_mul(4) else {
+        return false;
+    };
+    if raw.is_empty() || raw.len() % tuple_bytes != 0 {
+        return false;
+    }
+
+    while !raw.is_empty() {
+        let Some(start) = take_cell(&mut raw, address_cells) else {
+            return false;
+        };
+        let Some(size) = take_cell(&mut raw, size_cells) else {
+            return false;
+        };
+        if size == 0 {
+            continue;
+        }
+        if !push_reserved_memory(range_count, start, size) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn push_reserved_memory(range_count: &mut usize, start: usize, size: usize) -> bool {
+    if *range_count >= MAX_RESERVED_MEMORY_RANGES {
+        return false;
+    }
+    let Some(end) = start.checked_add(size) else {
+        return false;
+    };
+    if end <= start {
+        return false;
+    }
+
+    // SAFETY: EarlyDtb.Setup publishes a bounded fixed array before allocator
+    // or concurrent boot flows exist.
+    unsafe {
+        core::ptr::write_volatile(
+            (&raw mut __arceos_ex_reserved_memory_ranges)
+                .cast::<ReservedMemoryRange>()
+                .add(*range_count),
+            ReservedMemoryRange { start, size },
+        );
+    }
+    *range_count += 1;
+    true
+}
+
 fn is_cpu_node(node: &Node<'_>) -> bool {
     if node.name == "cpus" || !node.name.starts_with("cpu") {
         return false;
@@ -266,6 +408,11 @@ fn is_memory_node(node: &Node<'_>) -> bool {
     node.name.starts_with("memory") && node.prop_str_eq("device_type", b"memory")
 }
 
+fn node_name_base(name: &str) -> &str {
+    name.split_once('@')
+        .map_or(name, |(base, _unit_address)| base)
+}
+
 fn read_property_u32(node: &Node<'_>, name: &str) -> Option<u32> {
     let raw = node.property(name)?;
     if raw.len() != 4 {
@@ -299,6 +446,10 @@ pub fn physical_memory_range_count() -> usize {
     unsafe { core::ptr::read_volatile(&raw const __arceos_ex_physical_memory_range_count) }
 }
 
+pub fn reserved_memory_range_count() -> usize {
+    unsafe { core::ptr::read_volatile(&raw const __arceos_ex_reserved_memory_range_count) }
+}
+
 pub fn platform_hart_exists(hartid: usize) -> bool {
     let count = platform_hart_count();
     for index in 0..count {
@@ -330,6 +481,22 @@ pub fn physical_memory_range(index: usize) -> Option<PhysicalMemoryRange> {
         core::ptr::read_volatile(
             (&raw const __arceos_ex_physical_memory_ranges)
                 .cast::<PhysicalMemoryRange>()
+                .add(index),
+        )
+    })
+}
+
+pub fn reserved_memory_range(index: usize) -> Option<ReservedMemoryRange> {
+    if index >= reserved_memory_range_count() {
+        return None;
+    }
+
+    // SAFETY: EarlyDtb.Setup published this entry before MemBlock.Setup can
+    // consume it as a reserved range input.
+    Some(unsafe {
+        core::ptr::read_volatile(
+            (&raw const __arceos_ex_reserved_memory_ranges)
+                .cast::<ReservedMemoryRange>()
                 .add(index),
         )
     })

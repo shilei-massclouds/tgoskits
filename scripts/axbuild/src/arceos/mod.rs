@@ -188,13 +188,13 @@ impl ArceOS {
         }
     }
 
-    async fn build(&mut self, args: ArgsBuild) -> anyhow::Result<()> {
+    pub(super) async fn build(&mut self, args: ArgsBuild) -> anyhow::Result<()> {
         let request =
             self.prepare_request((&args).into(), None, None, SnapshotPersistence::Store)?;
         self.run_build_request(request).await
     }
 
-    async fn qemu(&mut self, args: ArgsQemu) -> anyhow::Result<()> {
+    pub(super) async fn qemu(&mut self, args: ArgsQemu) -> anyhow::Result<()> {
         let request = self.prepare_request(
             (&args.build).into(),
             args.qemu_config,
@@ -285,7 +285,10 @@ impl ArceOS {
         }
     }
 
-    async fn run_qemu_request(&mut self, request: ResolvedBuildRequest) -> anyhow::Result<()> {
+    pub(super) async fn run_qemu_request(
+        &mut self,
+        request: ResolvedBuildRequest,
+    ) -> anyhow::Result<()> {
         let cargo = build::load_cargo_config(&request)?;
         self.run_qemu_request_with_cargo(request, cargo).await
     }

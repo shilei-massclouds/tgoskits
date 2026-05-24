@@ -17,6 +17,7 @@ rtc = []
 smp = ["ax-plat/smp"]
 
 [dependencies]
+ax-config-macros.workspace = true
 ax-cpu.workspace = true
 ax-plat.workspace = true
 log.workspace = true

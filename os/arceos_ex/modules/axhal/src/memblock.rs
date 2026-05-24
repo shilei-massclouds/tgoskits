@@ -2,7 +2,10 @@
 
 use crate::{early_dtb, raw_dtb, vm};
 
-const MAX_MEMBLOCK_RANGES: usize = 4;
+const MAX_MEMBLOCK_CANDIDATE_RANGES: usize = 4;
+const MAX_MEMBLOCK_RESERVED_RANGES: usize = 12;
+const MAX_MEMBLOCK_USABLE_RANGES: usize =
+    MAX_MEMBLOCK_CANDIDATE_RANGES * (MAX_MEMBLOCK_RESERVED_RANGES + 1);
 const PAGE_SIZE: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,8 +37,9 @@ pub static mut __arceos_ex_memblock_candidate_range_count: usize = 0;
 // SAFETY: see `__arceos_ex_memblock_candidate_range_count`.
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".bss.memblock")]
-pub static mut __arceos_ex_memblock_candidate_ranges: [MemBlockRange; MAX_MEMBLOCK_RANGES] =
-    [MemBlockRange { start: 0, size: 0 }; MAX_MEMBLOCK_RANGES];
+pub static mut __arceos_ex_memblock_candidate_ranges: [MemBlockRange;
+    MAX_MEMBLOCK_CANDIDATE_RANGES] =
+    [MemBlockRange { start: 0, size: 0 }; MAX_MEMBLOCK_CANDIDATE_RANGES];
 
 // SAFETY: these symbols expose MemBlock.Ready facts after setup_bootmem-style
 // constraints have been applied to the candidate ranges.
@@ -46,8 +50,9 @@ pub static mut __arceos_ex_memblock_reserved_range_count: usize = 0;
 // SAFETY: see `__arceos_ex_memblock_reserved_range_count`.
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".bss.memblock")]
-pub static mut __arceos_ex_memblock_reserved_ranges: [MemBlockRange; MAX_MEMBLOCK_RANGES] =
-    [MemBlockRange { start: 0, size: 0 }; MAX_MEMBLOCK_RANGES];
+pub static mut __arceos_ex_memblock_reserved_ranges: [MemBlockRange;
+    MAX_MEMBLOCK_RESERVED_RANGES] =
+    [MemBlockRange { start: 0, size: 0 }; MAX_MEMBLOCK_RESERVED_RANGES];
 
 // SAFETY: see `__arceos_ex_memblock_reserved_range_count`.
 #[unsafe(no_mangle)]
@@ -57,8 +62,8 @@ pub static mut __arceos_ex_memblock_usable_range_count: usize = 0;
 // SAFETY: see `__arceos_ex_memblock_reserved_range_count`.
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".bss.memblock")]
-pub static mut __arceos_ex_memblock_usable_ranges: [MemBlockRange; MAX_MEMBLOCK_RANGES * 2] =
-    [MemBlockRange { start: 0, size: 0 }; MAX_MEMBLOCK_RANGES * 2];
+pub static mut __arceos_ex_memblock_usable_ranges: [MemBlockRange; MAX_MEMBLOCK_USABLE_RANGES] =
+    [MemBlockRange { start: 0, size: 0 }; MAX_MEMBLOCK_USABLE_RANGES];
 
 // SAFETY: scalar lifecycle facts are written once by the exclusive boot flow.
 #[unsafe(no_mangle)]
@@ -76,7 +81,7 @@ pub fn preset_from_physical_memory() -> bool {
     }
 
     let count = early_dtb::physical_memory_range_count();
-    if count == 0 || count > MAX_MEMBLOCK_RANGES {
+    if count == 0 || count > MAX_MEMBLOCK_CANDIDATE_RANGES {
         return false;
     }
 
@@ -129,7 +134,7 @@ pub unsafe extern "C" fn __arceos_ex_memblock_setup() -> usize {
     let Some(raw_dtb) = raw_dtb::raw_dtb() else {
         return 0;
     };
-    let mut reserved = [MemBlockRange { start: 0, size: 0 }; MAX_MEMBLOCK_RANGES];
+    let mut reserved = [MemBlockRange { start: 0, size: 0 }; MAX_MEMBLOCK_RESERVED_RANGES];
     let mut reserved_count = 0;
     if !push_reserved_range(&mut reserved, &mut reserved_count, kernel_start, kernel_end) {
         return 0;
@@ -140,6 +145,9 @@ pub unsafe extern "C" fn __arceos_ex_memblock_setup() -> usize {
         raw_dtb.start,
         raw_dtb.end,
     ) {
+        return 0;
+    }
+    if !push_fdt_reserved_ranges(&mut reserved, &mut reserved_count) {
         return 0;
     }
     sort_ranges(&mut reserved, reserved_count);
@@ -228,12 +236,33 @@ pub fn resize_allowed() -> bool {
     unsafe { core::ptr::read_volatile(&raw const __arceos_ex_memblock_resize_allowed) != 0 }
 }
 
+pub fn usable_range_count() -> usize {
+    // SAFETY: this reads the boot-time fact published by MemBlock.Setup.
+    unsafe { core::ptr::read_volatile(&raw const __arceos_ex_memblock_usable_range_count) }
+}
+
+pub fn usable_range(index: usize) -> Option<MemBlockRange> {
+    if index >= usable_range_count() {
+        return None;
+    }
+
+    // SAFETY: MemBlock.Setup published this entry before runtime allocator
+    // initialization can consume it.
+    Some(unsafe {
+        core::ptr::read_volatile(
+            (&raw const __arceos_ex_memblock_usable_ranges)
+                .cast::<MemBlockRange>()
+                .add(index),
+        )
+    })
+}
+
 fn kernel_virt_to_phys(vaddr: usize) -> Option<usize> {
     vaddr.checked_sub(vm::PHYS_VIRT_OFFSET)
 }
 
 fn push_reserved_range(
-    reserved: &mut [MemBlockRange; MAX_MEMBLOCK_RANGES],
+    reserved: &mut [MemBlockRange; MAX_MEMBLOCK_RESERVED_RANGES],
     count: &mut usize,
     start: usize,
     end: usize,
@@ -242,7 +271,7 @@ fn push_reserved_range(
     let Some(end) = align_up(end, PAGE_SIZE) else {
         return false;
     };
-    if end <= start || *count >= MAX_MEMBLOCK_RANGES {
+    if end <= start || *count >= MAX_MEMBLOCK_RESERVED_RANGES {
         return false;
     }
     reserved[*count] = MemBlockRange {
@@ -253,8 +282,27 @@ fn push_reserved_range(
     true
 }
 
+fn push_fdt_reserved_ranges(
+    reserved: &mut [MemBlockRange; MAX_MEMBLOCK_RESERVED_RANGES],
+    count: &mut usize,
+) -> bool {
+    for index in 0..early_dtb::reserved_memory_range_count() {
+        let Some(range) = early_dtb::reserved_memory_range(index) else {
+            return false;
+        };
+        let Some(end) = range.start.checked_add(range.size) else {
+            return false;
+        };
+        if !push_reserved_range(reserved, count, range.start, end) {
+            return false;
+        }
+    }
+
+    true
+}
+
 fn publish_usable_ranges(
-    reserved: &[MemBlockRange; MAX_MEMBLOCK_RANGES],
+    reserved: &[MemBlockRange; MAX_MEMBLOCK_RESERVED_RANGES],
     reserved_count: usize,
 ) -> Option<usize> {
     let mut usable_count = 0;
@@ -294,7 +342,7 @@ fn publish_usable_ranges(
 }
 
 fn publish_usable_range(count: &mut usize, start: usize, end: usize) -> Option<()> {
-    if end <= start || *count >= MAX_MEMBLOCK_RANGES * 2 {
+    if end <= start || *count >= MAX_MEMBLOCK_USABLE_RANGES {
         return None;
     }
 
@@ -332,7 +380,7 @@ fn range_is_inside_candidate(range: MemBlockRange) -> bool {
     false
 }
 
-fn sort_ranges(ranges: &mut [MemBlockRange; MAX_MEMBLOCK_RANGES], count: usize) {
+fn sort_ranges(ranges: &mut [MemBlockRange; MAX_MEMBLOCK_RESERVED_RANGES], count: usize) {
     let mut i = 0;
     while i < count {
         let mut j = i + 1;

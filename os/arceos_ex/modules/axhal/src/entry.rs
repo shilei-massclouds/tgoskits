@@ -25,6 +25,12 @@ unsafe extern "C" {
 #[unsafe(link_section = ".bss.stack")]
 static mut BOOT_STACK: [u8; BOOT_STACK_SIZE] = [0; BOOT_STACK_SIZE];
 
+#[unsafe(no_mangle)]
+extern "C" fn __arceos_ex_entry_prelude_handoff() -> ! {
+    let boot_args = crate::boot::boot_args();
+    ax_plat::call_main(0, boot_args.dtb_pa)
+}
+
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text.boot.entry")]
@@ -180,106 +186,7 @@ unsafe extern "C" fn _start() -> ! {
         li      a0, {checkpoint_entry_prelude_ready}
         call    {early_checkpoint}
 
-        li      a0, {checkpoint_entry_prelude_destroyed}
-        call    {early_checkpoint}
-
-        la      a0, boot_stack
-        call    {init_stack_enable}
-        beqz    a0, 5f
-        li      a0, {checkpoint_init_stack_online}
-        call    {early_checkpoint}
-
-        call    {early_dtb_preset}
-        beqz    a0, 5f
-        li      a0, {checkpoint_platform_cpu_info_online}
-        call    {early_checkpoint}
-        li      a0, {checkpoint_physical_memory_online}
-        call    {early_checkpoint}
-        li      a0, {checkpoint_early_dtb_prepared}
-        call    {early_checkpoint}
-
-        call    {cpu_id_map_preset}
-        beqz    a0, 5f
-        li      a0, {checkpoint_cpu_id_map_ready}
-        call    {early_checkpoint}
-
-        call    {interrupt_stream_setup}
-        beqz    a0, 5f
-        li      a0, {checkpoint_interrupt_stream_ready}
-        call    {early_checkpoint}
-
-        call    {boot_cpu_setup}
-        beqz    a0, 5f
-        li      a0, {checkpoint_boot_cpu_ready}
-        call    {early_checkpoint}
-
-        call    {boot_cpu_enable}
-        beqz    a0, 5f
-        li      a0, {checkpoint_boot_cpu_online}
-        call    {early_checkpoint}
-
-        call    {printk_buffer_preset}
-        beqz    a0, 5f
-        li      a0, {checkpoint_printk_buffer_prepared}
-        call    {early_checkpoint}
-
-        call    {early_dtb_setup}
-        beqz    a0, 5f
-        li      a0, {checkpoint_kernel_cmdline_ready}
-        call    {early_checkpoint}
-        li      a0, {checkpoint_memblock_prepared}
-        call    {early_checkpoint}
-        li      a0, {checkpoint_early_dtb_ready}
-        call    {early_checkpoint}
-
-        call    {init_mm_setup}
-        beqz    a0, 5f
-        li      a0, {checkpoint_init_mm_ready}
-        call    {early_checkpoint}
-
-        call    {early_ioremap_setup}
-        beqz    a0, 5f
-        li      a0, {checkpoint_early_ioremap_ready}
-        call    {early_checkpoint}
-
-        call    {sbi_setup}
-        beqz    a0, 5f
-        li      a0, {checkpoint_sbi_ready}
-        call    {early_checkpoint}
-
-        call    {kernel_param_setup}
-        beqz    a0, 5f
-        li      a0, {checkpoint_earlycon_online}
-        call    {early_checkpoint}
-        li      a0, {checkpoint_kernel_param_ready}
-        call    {early_checkpoint}
-
-        call    {memblock_setup}
-        beqz    a0, 5f
-        li      a0, {checkpoint_memblock_ready}
-        call    {early_checkpoint}
-
-        call    {vm_enable}
-        beqz    a0, 5f
-        li      a0, {checkpoint_swapper_vm_online}
-        call    {early_checkpoint}
-        li      a0, {checkpoint_vm_online}
-        call    {early_checkpoint}
-        li      a0, {checkpoint_early_vm_destroyed}
-        call    {early_checkpoint}
-
-        call    {memblock_enable}
-        beqz    a0, 5f
-        li      a0, {checkpoint_memblock_online}
-        call    {early_checkpoint}
-
-        call    {early_dtb_cleanup}
-        beqz    a0, 5f
-        li      a0, {checkpoint_early_dtb_destroyed}
-        call    {early_checkpoint}
-
-        li      a0, {checkpoint_entry_successor_ready}
-        call    {early_checkpoint}
+        call    {entry_prelude_handoff}
 
 4:
         j       4b
@@ -296,25 +203,10 @@ unsafe extern "C" fn _start() -> ! {
         raw_dtb_preset_setup = sym crate::raw_dtb::__arceos_ex_raw_dtb_preset_setup,
         fixmap_preset = sym crate::fixmap::__arceos_ex_fixmap_preset,
         early_vm_setup = sym crate::vm::__arceos_ex_early_vm_setup,
-        init_stack_enable = sym crate::stack::__arceos_ex_init_stack_enable,
-        early_dtb_preset = sym crate::early_dtb::__arceos_ex_early_dtb_preset,
-        cpu_id_map_preset = sym crate::cpu::__arceos_ex_cpu_id_map_preset,
-        interrupt_stream_setup = sym crate::interrupt::__arceos_ex_interrupt_stream_setup,
-        boot_cpu_setup = sym crate::cpu::__arceos_ex_boot_cpu_setup,
-        boot_cpu_enable = sym crate::cpu::__arceos_ex_boot_cpu_enable,
-        printk_buffer_preset = sym crate::printk::__arceos_ex_printk_buffer_preset,
-        early_dtb_setup = sym crate::early_dtb::__arceos_ex_early_dtb_setup,
-        init_mm_setup = sym crate::init_mm::__arceos_ex_init_mm_setup,
-        early_ioremap_setup = sym crate::early_ioremap::__arceos_ex_early_ioremap_setup,
-        sbi_setup = sym crate::sbi::__arceos_ex_sbi_setup,
-        kernel_param_setup = sym crate::kernel_param::__arceos_ex_kernel_param_setup,
-        memblock_setup = sym crate::memblock::__arceos_ex_memblock_setup,
-        vm_enable = sym crate::vm::__arceos_ex_vm_enable,
-        memblock_enable = sym crate::memblock::__arceos_ex_memblock_enable,
-        early_dtb_cleanup = sym crate::early_dtb::__arceos_ex_early_dtb_cleanup,
         trampoline_pg_dir = sym crate::vm::__arceos_ex_trampoline_pg_dir,
         early_pg_dir = sym crate::vm::__arceos_ex_early_pg_dir,
         early_checkpoint = sym early_checkpoint,
+        entry_prelude_handoff = sym __arceos_ex_entry_prelude_handoff,
         checkpoint_boot_args_ready = const Checkpoint::BootArgsReady as usize,
         checkpoint_interrupt_stream_prepared = const Checkpoint::InterruptStreamPrepared as usize,
         checkpoint_kernel_image_prepared = const Checkpoint::KernelImagePrepared as usize,
@@ -334,31 +226,6 @@ unsafe extern "C" fn _start() -> ! {
         checkpoint_init_stack_ready = const Checkpoint::InitStackReady as usize,
         checkpoint_soc_prepared = const Checkpoint::SocPrepared as usize,
         checkpoint_entry_prelude_ready = const Checkpoint::EntryPreludeReady as usize,
-        checkpoint_entry_prelude_destroyed = const Checkpoint::EntryPreludeDestroyed as usize,
-        checkpoint_init_stack_online = const Checkpoint::InitStackOnline as usize,
-        checkpoint_platform_cpu_info_online = const Checkpoint::PlatformCpuInfoOnline as usize,
-        checkpoint_physical_memory_online = const Checkpoint::PhysicalMemoryOnline as usize,
-        checkpoint_early_dtb_prepared = const Checkpoint::EarlyDtbPrepared as usize,
-        checkpoint_cpu_id_map_ready = const Checkpoint::CpuIdMapReady as usize,
-        checkpoint_interrupt_stream_ready = const Checkpoint::InterruptStreamReady as usize,
-        checkpoint_boot_cpu_ready = const Checkpoint::BootCpuReady as usize,
-        checkpoint_boot_cpu_online = const Checkpoint::BootCpuOnline as usize,
-        checkpoint_printk_buffer_prepared = const Checkpoint::PrintkBufferPrepared as usize,
-        checkpoint_kernel_cmdline_ready = const Checkpoint::KernelCmdlineReady as usize,
-        checkpoint_memblock_prepared = const Checkpoint::MemBlockPrepared as usize,
-        checkpoint_early_dtb_ready = const Checkpoint::EarlyDtbReady as usize,
-        checkpoint_init_mm_ready = const Checkpoint::InitMmReady as usize,
-        checkpoint_early_ioremap_ready = const Checkpoint::EarlyIoremapReady as usize,
-        checkpoint_sbi_ready = const Checkpoint::SbiReady as usize,
-        checkpoint_earlycon_online = const Checkpoint::EarlyConOnline as usize,
-        checkpoint_kernel_param_ready = const Checkpoint::KernelParamReady as usize,
-        checkpoint_memblock_ready = const Checkpoint::MemBlockReady as usize,
-        checkpoint_swapper_vm_online = const Checkpoint::SwapperVmOnline as usize,
-        checkpoint_vm_online = const Checkpoint::VmOnline as usize,
-        checkpoint_early_vm_destroyed = const Checkpoint::EarlyVmDestroyed as usize,
-        checkpoint_memblock_online = const Checkpoint::MemBlockOnline as usize,
-        checkpoint_early_dtb_destroyed = const Checkpoint::EarlyDtbDestroyed as usize,
-        checkpoint_entry_successor_ready = const Checkpoint::EntrySuccessorReady as usize,
         satp_mode_sv39 = const crate::vm::RISCV_SATP_MODE_SV39,
         phys_virt_offset = const crate::vm::PHYS_VIRT_OFFSET,
         pt_size_on_stack = const PT_SIZE_ON_STACK,

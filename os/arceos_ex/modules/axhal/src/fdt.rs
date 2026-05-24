@@ -32,11 +32,16 @@ impl<'a> Fdt<'a> {
 
         let off_dt_struct = usize::try_from(read_be_u32_at(blob, 8)?).ok()?;
         let off_dt_strings = usize::try_from(read_be_u32_at(blob, 12)?).ok()?;
+        let off_mem_rsvmap = usize::try_from(read_be_u32_at(blob, 16)?).ok()?;
         let size_dt_strings = usize::try_from(read_be_u32_at(blob, 32)?).ok()?;
         let size_dt_struct = usize::try_from(read_be_u32_at(blob, 36)?).ok()?;
         let struct_end = off_dt_struct.checked_add(size_dt_struct)?;
         let strings_end = off_dt_strings.checked_add(size_dt_strings)?;
-        if struct_end > blob.len() || strings_end > blob.len() {
+        if struct_end > blob.len()
+            || strings_end > blob.len()
+            || off_mem_rsvmap > blob.len()
+            || !valid_mem_reserve_block(&blob[off_mem_rsvmap..])
+        {
             return None;
         }
 
@@ -61,6 +66,16 @@ impl<'a> Fdt<'a> {
         }
     }
 
+    pub fn mem_reservations(&self) -> MemReserveIter<'a> {
+        let off_mem_rsvmap = usize::try_from(read_be_u32_at(self.blob, 16).unwrap_or(0))
+            .unwrap_or(0);
+        MemReserveIter {
+            block: &self.blob[off_mem_rsvmap..],
+            offset: 0,
+            done: false,
+        }
+    }
+
     pub fn find_node(&self, path: &str) -> Option<Node<'a>> {
         self.nodes().find(|node| node.path_eq(path))
     }
@@ -68,6 +83,39 @@ impl<'a> Fdt<'a> {
     fn string_at(&self, offset: usize) -> Option<&'a str> {
         let raw = cstr_at(self.strings_block, offset)?;
         core::str::from_utf8(raw).ok()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemReserveEntry {
+    pub start: usize,
+    pub size: usize,
+}
+
+pub struct MemReserveIter<'a> {
+    block: &'a [u8],
+    offset: usize,
+    done: bool,
+}
+
+impl Iterator for MemReserveIter<'_> {
+    type Item = MemReserveEntry;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+
+        let start = usize::try_from(read_be_u64_at(self.block, self.offset)?).ok()?;
+        self.offset = self.offset.checked_add(8)?;
+        let size = usize::try_from(read_be_u64_at(self.block, self.offset)?).ok()?;
+        self.offset = self.offset.checked_add(8)?;
+        if start == 0 && size == 0 {
+            self.done = true;
+            return None;
+        }
+
+        Some(MemReserveEntry { start, size })
     }
 }
 
@@ -193,6 +241,36 @@ fn read_be_u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
     let end = offset.checked_add(4)?;
     let raw = bytes.get(offset..end)?;
     Some(u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]))
+}
+
+fn read_be_u64_at(bytes: &[u8], offset: usize) -> Option<u64> {
+    let end = offset.checked_add(8)?;
+    let raw = bytes.get(offset..end)?;
+    Some(u64::from_be_bytes([
+        raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+    ]))
+}
+
+fn valid_mem_reserve_block(block: &[u8]) -> bool {
+    let mut offset = 0;
+    loop {
+        let Some(start) = read_be_u64_at(block, offset) else {
+            return false;
+        };
+        let Some(next_offset) = offset.checked_add(8) else {
+            return false;
+        };
+        let Some(size) = read_be_u64_at(block, next_offset) else {
+            return false;
+        };
+        let Some(next_offset) = next_offset.checked_add(8) else {
+            return false;
+        };
+        if start == 0 && size == 0 {
+            return true;
+        }
+        offset = next_offset;
+    }
 }
 
 fn cstr_at(bytes: &[u8], offset: usize) -> Option<&[u8]> {

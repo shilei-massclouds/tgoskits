@@ -13,6 +13,8 @@ use core::{panic::PanicInfo, time::Duration};
 #[macro_use]
 extern crate ax_log;
 
+mod boot;
+
 #[eii]
 fn ax_app_entry() {
     #[cfg(not(test))]
@@ -47,9 +49,16 @@ impl ax_log::LogIf for LogIfImpl {
 
 /// Primary runtime entry called by the platform after entry-prelude handoff.
 #[cfg_attr(not(test), ax_plat::main)]
-pub fn rust_main(_cpu_id: usize, _arg: usize) -> ! {
+pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
+    if !boot::entry_successor_phase_setup(cpu_id, arg) {
+        ax_hal::power::system_off()
+    }
+
     ax_log::init();
     ax_log::set_max_level(option_env!("AX_LOG").unwrap_or("info"));
+
+    #[cfg(feature = "alloc")]
+    boot::init_allocator();
 
     info!("arceos_ex runtime entered");
     ax_app_entry();

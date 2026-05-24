@@ -8,17 +8,17 @@ use ostool::ToolConfig;
 
 use crate::{
     arceos::{self, ArceOS},
-    context::{AppContext, axbuild_tmp_dir, workspace_root_path},
+    context::{
+        AppContext, BuildCliArgs, SnapshotPersistence, axbuild_tmp_dir, workspace_root_path,
+    },
 };
 
 const OVERLAY_DIR_NAME: &str = "arceos-ex-workspace";
 const DEFAULT_ARCH: &str = "riscv64";
-const DEFAULT_TEST_GROUP: &str = "std";
 const DEFAULT_TEST_CASE: &str = "helloworld";
-const DEFAULT_PACKAGE: &str = "test-arceos-std-helloworld";
-const DEFAULT_BUILD_CONFIG: &str =
-    "test-suit/arceos/std/qemu-smp1/build-riscv64gc-unknown-none-elf.toml";
-const DEFAULT_QEMU_CONFIG: &str = "test-suit/arceos/std/qemu-smp1/helloworld/qemu-riscv64.toml";
+const DEFAULT_PACKAGE: &str = "ax-helloworld";
+const DEFAULT_BUILD_CONFIG: &str = "os/arceos_ex/helloworld-riscv64.toml";
+const DEFAULT_QEMU_CONFIG: &str = "os/arceos_ex/qemu-riscv64.toml";
 const OVERLAY_MANIFEST_ENV: &str = "AXBUILD_WORKSPACE_MANIFEST";
 const DEFAULT_PLATFORM_ENV: &str = "AXBUILD_DEFAULT_PLATFORM_PACKAGE_RISCV64";
 const CHECKPOINT_SBI_CHAR_ENV: &str = "ARCEOS_EX_CHECKPOINT_SBI_CHAR";
@@ -53,30 +53,63 @@ impl ArceOSEx {
     }
 
     pub async fn execute(&mut self, command: arceos::Command) -> anyhow::Result<()> {
-        self.arceos.execute(normalize_command(command)?).await
+        match normalize_command(command)? {
+            NormalizedCommand::Arceos(command) => self.arceos.execute(command).await,
+            NormalizedCommand::DefaultHelloworldTest(args) => {
+                self.run_default_helloworld_test(args).await
+            }
+        }
+    }
+
+    async fn run_default_helloworld_test(
+        &mut self,
+        args: arceos::test::ArgsTestQemu,
+    ) -> anyhow::Result<()> {
+        let request = self.arceos.prepare_request(
+            BuildCliArgs {
+                config: Some(default_build_config()),
+                package: Some(DEFAULT_PACKAGE.to_string()),
+                arch: args.arch,
+                target: args.target,
+                plat_dyn: None,
+                smp: None,
+                debug: false,
+            },
+            Some(default_qemu_config()),
+            None,
+            SnapshotPersistence::Discard,
+        )?;
+        self.arceos.run_qemu_request(request).await
     }
 }
 
-fn normalize_command(command: arceos::Command) -> anyhow::Result<arceos::Command> {
+enum NormalizedCommand {
+    Arceos(arceos::Command),
+    DefaultHelloworldTest(arceos::test::ArgsTestQemu),
+}
+
+fn normalize_command(command: arceos::Command) -> anyhow::Result<NormalizedCommand> {
     match command {
         arceos::Command::Build(mut args) => {
             normalize_build_args(&mut args)?;
-            Ok(arceos::Command::Build(args))
+            Ok(NormalizedCommand::Arceos(arceos::Command::Build(args)))
         }
         arceos::Command::Qemu(mut args) => {
             normalize_build_args(&mut args.build)?;
             if args.qemu_config.is_none() {
                 args.qemu_config = Some(default_qemu_config());
             }
-            Ok(arceos::Command::Qemu(args))
+            Ok(NormalizedCommand::Arceos(arceos::Command::Qemu(args)))
         }
         arceos::Command::Uboot(mut args) => {
             normalize_build_args(&mut args.build)?;
-            Ok(arceos::Command::Uboot(args))
+            Ok(NormalizedCommand::Arceos(arceos::Command::Uboot(args)))
         }
         arceos::Command::Test(mut args) => {
-            normalize_test_args(&mut args)?;
-            Ok(arceos::Command::Test(args))
+            if let Some(default_args) = normalize_test_args(&mut args)? {
+                return Ok(NormalizedCommand::DefaultHelloworldTest(default_args));
+            }
+            Ok(NormalizedCommand::Arceos(arceos::Command::Test(args)))
         }
     }
 }
@@ -103,27 +136,28 @@ fn default_qemu_config() -> PathBuf {
     PathBuf::from(DEFAULT_QEMU_CONFIG)
 }
 
-fn normalize_test_args(args: &mut arceos::test::ArgsTest) -> anyhow::Result<()> {
+fn normalize_test_args(
+    args: &mut arceos::test::ArgsTest,
+) -> anyhow::Result<Option<arceos::test::ArgsTestQemu>> {
     match &mut args.command {
         arceos::test::TestCommand::Qemu(qemu) => {
             if qemu.arch.is_none() && qemu.target.is_none() && !qemu.list {
                 qemu.arch = Some(DEFAULT_ARCH.to_string());
             }
             ensure_riscv64_target(qemu.arch.as_deref(), qemu.target.as_deref())?;
-            if qemu.test_group.is_none() && !qemu.only_c && !qemu.only_rust {
-                qemu.test_group = Some(DEFAULT_TEST_GROUP.to_string());
-            }
-            if qemu.test_case.is_none()
-                && qemu.package.is_empty()
-                && !qemu.list
+            let default_helloworld = qemu.test_group.is_none()
                 && !qemu.only_c
                 && !qemu.only_rust
-            {
+                && qemu.package.is_empty();
+            if qemu.test_case.is_none() && !qemu.list && default_helloworld {
                 qemu.test_case = Some(DEFAULT_TEST_CASE.to_string());
+            }
+            if default_helloworld && qemu.test_case.as_deref() == Some(DEFAULT_TEST_CASE) {
+                return Ok(Some(qemu.clone()));
             }
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 fn ensure_riscv64_target(arch: Option<&str>, target: Option<&str>) -> anyhow::Result<()> {
