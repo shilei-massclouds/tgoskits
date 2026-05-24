@@ -198,6 +198,40 @@ unsafe extern "C" fn _start() -> ! {
         li      a0, {checkpoint_early_dtb_prepared}
         call    {early_checkpoint}
 
+        call    {cpu_id_map_preset}
+        beqz    a0, 5f
+        li      a0, {checkpoint_cpu_id_map_ready}
+        call    {early_checkpoint}
+
+        call    {interrupt_stream_setup}
+        beqz    a0, 5f
+        li      a0, {checkpoint_interrupt_stream_ready}
+        call    {early_checkpoint}
+
+        call    {boot_cpu_setup}
+        beqz    a0, 5f
+        li      a0, {checkpoint_boot_cpu_ready}
+        call    {early_checkpoint}
+
+        call    {boot_cpu_enable}
+        beqz    a0, 5f
+        li      a0, {checkpoint_boot_cpu_online}
+        call    {early_checkpoint}
+
+        call    {printk_buffer_preset}
+        beqz    a0, 5f
+        li      a0, {checkpoint_printk_buffer_prepared}
+        call    {early_checkpoint}
+
+        call    {early_dtb_setup}
+        beqz    a0, 5f
+        li      a0, {checkpoint_kernel_cmdline_ready}
+        call    {early_checkpoint}
+        li      a0, {checkpoint_memblock_prepared}
+        call    {early_checkpoint}
+        li      a0, {checkpoint_early_dtb_ready}
+        call    {early_checkpoint}
+
 4:
         j       4b
 5:
@@ -215,6 +249,12 @@ unsafe extern "C" fn _start() -> ! {
         early_vm_setup = sym crate::vm::__arceos_ex_early_vm_setup,
         init_stack_enable = sym crate::stack::__arceos_ex_init_stack_enable,
         early_dtb_preset = sym crate::early_dtb::__arceos_ex_early_dtb_preset,
+        cpu_id_map_preset = sym crate::cpu::__arceos_ex_cpu_id_map_preset,
+        interrupt_stream_setup = sym crate::interrupt::__arceos_ex_interrupt_stream_setup,
+        boot_cpu_setup = sym crate::cpu::__arceos_ex_boot_cpu_setup,
+        boot_cpu_enable = sym crate::cpu::__arceos_ex_boot_cpu_enable,
+        printk_buffer_preset = sym crate::printk::__arceos_ex_printk_buffer_preset,
+        early_dtb_setup = sym crate::early_dtb::__arceos_ex_early_dtb_setup,
         trampoline_pg_dir = sym crate::vm::__arceos_ex_trampoline_pg_dir,
         early_pg_dir = sym crate::vm::__arceos_ex_early_pg_dir,
         early_checkpoint = sym early_checkpoint,
@@ -242,6 +282,14 @@ unsafe extern "C" fn _start() -> ! {
         checkpoint_platform_cpu_info_online = const Checkpoint::PlatformCpuInfoOnline as usize,
         checkpoint_physical_memory_online = const Checkpoint::PhysicalMemoryOnline as usize,
         checkpoint_early_dtb_prepared = const Checkpoint::EarlyDtbPrepared as usize,
+        checkpoint_cpu_id_map_ready = const Checkpoint::CpuIdMapReady as usize,
+        checkpoint_interrupt_stream_ready = const Checkpoint::InterruptStreamReady as usize,
+        checkpoint_boot_cpu_ready = const Checkpoint::BootCpuReady as usize,
+        checkpoint_boot_cpu_online = const Checkpoint::BootCpuOnline as usize,
+        checkpoint_printk_buffer_prepared = const Checkpoint::PrintkBufferPrepared as usize,
+        checkpoint_kernel_cmdline_ready = const Checkpoint::KernelCmdlineReady as usize,
+        checkpoint_memblock_prepared = const Checkpoint::MemBlockPrepared as usize,
+        checkpoint_early_dtb_ready = const Checkpoint::EarlyDtbReady as usize,
         satp_mode_sv39 = const crate::vm::RISCV_SATP_MODE_SV39,
         phys_virt_offset = const crate::vm::PHYS_VIRT_OFFSET,
         pt_size_on_stack = const PT_SIZE_ON_STACK,

@@ -12,16 +12,21 @@ pub use ax_cpu::asm;
 extern crate ax_plat_riscv64_generic;
 
 pub mod boot;
+pub mod cmdline;
 pub mod console {
     pub use ax_plat::console::{read_bytes, write_bytes, write_text_bytes};
 }
 
 pub mod checkpoint;
+pub mod cpu;
 pub mod early_dtb;
 #[cfg(target_arch = "riscv64")]
 mod entry;
 pub mod fixmap;
+pub mod interrupt;
 pub mod mem;
+pub mod memblock;
+pub mod printk;
 pub mod raw_dtb;
 pub mod stack;
 pub mod task;

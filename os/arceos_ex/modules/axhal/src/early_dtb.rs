@@ -2,7 +2,7 @@ use core::slice;
 
 use fdt_parser::{Fdt, Node};
 
-use crate::{boot, fixmap, raw_dtb};
+use crate::{boot, cmdline, fixmap, memblock, raw_dtb};
 
 const MAX_PHYSICAL_MEMORY_RANGES: usize = 4;
 const MAX_PLATFORM_HARTS: usize = 16;
@@ -33,26 +33,9 @@ pub static mut __arceos_ex_physical_memory_ranges: [PhysicalMemoryRange;
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __arceos_ex_early_dtb_preset() -> usize {
-    let Some(raw_dtb) = raw_dtb::raw_dtb() else {
+    let Some(dtb) = mapped_dtb() else {
         return 0;
     };
-    let Some(fdt_slot) = fixmap::fdt_slot() else {
-        return 0;
-    };
-    let Some(raw_offset) = raw_dtb.start.checked_sub(fdt_slot.phys_start) else {
-        return 0;
-    };
-    let Some(dtb_vaddr) = fdt_slot.virt_start.checked_add(raw_offset) else {
-        return 0;
-    };
-    let Some(dtb_vaddr_end) = dtb_vaddr.checked_add(raw_dtb.total_size) else {
-        return 0;
-    };
-    if dtb_vaddr < fdt_slot.virt_start || dtb_vaddr_end > fdt_slot.virt_end {
-        return 0;
-    }
-
-    let dtb = unsafe { slice::from_raw_parts(dtb_vaddr as *const u8, raw_dtb.total_size) };
     let Ok(fdt) = Fdt::from_bytes(dtb) else {
         return 0;
     };
@@ -65,6 +48,45 @@ pub unsafe extern "C" fn __arceos_ex_early_dtb_preset() -> usize {
     }
 
     1
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __arceos_ex_early_dtb_setup() -> usize {
+    let Some(dtb) = mapped_dtb() else {
+        return 0;
+    };
+    let Ok(fdt) = Fdt::from_bytes(dtb) else {
+        return 0;
+    };
+
+    let bootargs = fdt
+        .find_nodes("/chosen")
+        .next()
+        .and_then(|node| node.find_property("bootargs"))
+        .map(|property| property.raw_value());
+    if !cmdline::publish_kernel_cmdline(bootargs) {
+        return 0;
+    }
+    if !memblock::preset_from_physical_memory() {
+        return 0;
+    }
+
+    1
+}
+
+fn mapped_dtb() -> Option<&'static [u8]> {
+    let raw_dtb = raw_dtb::raw_dtb()?;
+    let fdt_slot = fixmap::fdt_slot()?;
+    let raw_offset = raw_dtb.start.checked_sub(fdt_slot.phys_start)?;
+    let dtb_vaddr = fdt_slot.virt_start.checked_add(raw_offset)?;
+    let dtb_vaddr_end = dtb_vaddr.checked_add(raw_dtb.total_size)?;
+    if dtb_vaddr < fdt_slot.virt_start || dtb_vaddr_end > fdt_slot.virt_end {
+        return None;
+    }
+
+    // SAFETY: RawDtb.Ready and FixMap.Ready proved that this DTB physical range
+    // is fully covered by the FDT fixmap slot for EarlyDtb parsing.
+    Some(unsafe { slice::from_raw_parts(dtb_vaddr as *const u8, raw_dtb.total_size) })
 }
 
 fn publish_platform_cpu_info(fdt: &Fdt<'_>, boot_hartid: usize) -> bool {
@@ -257,4 +279,40 @@ pub fn platform_hart_count() -> usize {
 
 pub fn physical_memory_range_count() -> usize {
     unsafe { core::ptr::read_volatile(&raw const __arceos_ex_physical_memory_range_count) }
+}
+
+pub fn platform_hart_exists(hartid: usize) -> bool {
+    let count = platform_hart_count();
+    for index in 0..count {
+        // SAFETY: PlatformCpuInfo.Online published exactly `count` valid hartid
+        // entries during EarlyDtb.Preset.
+        let current = unsafe {
+            core::ptr::read_volatile(
+                (&raw const __arceos_ex_platform_harts)
+                    .cast::<usize>()
+                    .add(index),
+            )
+        };
+        if current == hartid {
+            return true;
+        }
+    }
+
+    false
+}
+
+pub fn physical_memory_range(index: usize) -> Option<PhysicalMemoryRange> {
+    if index >= physical_memory_range_count() {
+        return None;
+    }
+
+    // SAFETY: PhysicalMemory.Online published this entry before MemBlock.Preset
+    // can copy it as a candidate range.
+    Some(unsafe {
+        core::ptr::read_volatile(
+            (&raw const __arceos_ex_physical_memory_ranges)
+                .cast::<PhysicalMemoryRange>()
+                .add(index),
+        )
+    })
 }
