@@ -9,17 +9,17 @@ license.workspace = true
 
 [features]
 default = []
-alloc = ["dep:ax-alloc"]
+alloc = []
 dma = ["paging"]
-buddy-slab = ["alloc"]
+buddy-slab = []
 ipi = []
 irq = ["ax-hal/irq"]
 multitask = []
 paging = ["ax-hal/paging"]
 rtc = []
-smp = ["alloc", "ax-hal/smp"]
+smp = ["ax-hal/smp"]
 tls = ["ax-hal/tls"]
-plat-dyn = ["ax-hal/plat-dyn", "paging", "buddy-slab"]
+plat-dyn = ["ax-hal/plat-dyn", "paging"]
 ax-driver = []
 display = ["ax-driver"]
 fs = ["ax-driver"]
@@ -30,8 +30,6 @@ net-ng = ["ax-driver"]
 vsock = ["net-ng"]
 
 [dependencies]
-ax-alloc = { workspace = true, optional = true }
 ax-hal = { workspace = true }
-ax-log = { workspace = true }
 ax-plat = { workspace = true }
 ax-crate-interface = { workspace = true }
