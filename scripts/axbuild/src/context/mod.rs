@@ -193,11 +193,22 @@ impl AppContext {
         qemu: QemuConfig,
         capture_backtrace: Option<crate::backtrace::BacktraceQemuCapture>,
     ) -> anyhow::Result<()> {
-        let _path_guard = self.scoped_qemu_path(cargo)?;
         let success_regex = qemu.success_regex.clone();
+        self.run_qemu_with_success_contract(cargo, qemu, capture_backtrace, &success_regex)
+            .await
+    }
+
+    async fn run_qemu_with_success_contract(
+        &mut self,
+        cargo: &Cargo,
+        qemu: QemuConfig,
+        capture_backtrace: Option<crate::backtrace::BacktraceQemuCapture>,
+        success_regex: &[String],
+    ) -> anyhow::Result<()> {
+        let _path_guard = self.scoped_qemu_path(cargo)?;
         let (capture_backtrace, success_output) =
             crate::support::qemu_success::capture_required_success_output(
-                &success_regex,
+                success_regex,
                 capture_backtrace,
             );
         let output_capture = capture_backtrace
@@ -243,10 +254,12 @@ impl AppContext {
             &cargo.target,
         )?;
         crate::support::axtest_coverage::apply_qemu_monitor(&mut qemu, &paths)?;
-        crate::support::axtest_coverage::update_success_regex(&mut qemu);
+        let success_regex = crate::support::axtest_coverage::update_success_regex(&mut qemu);
         let capture = crate::support::axtest_coverage::AxtestCoverageCaptureGuard::install(&paths)
             .context("failed to install axtest coverage capture")?;
-        let result = self.run_qemu(cargo, qemu, capture_backtrace).await;
+        let result = self
+            .run_qemu_with_success_contract(cargo, qemu, capture_backtrace, &success_regex)
+            .await;
         capture.finish()?;
         result
     }
