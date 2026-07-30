@@ -61,7 +61,7 @@ stack-protector = ["ax-runtime/stack-protector"]
 axtest = []
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(axtest)', 'cfg(feature, values("ax-std"))'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(axtest)', 'cfg(axtest_coverage)', 'cfg(feature, values("ax-std"))'] }
 
 [dependencies]
 ax-alloc = { workspace = true }

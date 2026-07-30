@@ -1794,6 +1794,24 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             }
         }),
     );
+    // Coverage dump trigger: writing to /proc/starry-test-coverage calls
+    // axtest::dump_coverage() to emit AXTEST_COVERAGE markers for host-side
+    // profraw capture via QEMU monitor memsave. Only compiled when the
+    // axtest_coverage cfg is active (coverage build).
+    #[cfg(axtest_coverage)]
+    root.add(
+        "starry-test-coverage",
+        SimpleFile::new_regular(
+            fs.clone(),
+            RwFile::new(move |req| match req {
+                SimpleFileOperation::Read => Ok(Some(Vec::new())),
+                SimpleFileOperation::Write(_data) => {
+                    axtest::dump_coverage();
+                    Ok(None)
+                }
+            }),
+        ),
+    );
     // Timer-tick callbacks registered once on the boot CPU.
     // IRQ counting: increment the module-level IRQ_CNT on every tick.
     ax_task::register_timer_callback(|_| {

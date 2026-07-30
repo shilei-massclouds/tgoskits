@@ -22,6 +22,7 @@ const COVERAGE_FEATURE: &str = "axtest/coverage";
 const MARKER_PREFIX: &str = "AXTEST_COVERAGE status=ready";
 const SUITE_OK_MARKER: &str = "AXTEST_SUITE_OK";
 pub(crate) const COVERAGE_DONE_MARKER: &str = "AXTEST_COVERAGE_DONE";
+pub(crate) const DEFERRED_FAIL_MARKER: &str = "AXTEST_COVERAGE_DEFERRED_FAIL";
 
 pub(crate) fn enabled(cargo: &Cargo) -> bool {
     crate::build::env_truthy(&cargo.env, "AXTEST_COVERAGE")
@@ -153,8 +154,8 @@ mod capture {
     use regex::Regex;
 
     use super::{
-        AxtestCoveragePaths, COVERAGE_DONE_MARKER, MARKER_PREFIX, SUITE_OK_MARKER,
-        remove_stale_profraw,
+        AxtestCoveragePaths, COVERAGE_DONE_MARKER, DEFERRED_FAIL_MARKER, MARKER_PREFIX,
+        SUITE_OK_MARKER, remove_stale_profraw,
     };
 
     pub(crate) struct AxtestCoverageCaptureGuard {
@@ -171,6 +172,7 @@ mod capture {
         line_buf: String,
         dumped: bool,
         completion_signaled: bool,
+        deferred_fail: bool,
         error: Option<String>,
         monitor_conn: Option<UnixStream>,
     }
@@ -207,6 +209,7 @@ mod capture {
                 line_buf: String::new(),
                 dumped: false,
                 completion_signaled: false,
+                deferred_fail: false,
                 error: None,
                 monitor_conn: None,
             }));
@@ -241,18 +244,27 @@ mod capture {
                                 // to ostool so it can stop waiting.
                                 if state.dumped && !state.completion_signaled {
                                     state.completion_signaled = true;
-                                    let marker = format!("{COVERAGE_DONE_MARKER}\n");
+                                    let mut marker = format!("{COVERAGE_DONE_MARKER}\n");
+                                    // Emit deferred fail marker after coverage
+                                    // done so mismatch is visible to the runner
+                                    // only after profraw extraction succeeds.
+                                    if state.deferred_fail {
+                                        marker.push_str(DEFERRED_FAIL_MARKER);
+                                        marker.push('\n');
+                                    }
                                     terminal.write_all(marker.as_bytes())?;
                                 }
                             }
 
                             tee_buf.push_str(&chunk);
                             // Flush complete lines to terminal, filtering out
-                            // AXTEST_SUITE_OK so ostool doesn't kill QEMU before
-                            // coverage extraction finishes.
+                            // AXTEST_SUITE_OK and deferred fail marker so ostool
+                            // doesn't kill QEMU before coverage extraction finishes.
                             while let Some(newline) = tee_buf.find('\n') {
                                 let line = &tee_buf[..=newline];
-                                if !line.contains(SUITE_OK_MARKER) {
+                                if !line.contains(SUITE_OK_MARKER)
+                                    && !line.contains(DEFERRED_FAIL_MARKER)
+                                {
                                     terminal.write_all(line.as_bytes())?;
                                 }
                                 tee_buf.drain(..=newline);
@@ -263,7 +275,10 @@ mod capture {
                     }
                 }
                 // Flush any remaining partial line
-                if !tee_buf.is_empty() && !tee_buf.contains(SUITE_OK_MARKER) {
+                if !tee_buf.is_empty()
+                    && !tee_buf.contains(SUITE_OK_MARKER)
+                    && !tee_buf.contains(DEFERRED_FAIL_MARKER)
+                {
                     terminal.write_all(tee_buf.as_bytes())?;
                 }
                 terminal.flush()
@@ -338,6 +353,10 @@ mod capture {
         }
 
         fn process_line(&mut self, line: &str) {
+            if line.contains(DEFERRED_FAIL_MARKER) {
+                self.deferred_fail = true;
+                return;
+            }
             if self.dumped || !line.starts_with(MARKER_PREFIX) {
                 return;
             }
@@ -478,6 +497,7 @@ mod capture {
                 line_buf: String::new(),
                 dumped: false,
                 completion_signaled: false,
+                deferred_fail: false,
                 error: None,
                 monitor_conn: Some(client),
             };
