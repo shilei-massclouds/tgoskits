@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Dict, Optional
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from pipe_oracle.artifact import validate_failure, load_metadata, build_metadata, save_metadata
+from pipe_oracle.common import CORPUS_DIR
+
+
+WORKSPACE_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Replay a pipe oracle failure artifact"
+    )
+    parser.add_argument("failure_path", type=Path,
+                        help="Path to the failure directory")
+    parser.add_argument("--refresh-host", action="store_true",
+                        help="Re-record the host trace without overwriting original evidence")
+    args = parser.parse_args()
+
+    failure_dir = args.failure_path.resolve()
+    if not failure_dir.is_dir():
+        print(f"Error: {failure_dir} is not a directory", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        meta = validate_failure(failure_dir)
+    except (AssertionError, FileNotFoundError, json.JSONDecodeError) as e:
+        print(f"Validation error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Replaying failure: {failure_dir.name}")
+    print(f"  Schema version: {meta.get('schema_version')}")
+    print(f"  Category: {meta.get('guest_result_category', 'unknown')}")
+    print(f"  Git commit: {meta.get('git_commit', 'unknown')}")
+
+    if args.refresh_host:
+        _refresh_host(failure_dir, meta)
+    else:
+        _replay_guest(failure_dir, meta)
+
+
+def _replay_guest(failure_dir: Path, meta: Dict):
+    elf = failure_dir / "pipe-linux-oracle"
+    ops = failure_dir / "pipe.ops"
+    trace = failure_dir / "linux.trace"
+
+    run_dir = failure_dir / "replay-runs"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    run_id = _next_run_id(run_dir)
+    run_path = run_dir / run_id
+    run_path.mkdir()
+
+    result = subprocess.run(
+        [
+            "cargo", "xtask", "starry", "test", "qemu",
+            "--arch", "x86_64",
+            "-c", "qemu/pipe-linux-oracle",
+        ],
+        cwd=str(WORKSPACE_ROOT),
+        capture_output=True, text=True, timeout=600,
+    )
+
+    guest_log = result.stdout + "\n" + result.stderr
+    (run_path / "guest.log").write_text(guest_log)
+    profraws = list(Path(WORKSPACE_ROOT / "coverage").glob("*.profraw"))
+    for p in profraws:
+        shutil.copy2(p, run_path / p.name)
+
+    passed = result.returncode == 0
+    replay_meta = build_metadata(
+        seed=meta.get("fuzz_seed"),
+        batch_index=meta.get("batch_index", -1),
+        generator_version=meta.get("generator_version", "unknown"),
+        input_path=failure_dir / "input.bin" if (failure_dir / "input.bin").exists() else None,
+        elf_path=elf,
+        ops_path=ops,
+        trace_path=trace,
+        guest_log_path=run_path / "guest.log",
+        profraw_paths=list(run_path.glob("*.profraw")),
+        command=" ".join(sys.argv),
+        result_category="passed" if passed else meta.get("guest_result_category", "mismatch"),
+    )
+    save_metadata(run_path, replay_meta)
+
+    if passed:
+        print(f"  REPLAY PASSED: saved to {run_path}")
+    else:
+        print(f"  REPLAY FAILED: saved to {run_path}")
+        sys.exit(1)
+
+
+def _refresh_host(failure_dir: Path, meta: Dict):
+    elf = failure_dir / "pipe-linux-oracle"
+    ops = failure_dir / "pipe.ops"
+
+    refresh_dir = failure_dir / "refresh-runs"
+    refresh_dir.mkdir(parents=True, exist_ok=True)
+    run_id = _next_run_id(refresh_dir)
+    run_path = refresh_dir / run_id
+    run_path.mkdir()
+
+    new_trace = run_path / "linux.trace"
+    result = subprocess.run(
+        [str(elf), "--record", str(ops), str(new_trace)],
+        capture_output=True, text=True, timeout=30,
+    )
+
+    host_log = result.stdout + "\n" + result.stderr
+    (run_path / "host.log").write_text(host_log)
+
+    if result.returncode != 0:
+        print(f"  HOST RECORD FAILED: saved to {run_path}", file=sys.stderr)
+        sys.exit(1)
+
+    refresh_meta = build_metadata(
+        seed=meta.get("fuzz_seed"),
+        batch_index=meta.get("batch_index", -1),
+        generator_version=meta.get("generator_version", "unknown"),
+        input_path=failure_dir / "input.bin" if (failure_dir / "input.bin").exists() else None,
+        elf_path=elf,
+        ops_path=ops,
+        trace_path=new_trace,
+        guest_log_path=run_path / "host.log",
+        profraw_paths=None,
+        command=" ".join(sys.argv),
+        result_category="refresh-host",
+    )
+    save_metadata(run_path, refresh_meta)
+
+    old_meta_path = failure_dir / "metadata.json"
+    old_meta = json.loads(old_meta_path.read_text())
+    print(f"  Old host: {old_meta.get('host_uname', {}).get('release', 'unknown')}")
+    print(f"  New host: {refresh_meta.get('host_uname', {}).get('release', 'unknown')}")
+    print(f"  Old trace SHA-256: {old_meta.get('trace_sha256', 'unknown')}")
+    print(f"  New trace SHA-256: {refresh_meta.get('trace_sha256', 'unknown')}")
+    print(f"  Refresh saved to {run_path}")
+
+
+def _next_run_id(run_dir: Path) -> str:
+    existing = [d for d in run_dir.iterdir() if d.is_dir()]
+    n = len(existing) + 1
+    return f"run-{n:04d}"
+
+
+if __name__ == "__main__":
+    main()
