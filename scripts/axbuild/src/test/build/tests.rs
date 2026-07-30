@@ -3,6 +3,7 @@ use std::{collections::BTreeSet, ffi::OsStr, fs, path::PathBuf, process::Command
 use tempfile::tempdir;
 
 use super::{grouped_c::*, toolchain::*, *};
+use crate::test::case::AssetCachePolicy;
 
 fn fake_config() -> CaseAssetConfig {
     CaseAssetConfig {
@@ -45,6 +46,7 @@ fn fake_case(root: &Path, name: &str) -> TestQemuCase {
         test_commands: Vec::new(),
         host_symbolize_success_regex: Vec::new(),
         host_http_server: None,
+        asset_cache: AssetCachePolicy::Reuse,
         subcases: Vec::new(),
         grouped_subcase_filter: None,
     }

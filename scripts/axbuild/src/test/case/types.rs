@@ -36,8 +36,17 @@ pub(crate) struct TestQemuCase {
     pub(crate) test_commands: Vec<String>,
     pub(crate) host_symbolize_success_regex: Vec<String>,
     pub(crate) host_http_server: Option<HostHttpServerConfig>,
+    pub(crate) asset_cache: AssetCachePolicy,
     pub(crate) subcases: Vec<TestQemuSubcase>,
     pub(crate) grouped_subcase_filter: Option<BTreeSet<String>>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum AssetCachePolicy {
+    #[default]
+    Reuse,
+    Bypass,
 }
 
 impl TestQemuCase {

@@ -89,6 +89,8 @@ pub(crate) struct QemuCaseExtraConfig {
     #[serde(default)]
     pub(crate) host_http_server: Option<HostHttpServerConfig>,
     #[serde(default)]
+    pub(crate) asset_cache: AssetCachePolicy,
+    #[serde(default)]
     pub(crate) snapshot: Option<bool>,
 }
 

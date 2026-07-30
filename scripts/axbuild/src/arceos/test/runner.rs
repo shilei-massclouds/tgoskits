@@ -360,6 +360,7 @@ mod tests {
                     test_commands: Vec::new(),
                     host_symbolize_success_regex: Vec::new(),
                     host_http_server: None,
+                    asset_cache: crate::test::case::AssetCachePolicy::Reuse,
                     subcases: Vec::new(),
                     grouped_subcase_filter: None,
                 },

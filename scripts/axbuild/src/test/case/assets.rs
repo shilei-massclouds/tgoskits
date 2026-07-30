@@ -189,7 +189,13 @@ pub(crate) fn prepare_case_assets_sync(
             .with_context(|| format!("failed to create {}", layout.run_dir.display()))?;
         timing_stage.finish();
 
-        let cache_hit = if is_valid_rootfs_cache_image(&rootfs_cache_img) {
+        let cache_hit = if rootfs_cache_img
+            .as_deref()
+            .is_some_and(is_valid_rootfs_cache_image)
+        {
+            let rootfs_cache_img = rootfs_cache_img
+                .as_deref()
+                .expect("a valid cache image has a path");
             // Cache HIT: copy/reflink the cached post-injection image. No need
             // to copy shared_rootfs, build an overlay, or run inject_overlay.
             let timing_stage = timing::TimingStage::new(
@@ -201,7 +207,7 @@ pub(crate) fn prepare_case_assets_sync(
                     ("cache", "hit".to_string()),
                 ],
             );
-            let result = copy_file_fast(&rootfs_cache_img, &layout.case_rootfs_copy);
+            let result = copy_file_fast(rootfs_cache_img, &layout.case_rootfs_copy);
             timing_stage.finish();
             result?;
             true
@@ -258,9 +264,13 @@ pub(crate) fn prepare_case_assets_sync(
                     ("cache", "miss".to_string()),
                 ],
             );
-            let result = save_rootfs_cache_image(&layout.case_rootfs_copy, &rootfs_cache_img);
-            timing_stage.finish();
-            result?;
+            if let Some(rootfs_cache_img) = rootfs_cache_img.as_deref() {
+                let result = save_rootfs_cache_image(&layout.case_rootfs_copy, rootfs_cache_img);
+                timing_stage.finish();
+                result?;
+            } else {
+                timing_stage.finish();
+            }
             false
         };
 

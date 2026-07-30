@@ -142,6 +142,9 @@ target/<target>/qemu-cases/<build_group>/<case>/cache/rootfs/
 ```
 
 plain case 不复制 rootfs，依赖 QEMU `-snapshot` 保证 guest 写入不落回共享镜像。
+如果用例的资产必须在每次运行时重新生成（例如参照结果来自本次宿主机 Linux
+执行），在 `qemu-<arch>.toml` 中设置 `asset_cache = "bypass"`。该策略会跳过
+rootfs 资产缓存的读取和写入；普通用例默认使用 `reuse`，不应无理由关闭缓存。
 
 ## QEMU TOML
 
@@ -155,6 +158,7 @@ plain case 不复制 rootfs，依赖 QEMU `-snapshot` 保证 guest 写入不落�
 | `shell_prefix` | 等待 guest shell 的提示符 |
 | `shell_init_cmd` | plain/C/sh/python case 的 guest 命令 |
 | `test_commands` | grouped case 的 guest 命令列表；不能与 `shell_init_cmd` 同时使用 |
+| `asset_cache` | pipeline 资产缓存策略：默认 `reuse`；需要每次重新生成资产时使用 `bypass` |
 | `success_regex` | 全部匹配才 PASS |
 | `fail_regex` | 任一匹配即 FAIL |
 | `timeout` | 超时时间，单位秒 |

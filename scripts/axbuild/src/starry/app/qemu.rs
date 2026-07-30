@@ -103,6 +103,7 @@ pub(crate) fn app_qemu_test_case(
         test_commands: case.test_commands.clone(),
         host_symbolize_success_regex: case.host_symbolize_success_regex.clone(),
         host_http_server: case.host_http_server.clone(),
+        asset_cache: crate::test::case::AssetCachePolicy::Reuse,
         subcases: case.subcases.clone(),
         grouped_subcase_filter: None,
     })

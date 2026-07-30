@@ -1,4 +1,21 @@
-use crate::test::qemu::{summary::*, tree::*, types::*};
+use crate::test::{
+    case::AssetCachePolicy,
+    qemu::{summary::*, tree::*, types::*},
+};
+
+#[test]
+fn qemu_asset_cache_defaults_to_reuse() {
+    let config: QemuCaseExtraConfig = toml::from_str("").unwrap();
+
+    assert_eq!(config.asset_cache, AssetCachePolicy::Reuse);
+}
+
+#[test]
+fn qemu_asset_cache_accepts_bypass() {
+    let config: QemuCaseExtraConfig = toml::from_str("asset_cache = \"bypass\"").unwrap();
+
+    assert_eq!(config.asset_cache, AssetCachePolicy::Bypass);
+}
 
 #[test]
 fn qemu_failure_summary_is_aggregated() {

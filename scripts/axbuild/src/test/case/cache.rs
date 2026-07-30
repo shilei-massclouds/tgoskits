@@ -19,9 +19,12 @@ pub(super) fn rootfs_cache_image_path(
     case: &TestQemuCase,
     shared_rootfs: &Path,
     config: &CaseAssetConfig,
-) -> anyhow::Result<PathBuf> {
+) -> anyhow::Result<Option<PathBuf>> {
+    if case.asset_cache == super::AssetCachePolicy::Bypass {
+        return Ok(None);
+    }
     let key = case_asset_cache_key(arch, target, pipeline, case, shared_rootfs, config)?;
-    Ok(layout.rootfs_cache_dir.join(format!("{key}.img")))
+    Ok(Some(layout.rootfs_cache_dir.join(format!("{key}.img"))))
 }
 
 fn rootfs_cache_write_enabled() -> bool {

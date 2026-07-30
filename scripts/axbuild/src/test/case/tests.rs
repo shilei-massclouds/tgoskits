@@ -89,6 +89,7 @@ fn fake_case(root: &Path, name: &str) -> TestQemuCase {
         test_commands: Vec::new(),
         host_symbolize_success_regex: Vec::new(),
         host_http_server: None,
+        asset_cache: AssetCachePolicy::Reuse,
         subcases: Vec::new(),
         grouped_subcase_filter: None,
     }
@@ -292,6 +293,29 @@ fn grouped_cache_key_tracks_subcase_filter() {
     .unwrap();
 
     assert_ne!(full_group, single_subcase);
+}
+
+#[test]
+fn bypass_policy_disables_rootfs_cache_path() {
+    let root = tempdir().unwrap();
+    let shared_img = root.path().join("rootfs.img");
+    fs::write(&shared_img, b"rootfs").unwrap();
+    let mut case = fake_case(root.path(), "linux-oracle");
+    case.asset_cache = AssetCachePolicy::Bypass;
+    let layout = case_asset_layout(root.path(), "x86_64-unknown-none", &case.display_name).unwrap();
+
+    let cache_path = rootfs_cache_image_path(
+        &layout,
+        "x86_64",
+        "x86_64-unknown-none",
+        CasePipeline::C,
+        &case,
+        &shared_img,
+        &fake_config(),
+    )
+    .unwrap();
+
+    assert!(cache_path.is_none());
 }
 
 #[test]
