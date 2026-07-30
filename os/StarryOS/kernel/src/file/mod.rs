@@ -68,7 +68,7 @@ pub(crate) use self::epoll_topology::push_topology_item_preserves_order_and_grow
 pub(crate) use self::fs::metadata_to_kstat_conversion_rules_hold_for_test;
 #[cfg(axtest)]
 pub(crate) use self::pipe::{
-    peer_close_with_multiple_readers_is_visible_for_test,
+    peer_close_with_multiple_readers_is_visible_for_test, pipe_linux_io_semantics_hold_for_test,
     pipe_resize_rounding_and_state_rules_hold_for_test, resize_rejects_oversized_pipe_for_test,
 };
 #[cfg(axtest)]
