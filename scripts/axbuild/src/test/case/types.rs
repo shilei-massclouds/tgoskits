@@ -37,6 +37,7 @@ pub(crate) struct TestQemuCase {
     pub(crate) host_symbolize_success_regex: Vec<String>,
     pub(crate) host_http_server: Option<HostHttpServerConfig>,
     pub(crate) asset_cache: AssetCachePolicy,
+    pub(crate) default_run: bool,
     pub(crate) subcases: Vec<TestQemuSubcase>,
     pub(crate) grouped_subcase_filter: Option<BTreeSet<String>>,
 }

@@ -1,5 +1,121 @@
 use super::*;
 
+fn write_qemu_test_config_with_default_run(
+    root: &Path,
+    _group: &str,
+    build_group: &str,
+    case_name: &str,
+    arch: &str,
+    default_run: bool,
+) {
+    let path = root
+        .join("test-suit/starryos")
+        .join(build_group)
+        .join(case_name)
+        .join(format!("qemu-{arch}.toml"));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, format!("timeout = 1\ndefault_run = {default_run}\n")).unwrap();
+}
+
+#[test]
+fn default_run_true_case_included_in_default_discovery() {
+    let root = tempdir().unwrap();
+    write_qemu_build_config(root.path(), "normal", "default", "x86_64-unknown-none");
+    write_qemu_test_config_with_default_run(
+        root.path(),
+        "normal",
+        "default",
+        "smoke",
+        "x86_64",
+        true,
+    );
+
+    let cases = discover_qemu_cases(root.path(), "x86_64", "x86_64-unknown-none", None).unwrap();
+
+    assert_eq!(cases.len(), 1);
+    assert_eq!(cases[0].case.name, "smoke");
+}
+
+#[test]
+fn default_run_false_case_skipped_in_default_discovery() {
+    let root = tempdir().unwrap();
+    write_qemu_build_config(root.path(), "normal", "default", "x86_64-unknown-none");
+    write_qemu_test_config_with_default_run(
+        root.path(),
+        "normal",
+        "default",
+        "manual-only",
+        "x86_64",
+        false,
+    );
+
+    let cases = discover_qemu_cases(root.path(), "x86_64", "x86_64-unknown-none", None).unwrap();
+
+    assert!(cases.is_empty());
+}
+
+#[test]
+fn default_run_false_case_discoverable_with_explicit_selection() {
+    let root = tempdir().unwrap();
+    write_qemu_build_config(root.path(), "normal", "default", "x86_64-unknown-none");
+    write_qemu_test_config_with_default_run(
+        root.path(),
+        "normal",
+        "default",
+        "manual-only",
+        "x86_64",
+        false,
+    );
+
+    let cases = discover_qemu_cases(
+        root.path(),
+        "x86_64",
+        "x86_64-unknown-none",
+        Some("manual-only"),
+    )
+    .unwrap();
+
+    assert_eq!(cases.len(), 1);
+    assert_eq!(cases[0].case.name, "manual-only");
+}
+
+#[test]
+fn default_run_false_case_excluded_from_default_list() {
+    let root = tempdir().unwrap();
+    write_flat_qemu_build_config(root.path(), "qemu", "x86_64-unknown-none");
+    write_qemu_test_config_with_default_run(
+        root.path(),
+        "normal",
+        "qemu",
+        "manual-only",
+        "x86_64",
+        false,
+    );
+
+    let listed = discover_all_qemu_cases_with_archs(root.path(), None).unwrap();
+
+    assert!(listed.iter().all(|c| c.name != "qemu/manual-only"));
+}
+
+#[test]
+fn default_run_false_case_listable_with_explicit_selection() {
+    let root = tempdir().unwrap();
+    write_flat_qemu_build_config(root.path(), "qemu", "x86_64-unknown-none");
+    write_qemu_test_config_with_default_run(
+        root.path(),
+        "normal",
+        "qemu",
+        "manual-only",
+        "x86_64",
+        false,
+    );
+
+    let listed = discover_all_qemu_cases_with_archs(root.path(), Some("manual-only")).unwrap();
+
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, "qemu/manual-only");
+}
+
 #[test]
 fn starry_grouped_cases_install_profile_autorun() {
     let config = starry_case_asset_config();

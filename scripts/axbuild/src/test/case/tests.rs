@@ -90,6 +90,7 @@ fn fake_case(root: &Path, name: &str) -> TestQemuCase {
         host_symbolize_success_regex: Vec::new(),
         host_http_server: None,
         asset_cache: AssetCachePolicy::Reuse,
+        default_run: true,
         subcases: Vec::new(),
         grouped_subcase_filter: None,
     }

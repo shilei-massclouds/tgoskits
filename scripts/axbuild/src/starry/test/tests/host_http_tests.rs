@@ -21,6 +21,7 @@ fn starry_qemu_case_starts_host_http_server_from_loaded_config() {
             dir: None,
         }),
         asset_cache: case::AssetCachePolicy::Reuse,
+        default_run: true,
         subcases: Vec::new(),
         grouped_subcase_filter: None,
     };

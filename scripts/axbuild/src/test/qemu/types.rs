@@ -90,8 +90,14 @@ pub(crate) struct QemuCaseExtraConfig {
     pub(crate) host_http_server: Option<HostHttpServerConfig>,
     #[serde(default)]
     pub(crate) asset_cache: AssetCachePolicy,
+    #[serde(default = "default_run_true")]
+    pub(crate) default_run: bool,
     #[serde(default)]
     pub(crate) snapshot: Option<bool>,
+}
+
+fn default_run_true() -> bool {
+    true
 }
 
 pub(super) fn list_qemu_cases_unexpected_error(err: anyhow::Error) -> ListQemuCasesError {

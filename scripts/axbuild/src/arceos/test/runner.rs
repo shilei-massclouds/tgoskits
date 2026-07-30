@@ -361,6 +361,7 @@ mod tests {
                     host_symbolize_success_regex: Vec::new(),
                     host_http_server: None,
                     asset_cache: crate::test::case::AssetCachePolicy::Reuse,
+                    default_run: true,
                     subcases: Vec::new(),
                     grouped_subcase_filter: None,
                 },

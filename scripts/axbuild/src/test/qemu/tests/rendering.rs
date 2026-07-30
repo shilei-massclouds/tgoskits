@@ -18,6 +18,27 @@ fn qemu_asset_cache_accepts_bypass() {
 }
 
 #[test]
+fn qemu_default_run_defaults_to_true() {
+    let config: QemuCaseExtraConfig = toml::from_str("").unwrap();
+
+    assert!(config.default_run);
+}
+
+#[test]
+fn qemu_default_run_accepts_false() {
+    let config: QemuCaseExtraConfig = toml::from_str("default_run = false").unwrap();
+
+    assert!(!config.default_run);
+}
+
+#[test]
+fn qemu_default_run_accepts_true() {
+    let config: QemuCaseExtraConfig = toml::from_str("default_run = true").unwrap();
+
+    assert!(config.default_run);
+}
+
+#[test]
 fn qemu_failure_summary_is_aggregated() {
     let mut summary = QemuTestSummary::default();
     summary.pass_with_detail("pkg-a", "0.10s");

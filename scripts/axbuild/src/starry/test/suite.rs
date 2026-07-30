@@ -49,7 +49,44 @@ pub(crate) fn discover_all_qemu_cases_with_archs(
     } else {
         selected_case
     };
-    qemu_test::discover_all_qemu_cases_with_archs(&test_suite_dir, selected_case, "Starry", "qemu")
+    let mut listed = qemu_test::discover_all_qemu_cases_with_archs(
+        &test_suite_dir,
+        selected_case,
+        "Starry",
+        "qemu",
+    )?;
+    if selected_case.is_none() {
+        listed.retain(|case| qemu_case_has_default_run(&test_suite_dir, &case.name));
+    }
+    Ok(listed)
+}
+
+fn qemu_case_has_default_run(test_suite_dir: &Path, case_name: &str) -> bool {
+    let case_dir = test_suite_dir.join(case_name);
+    let qemu_config_path = case_dir.join("qemu-x86_64.toml");
+    if !qemu_config_path.is_file() {
+        for entry in match fs::read_dir(&case_dir) {
+            Ok(entries) => entries,
+            Err(_) => return true,
+        } {
+            let Ok(entry) = entry else { continue };
+            let path = entry.path();
+            if path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("qemu-") && n.ends_with(".toml"))
+                && let Ok(config) = qemu_test::load_qemu_case_extra_config(&path)
+            {
+                return config.default_run;
+            }
+        }
+        true
+    } else if let Ok(config) = qemu_test::load_qemu_case_extra_config(&qemu_config_path) {
+        config.default_run
+    } else {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -85,6 +122,7 @@ pub(crate) fn format_duration(duration: Duration) -> String {
     format!("{:.2}s", duration.as_secs_f64())
 }
 use std::{
+    fs,
     path::{Path, PathBuf},
     time::Duration,
 };

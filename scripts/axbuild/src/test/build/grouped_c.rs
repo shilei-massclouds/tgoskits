@@ -640,6 +640,7 @@ pub(super) fn subcase_as_case(case: &TestQemuCase, subcase: &TestQemuSubcase) ->
         host_symbolize_success_regex: Vec::new(),
         host_http_server: case.host_http_server.clone(),
         asset_cache: case.asset_cache,
+        default_run: true,
         subcases: Vec::new(),
         grouped_subcase_filter: None,
     }

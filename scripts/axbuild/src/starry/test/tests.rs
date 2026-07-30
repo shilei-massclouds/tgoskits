@@ -206,6 +206,7 @@ fn grouped_host_http_test_case(
             dir: None,
         }),
         asset_cache: crate::test::case::AssetCachePolicy::Reuse,
+        default_run: true,
         subcases: grouped_subcase_filter
             .as_ref()
             .into_iter()
@@ -231,6 +232,7 @@ fn prepared_qemu_case(name: &str, build_config_path: PathBuf) -> PreparedStarryQ
             host_symbolize_success_regex: Vec::new(),
             host_http_server: None,
             asset_cache: crate::test::case::AssetCachePolicy::Reuse,
+            default_run: true,
             subcases: Vec::new(),
             grouped_subcase_filter: None,
         },

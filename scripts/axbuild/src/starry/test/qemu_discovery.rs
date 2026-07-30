@@ -76,7 +76,18 @@ fn load_qemu_cases_for_selection(
         "qemu",
     )?
     .into_iter()
-    .map(|case| load_qemu_case(case, grouped_subcase_filter.clone()))
+    .filter_map(
+        |case| match load_qemu_case(case, grouped_subcase_filter.clone()) {
+            Ok(starry_case) => {
+                if selected_case.is_none() && !starry_case.case.default_run {
+                    None
+                } else {
+                    Some(Ok(starry_case))
+                }
+            }
+            Err(err) => Some(Err(err)),
+        },
+    )
     .collect()
 }
 
