@@ -146,6 +146,10 @@ plain case 不复制 rootfs，依赖 QEMU `-snapshot` 保证 guest 写入不落�
 执行），在 `qemu-<arch>.toml` 中设置 `asset_cache = "bypass"`。该策略会跳过
 rootfs 资产缓存的读取和写入；普通用例默认使用 `reuse`，不应无理由关闭缓存。
 
+手动用例（`default_run = false`）不参与默认 `cargo xtask starry test qemu` 的
+批量执行和 `--list`，仅通过 `-c <case>` 显式指定访问。这保证了默认测试路径的
+零负担。手动用例通常也设置为 `asset_cache = "bypass"`。
+
 ## QEMU TOML
 
 每个 `qemu-<arch>.toml` 定义运行配置，而不是构建配置。常用字段如下：
@@ -159,6 +163,7 @@ rootfs 资产缓存的读取和写入；普通用例默认使用 `reuse`，不�
 | `shell_init_cmd` | plain/C/sh/python case 的 guest 命令 |
 | `test_commands` | grouped case 的 guest 命令列表；不能与 `shell_init_cmd` 同时使用 |
 | `asset_cache` | pipeline 资产缓存策略：默认 `reuse`；需要每次重新生成资产时使用 `bypass` |
+| `default_run` | 是否参与默认批量执行和 `--list`；设为 `false` 的 case 仅通过显式 `-c` 访问；默认 `true` |
 | `success_regex` | 全部匹配才 PASS |
 | `fail_regex` | 任一匹配即 FAIL |
 | `timeout` | 超时时间，单位秒 |
