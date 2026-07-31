@@ -3,9 +3,10 @@
 ## Status
 
 Implemented on 2026-07-30, extended with structured scenario generation,
-persistent canonical coverage corpus, and resumable exact coverage attribution
-on 2026-07-31. This document records the design and implementation of the
-script-driven pipe differential oracle.
+persistent canonical coverage corpus, resumable exact coverage attribution,
+and persistent coverage/mismatch minimization on 2026-07-31. This document
+records the design and implementation of the script-driven pipe differential
+oracle.
 
 Base: `dev-cov2` at `fb399d055`.
 
@@ -91,6 +92,15 @@ The implementation is complete when all of the following hold:
 - an interrupted attribution job resumes before new batches, while unstable
   attribution preserves its complete evidence and leaves the coverage baseline
   unchanged;
+- guest execution has typed results so infrastructure failures cannot be
+  reported as semantic mismatches;
+- productive coverage representatives and semantic mismatches are minimized by
+  a deterministic structured reducer with a bounded QEMU budget;
+- minimization resumes before new RNG consumption, pins one Starry ELF, and
+  requires one original validation plus two consecutive final proofs;
+- coverage minimization preserves each representative's assigned region set,
+  while mismatch minimization preserves the original operation and complete
+  semantic fingerprint;
 - `scripts/pipe-oracle/replay.py` replays saved failure artifacts;
 - failure artifacts include `input.bin`, `pipe.ops`, `linux.trace`,
   `pipe-linux-oracle` ELF, `guest.log`, profraw files, and `metadata.json`;
@@ -108,7 +118,7 @@ The first implementation deliberately excludes:
   protocol;
 - a Linux VM pinned to a specific kernel release;
 - coverage-guided mutation in the regular PR path or CI;
-- coverage or mismatch scenario minimization (stage 2.3);
+- a globally minimal scenario or an unbounded minimization search;
 - using output from `strace` as expected data;
 - dynamic `axbuild` subcommands for fuzzing (all host orchestration is in
   Python scripts outside `cargo xtask`).
@@ -124,6 +134,8 @@ The first implementation deliberately excludes:
 | axbuild subcommand for fuzzing | Integration with existing CLI | Adds coupling to axbuild's already complex surface; fuzzing is a dev-time activity | Reject; use Python scripts |
 | Default CI integration | Catches regressions automatically | Adds QEMU boot overhead to every PR; signal may not justify cost | Reject; manual-only `default_run=false` |
 | Coverage-guided in default path | Better corpus growth | Too heavy for regular CI; belongs in manual fuzz workflow | Reject for v1 |
+| Byte-level minimization | Simple implementation | Breaks resource relationships and spends QEMU launches on malformed inputs | Reject; reduce the scenario IR |
+| Structured hierarchical delta debugging | Preserves operation/resource structure and gives deterministic checkpoints | Does not guarantee a global minimum | Select with a bounded candidate budget |
 
 ## Architecture
 
@@ -215,9 +227,10 @@ does not exist and the production kernel carries no coverage-related code.
 
 - `common.py`: SHA-256 hashing, atomic directory save, `build_metadata()` that
   captures git commit, dirty state, host uname, page size, and file digests.
-- `corpus.py`: Canonical digest map, strict schema-v1/v2 persistent entry
-  validation, atomic entry/run/coverage-state saves, ELF-scoped region
-  baselines, and exact-attribution admission.
+- `corpus.py`: Canonical digest map, strict schema-v1/v2/v3 persistent entry
+  validation, active/superseded lifecycle, minimization lineage, atomic
+  entry/run/coverage-state saves, ELF-scoped region baselines, and
+  exact-attribution admission.
 - `campaign_lock.py` and `corpus_errors.py`: Process-lock ownership and shared
   persistent-state error types.
 - `attribution.py` and `attribution_schema.py`: Atomic schema-v2 attribution
@@ -236,19 +249,34 @@ does not exist and the production kernel carries no coverage-related code.
   fragment duplication/deletion, donor splice, and parameter mutation. It
   repairs dependencies needed for executable candidates and explicitly labels
   codec/limit failures as malformed.
-- `artifact.py`: Failure artifact validation (ELF header, digest match) and
-  atomic save.
+- `guest_result.py` and `fingerprint.py`: Typed guest result classification,
+  stable harness-difference parsing, and mismatch fingerprints anchored to an
+  original operation identity.
+- `artifact.py`: Strict failure schema-v1/v2 replay validation, fixed Starry and
+  host ELF digests, typed result/fingerprint metadata, and atomic save.
+- `reducer.py` and `minimization.py`: Pure deterministic hierarchical reduction,
+  operation-origin tracking, coverage responsibility assignment, mismatch
+  predicate checks, digest deduplication, and shared candidate-QEMU budgets.
+- `minimization_schema.py` and `minimization_store.py`: Strict schema-v1 job and
+  evidence validation, atomic checkpoints, reducer cursor persistence, and
+  stale/unstable failure preservation.
+- `minimization_source.py`, `minimization_campaign.py`, and `minimize.py`:
+  failure/attribution source import, fresh trace/profraw predicate execution,
+  two final proofs, corpus/failure commit, automatic recovery, and the manual
+  minimization CLI.
 - `runner.py`: validates one absolute artifact directory, passes it to the QEMU
   build through `STARRY_PIPE_ORACLE_ARTIFACT_DIR`, deletes the fixed profraw
   before every launch, and returns only this run's
-  `starryos-x86_64-unknown-none.profraw`. Attribution replays also pass their
-  content-addressed Starry ELF to axbuild's internal kallsyms pinning contract.
+  `starryos-x86_64-unknown-none.profraw` as a typed execution result.
+  Attribution and minimization replays also pass their content-addressed Starry
+  ELF to axbuild's internal kallsyms pinning contract.
 - `coverage.py`: `llvm-profdata merge -sparse` and `llvm-cov export` against
   `target/x86_64-unknown-none/release/starryos`; covered pipe regions use stable
   `source:line:column` string IDs.
-- `fuzz.py`: Batch fuzzing with seed, batch count, batch size. Startup merges
-  five built-in seeds with compatible disk entries into a canonical-digest-
-  sorted map; each selection remains 30% new generation and 70% structured
+- `fuzz.py`: Batch fuzzing with seed, batch count, batch size, minimization
+  budget, and a `--no-minimize` rollback switch. Startup resumes attribution,
+  creates or resumes minimization, reloads active corpus entries, and only then
+  initializes RNG. Selection remains 30% new generation and 70% structured
   mutation. Malformed candidates are counted and filtered before host/QEMU
   execution. Each executable batch runs one QEMU; mismatch/panic/timeout/
   coverage failure stops immediately and saves a complete failure artifact to
@@ -258,7 +286,7 @@ does not exist and the production kernel carries no coverage-related code.
   re-records the host trace without overwriting original evidence.
 
 Constraints:
-- A version-2 corpus entry is canonical UTF-8 `pipe.ops` and is at most 4096
+- A canonical corpus entry is UTF-8 `pipe.ops` and is at most 4096
   bytes; `input.bin` and `inputs/*.bin` store those exact bytes.
 - One entry contains at most four scenarios and one scenario contains at most
   32 operations.
@@ -277,6 +305,7 @@ coverage/pipe-oracle-fuzz/
   runs/<run-id>/metadata.json
   coverage-state/<starry-elf-sha256>.json
   attribution-jobs/<job-id>/...
+  minimization-jobs/<job-id>/...
   failures/...
   .campaign.lock
 ```
@@ -293,10 +322,19 @@ the canonical and `pipe.ops` digests, generator version, provenance,
 first-observed and last-verified environments, and its original
 `batch-pending` coverage claim. Schema v2 replaces that claim with `exact`, the
 sorted union of `attributed_regions`, the attribution job IDs that proved it,
-and a successful-attribution verification count. New representatives are
-written directly as v2. A v1 entry is upgraded atomically and lazily only when
-it contributes again in a completed exact-attribution job; merely loading or
-selecting it does not rewrite metadata.
+and a successful-attribution verification count. Schema v3 adds an
+`active`/`superseded` lifecycle and minimization lineage. A v1/v2 entry is
+upgraded atomically and lazily only when exact attribution or minimization
+changes it; merely loading or selecting it does not rewrite metadata.
+
+A proved minimized entry is activated as schema v3 before any original entry is
+marked superseded. The supersede update is a separate atomic metadata replace,
+so a crash can expose both active entries but can never leave only an
+uncommitted replacement. Historical directories are never deleted. Corpus
+loading validates every finalized v1/v2/v3 entry, then exposes only active
+entries to mutation. If a minimized digest already exists, its historical
+region union and minimization lineage are merged instead of creating a duplicate
+directory.
 
 Loading fails closed on an unknown schema or generator version, a directory or
 file digest mismatch, noncanonical UTF-8 encoding, codec/resource-limit error,
@@ -318,12 +356,14 @@ same baseline; a productive batch must finish exact attribution and the final
 representative replay before the enlarged baseline is atomically committed. A
 different ELF therefore has an independent baseline.
 
-Run metadata schema v2 stores the seed, exact command, measured duration,
+Run metadata schema v3 stores the seed, exact command, measured duration,
 candidate/executable/malformed/unique counts, sources and ancestry, new regions,
 admitted digests, Starry ELF digest, result category, attribution job ID, every
 entry-to-region mapping, the representative digests, and the number of extra
-QEMU replays. Run records are observational; corpus entry directories remain
-the authoritative identity used for selection.
+QEMU replays. It also records the minimization job, original/minimized digests,
+candidate/proof QEMU counts, completion mode, and size changes. Run records are
+observational; corpus entry directories remain the authoritative identity used
+for selection.
 
 ### Exact attribution state machine
 
@@ -346,9 +386,9 @@ set and the initial batch evidence. It then:
    ELF-scoped baseline.
 
 Thus a successful productive batch adds at most `N + 1` QEMU invocations beyond
-its initial batch execution. This is exact per-entry attribution and
-deterministic set deduplication, not stage-2.3 operation or scenario
-minimization.
+its initial batch execution. Exact attribution and deterministic set
+deduplication establish the representative and target-region inputs consumed by
+the subsequent structured minimizer.
 
 The job states are `entry-replays`, `representative-replay`, and `completed`.
 Metadata, replay directories, and initial job directories use fsync plus atomic
@@ -389,6 +429,106 @@ ELF change stops the campaign. The job is marked `unstable` and atomically moved
 to `failures/attribution-<job-id>/` with all evidence retained. Corpus admission
 and coverage-baseline update do not occur on that path.
 
+### Persistent coverage and mismatch minimization
+
+Minimization is automatic after successful exact attribution and after a saved
+semantic mismatch. It is also available explicitly as:
+
+```
+scripts/pipe-oracle/minimize.py SOURCE --max-qemu 64
+```
+
+`SOURCE` is either a completed attribution job or a failure artifact. Failure
+schema v2 provides its fixed Starry ELF and fingerprint directly. A schema-v1
+failure remains replayable, but is imported for minimization only when its old
+guest log contains exactly one strict semantic difference. The importer derives
+the fingerprint, pins the active Starry ELF, and the normal original-validation
+replay must reproduce it before reduction begins. Source artifacts are never
+rewritten.
+
+The pure reducer tracks an immutable origin for every operation and yields
+canonical, strictly lower-complexity candidates in this order:
+
+1. delete operations after the critical mismatch operation;
+2. delete coarse-to-fine contiguous scenario blocks;
+3. delete coarse-to-fine contiguous operation blocks;
+4. try individual operations in reverse order;
+5. compress duplicate chains, redirect compatible resource references, and
+   rename live slots densely; and
+6. reduce length, byte, pipe size, and poll masks through fixed simple values.
+
+It neither consumes campaign RNG nor synthesizes initialization operations.
+Every candidate passes the canonical codec and must lower a well-founded
+complexity key. Invalid candidates do not consume QEMU budget, and a previously
+seen canonical digest is never executed twice.
+
+Coverage target regions are assigned to the first covering representative in
+canonical-digest order. Each representative's responsibility is the union of
+that assignment and its historical `attributed_regions`. Representatives are
+scheduled round-robin in digest order and share one candidate budget, default
+64. A candidate re-records a Linux trace, launches the job's fixed Starry ELF,
+uses only that launch's fresh profraw, and is accepted only when it covers the
+representative's complete responsibility. Final proof combines the current
+representative set and must cover the union of all responsibilities twice
+consecutively. The minimizer does not update the ELF coverage baseline.
+
+A mismatch fingerprint contains the original operation origin, operation kind,
+the ordered difference-field set (`result`, `errno`, `value`, `data_len`, or
+`data`), expected and actual result classes, and exact errno for each failing
+side. A mismatch candidate is accepted only when the observed difference maps
+back to that same origin and produces the identical fingerprint. A pass or a
+different fingerprint is an ordinary rejection, not a new failure.
+
+Each strict schema-v1 minimization job owns its source identity, original
+inputs, fixed host and Starry ELFs, current-best checkpoints with operation
+origins, reducer cursors and seen digests, shared budget/cursor, compact attempt
+summaries, original validation, and two final proofs. States are
+`validating`, `reducing`, `final-proof`, and `completed`; abnormal terminal
+states are `stale` and `unstable`. Evidence and checkpoints are saved before the
+metadata transition. A crash in between may repeat one candidate, but cannot
+skip it or expose an unproved corpus entry. Normal rejected candidates retain
+only digest, transform, typed category, region/fingerprint summary, and evidence
+digest. Full trace/log/profraw evidence is retained for original validation,
+the current best, abnormal observations, and both final proofs.
+
+Candidate execution happens once; the final current-best result executes twice
+consecutively. Validation and proof launches do not count toward the candidate
+budget. When the budget is exhausted, the current best still enters final
+proof; success completes as `budget-limited`. The algorithm promises bounded,
+deterministic improvement rather than a global minimum.
+
+Startup ordering is fixed: resume attribution, create or resume minimization,
+reload active corpus, then initialize campaign RNG and generate new work. If the
+active Starry ELF changed before a minimization resume, the job is marked
+`stale`, moved intact to `failures/minimization-<job-id>/`, and is not rebased.
+Panic, lockdep, timeout, infrastructure/oracle failure, a new mismatch during a
+coverage reduction, or a failed final proof retains full abnormal evidence,
+marks the job `unstable`, and stops the campaign without changing source corpus,
+failure artifacts, or coverage baseline. Successful coverage minimization may
+continue the campaign. Mismatch minimization always stops it and retains both
+the original and minimized schema-v2 failure artifacts.
+
+The stage-2.3 acceptance run used the completed exact-attribution job for Starry
+ELF `de330f7778459ac401f5891dab69f130812b2064a9845657db5687051f5b7c3d`.
+With a four-candidate budget it executed one original validation, four
+candidates, and two final proofs. The representative shrank from 637 to 503
+bytes; both proof launches produced independent fresh profraw files and covered
+all 346 responsibility regions. Only then was the original corpus entry marked
+superseded and the minimized entry activated.
+
+The retained schema-v1 poll-mismatch artifact also passed strict lazy import:
+its old log yielded a fingerprint at original operation 16 with
+`result`/`errno`/`value` differences. The active fixed ELF now passes all 397
+operations because that historical ABI defect was repaired, so original
+validation correctly saved the job as `unstable` with zero candidate launches
+and left the source artifact byte-identical. No matching old Starry ELF exists
+locally for a positive real reduction. The positive mismatch path is therefore
+covered by the deterministic end-to-end campaign regression (one validation,
+one candidate, two proofs, identical fingerprint, and separate original and
+minimized schema-v2 artifacts). Two other legacy artifacts previously labeled
+as mismatches contain only infrastructure/profraw failures and are rejected
+before QEMU.
+
 ### Artifact injection contract
 
 `STARRY_PIPE_ORACLE_ARTIFACT_DIR` is an internal orchestration interface. When
@@ -415,14 +555,20 @@ coverage/pipe-oracle-fuzz/failures/<case-id>/
   pipe.ops
   linux.trace
   pipe-linux-oracle      (static ELF)
+  starryos               (fixed instrumented ELF for schema-v2 mismatch)
   guest.log
   profraws/*.profraw
   metadata.json
 ```
 
-`metadata.json` includes `schema_version`, git state, host uname, page size,
-fuzz seed, batch index, SHA-256 digests, exact command, coverage region
-summary, and `guest_result_category`.
+Failure schema v1 remains strictly replayable. Schema v2 includes git state,
+host uname, page size, fuzz seed, batch index, SHA-256 and size for every
+artifact, exact command, and one typed guest result: `passed`,
+`semantic-mismatch`, `oracle-failure`, `kernel-panic`, `lockdep-failure`,
+`timeout`, or `infrastructure-failure`. A semantic mismatch additionally
+requires its fixed Starry ELF and stable mismatch fingerprint. QEMU startup,
+monitor-socket, or other infrastructure errors therefore cannot be imported or
+reported as semantic mismatches.
 
 Saves use a temp-directory + atomic rename to prevent half-written artifacts.
 Attribution instability uses the separate schema-v2 job layout described above
@@ -464,10 +610,12 @@ generated trace (owned by one test run)
 ```
 
 The checked-in regression corpus is repository-owned. The fuzz campaign owns a
-canonical-digest-sorted selection map merged from built-in and persistent
+canonical-digest-sorted selection map merged from built-in and active persistent
 entries; the ignored `CorpusStore` owns cross-process corpus identity, run
 records, and ELF-scoped coverage baselines. `AttributionStore` owns resumable
-jobs and their immutable replay evidence. Trace, profraw, guest log, and
+attribution jobs and their immutable replay evidence. `MinimizationStore` owns
+fixed ELFs, reducer checkpoints, summaries, and selected heavy evidence until a
+proved corpus/failure result is committed. Trace, profraw, guest log, and
 prepared rootfs are run-owned build artifacts until copied into a job or
 failure artifact. Failure artifacts are saved under
 `coverage/pipe-oracle-fuzz/failures/`. Version-1 failure replay keeps using the
@@ -514,7 +662,7 @@ remove the `pipe-linux-oracle` case directory and the `default_run` field from
 axbuild. Production pipe fixes and existing axtest coverage remain valid
 independently.
 
-Future work may add stage-2.3 scenario minimization, blocking/concurrent
-scenarios, cross-architecture differential coverage, or automatic CI
-regression detection. Those changes require their own design evidence and must
-continue to keep the default test path clean.
+Future work may add blocking/concurrent scenarios, cross-architecture
+differential coverage, or automatic CI regression detection. Those changes
+require their own design evidence and must continue to keep the default test
+path clean.

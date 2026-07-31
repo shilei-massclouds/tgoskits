@@ -39,6 +39,17 @@ enum operation_kind {
     OP_FIONREAD,
 };
 
+enum operation_difference {
+    DIFF_SCENARIO = 1U << 0,
+    DIFF_OPERATION = 1U << 1,
+    DIFF_KIND = 1U << 2,
+    DIFF_RESULT = 1U << 3,
+    DIFF_ERRNO = 1U << 4,
+    DIFF_VALUE = 1U << 5,
+    DIFF_DATA_LEN = 1U << 6,
+    DIFF_DATA = 1U << 7,
+};
+
 struct trace_header {
     unsigned char magic[8];
     uint32_t version;
@@ -397,22 +408,41 @@ static int compare_operation(const struct run_context *context,
                              unsigned int line_number, const char *line)
 {
     struct operation_result expected;
+    uint32_t difference_mask = 0;
 
     if (fread(&expected, sizeof(expected), 1, context->trace) != 1)
         return fail_line(line_number, line, "expected trace is truncated");
-    if (expected.scenario_index != actual->scenario_index ||
-        expected.operation_index != actual->operation_index || expected.kind != actual->kind ||
-        expected.result != actual->result || expected.error != actual->error ||
-        expected.value != actual->value || expected.data_len != actual->data_len ||
-        memcmp(expected.data, actual->data, actual->data_len) != 0) {
+    if (expected.data_len > MAX_IO_BYTES)
+        return fail_line(line_number, line, "expected trace data length is invalid");
+    if (expected.scenario_index != actual->scenario_index)
+        difference_mask |= DIFF_SCENARIO;
+    if (expected.operation_index != actual->operation_index)
+        difference_mask |= DIFF_OPERATION;
+    if (expected.kind != actual->kind)
+        difference_mask |= DIFF_KIND;
+    if (expected.result != actual->result)
+        difference_mask |= DIFF_RESULT;
+    if (expected.error != actual->error)
+        difference_mask |= DIFF_ERRNO;
+    if (expected.value != actual->value)
+        difference_mask |= DIFF_VALUE;
+    if (expected.data_len != actual->data_len)
+        difference_mask |= DIFF_DATA_LEN;
+    if (memcmp(expected.data, actual->data,
+               expected.data_len > actual->data_len ? expected.data_len
+                                                    : actual->data_len) != 0)
+        difference_mask |= DIFF_DATA;
+    if (difference_mask != 0) {
         fprintf(stderr,
                 "STARRY_PIPE_LINUX_ORACLE_FAILED: host=%s/%s line=%u scenario=%" PRIu32
-                " operation=%" PRIu32 " text=\"%s\" expected={kind=%" PRIu32
+                " operation=%" PRIu32 " text=\"%s\" difference_mask=0x%08" PRIx32
+                " expected={kind=%" PRIu32
                 ",result=%" PRId64 ",errno=%" PRId32 ",value=%" PRId64
                 ",data_len=%" PRIu32 "} actual={kind=%" PRIu32 ",result=%" PRId64
                 ",errno=%" PRId32 ",value=%" PRId64 ",data_len=%" PRIu32 "}\n",
                 context->header.release, context->header.machine, line_number,
-                actual->scenario_index, actual->operation_index, line, expected.kind,
+                actual->scenario_index, actual->operation_index, line, difference_mask,
+                expected.kind,
                 expected.result, expected.error, expected.value, expected.data_len,
                 actual->kind, actual->result, actual->error, actual->value,
                 actual->data_len);

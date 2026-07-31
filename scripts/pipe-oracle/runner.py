@@ -1,7 +1,13 @@
 import os
 import subprocess
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Optional
+
+from guest_result import (
+    GuestExecutionResult,
+    GuestResultCategory,
+    classify_guest_execution,
+)
 
 
 ARTIFACT_DIR_ENV = "STARRY_PIPE_ORACLE_ARTIFACT_DIR"
@@ -15,7 +21,7 @@ def run_guest_compare(
     workspace: Path,
     artifact_dir: Path,
     pinned_starry_elf: Optional[Path] = None,
-) -> Tuple[str, List[Path], bool]:
+) -> GuestExecutionResult:
     workspace = workspace.resolve()
     artifact_dir = artifact_dir.resolve()
     _validate_artifact_dir(artifact_dir)
@@ -52,13 +58,24 @@ def run_guest_compare(
             timeout=600,
         )
         guest_log = result.stdout + "\n" + result.stderr
-        passed = result.returncode == 0
+        returncode = result.returncode
+        timed_out = False
     except subprocess.TimeoutExpired as error:
         guest_log = _timeout_output(error) + "\nQEMU command timed out\n"
-        passed = False
+        returncode = None
+        timed_out = True
+    except OSError as error:
+        guest_log = f"QEMU command failed to start: {error}\n"
+        returncode = None
+        timed_out = False
 
     profraws = [profraw_path] if profraw_path.is_file() else []
-    return guest_log, profraws, passed
+    return classify_guest_execution(
+        guest_log,
+        returncode,
+        profraws,
+        timed_out=timed_out,
+    )
 
 
 def coverage_object(workspace: Path) -> Path:

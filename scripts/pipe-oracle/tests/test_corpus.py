@@ -125,7 +125,7 @@ class PersistentCorpusRegressionTests(unittest.TestCase):
 
     def test_schema_and_generator_incompatibility_fail_closed(self):
         cases = (
-            ("schema_version", 3, "unsupported corpus schema"),
+            ("schema_version", 4, "unsupported corpus schema"),
             ("generator_version", "future", "incompatible generator version"),
         )
         for field, value, reason in cases:
@@ -206,6 +206,146 @@ class PersistentCorpusRegressionTests(unittest.TestCase):
                 },
             )
             self.assertEqual(len(store.load_corpus()), 1)
+
+    def test_v3_activates_replacement_before_superseding_history(self):
+        original = scenario.parse_document(
+            "version 1\nscenario original\npipe2 0 1\nwrite 1 8 65\n"
+        )
+        minimized = scenario.parse_document(
+            "version 1\nscenario minimized\npipe2 0 1\n"
+        )
+        original_digest = scenario.canonical_digest(original)
+        minimized_digest = scenario.canonical_digest(minimized)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = corpus.CorpusStore(Path(temporary_directory))
+            store.admit_attributed_entry(
+                original,
+                corpus.CorpusProvenance.generated(),
+                {"pipe.rs:1:1", "pipe.rs:2:1"},
+                "attribution-0001",
+            )
+
+            store.admit_minimized_entry(
+                minimized,
+                corpus.CorpusProvenance.generated(),
+                {"pipe.rs:1:1", "pipe.rs:2:1"},
+                "minimize-0001",
+                {original_digest},
+            )
+            self.assertEqual(len(store.load_corpus()), 2)
+
+            store.supersede_entry(
+                original_digest,
+                minimized_digest,
+                "minimize-0001",
+            )
+            loaded = store.load_corpus()
+            original_metadata = store.entry_metadata(original_digest)
+            minimized_metadata = store.entry_metadata(minimized_digest)
+
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded.ordered_entries()[0].digest, minimized_digest)
+        self.assertEqual(original_metadata["schema_version"], 3)
+        self.assertEqual(original_metadata["lifecycle"]["status"], "superseded")
+        self.assertEqual(
+            original_metadata["lifecycle"]["superseded_by"],
+            minimized_digest,
+        )
+        self.assertEqual(minimized_metadata["lifecycle"]["status"], "active")
+        self.assertEqual(
+            minimized_metadata["coverage"]["attributed_regions"],
+            ["pipe.rs:1:1", "pipe.rs:2:1"],
+        )
+
+    def test_existing_minimized_child_merges_regions_and_lineage_idempotently(self):
+        original = scenario.parse_document(
+            "version 1\nscenario original\npipe2 0 1\nwrite 1 8 65\n"
+        )
+        child = scenario.parse_document(
+            "version 1\nscenario child\npipe2 0 1\n"
+        )
+        original_digest = scenario.canonical_digest(original)
+        child_digest = scenario.canonical_digest(child)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = corpus.CorpusStore(Path(temporary_directory))
+            store.admit_attributed_entry(
+                child,
+                corpus.CorpusProvenance.generated(),
+                {"pipe.rs:old:1"},
+                "attribution-old",
+            )
+
+            self.assertFalse(
+                store.admit_minimized_entry(
+                    child,
+                    corpus.CorpusProvenance.generated(),
+                    {"pipe.rs:new:2"},
+                    "minimize-merge",
+                    {original_digest},
+                )
+            )
+            store.admit_minimized_entry(
+                child,
+                corpus.CorpusProvenance.generated(),
+                {"pipe.rs:new:2"},
+                "minimize-merge",
+                {original_digest},
+            )
+            metadata = store.entry_metadata(child_digest)
+
+        self.assertEqual(metadata["schema_version"], 3)
+        self.assertEqual(
+            metadata["coverage"]["attributed_regions"],
+            ["pipe.rs:new:2", "pipe.rs:old:1"],
+        )
+        self.assertEqual(
+            metadata["minimization"]["original_digests"],
+            sorted({child_digest, original_digest}),
+        )
+        self.assertEqual(
+            metadata["minimization"]["minimization_jobs"],
+            ["minimize-merge"],
+        )
+        self.assertEqual(
+            metadata["stability"]["successful_batch_verifications"],
+            2,
+        )
+
+    def test_superseded_entry_without_active_replacement_fails_closed(self):
+        original = scenario.parse_document(
+            "version 1\nscenario original\npipe2 0 1\nwrite 1 8 65\n"
+        )
+        minimized = scenario.parse_document(
+            "version 1\nscenario minimized\npipe2 0 1\n"
+        )
+        original_digest = scenario.canonical_digest(original)
+        minimized_digest = scenario.canonical_digest(minimized)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = corpus.CorpusStore(Path(temporary_directory))
+            store.admit_attributed_entry(
+                original,
+                corpus.CorpusProvenance.generated(),
+                {"pipe.rs:1:1"},
+                "attribution-0001",
+            )
+            store.admit_minimized_entry(
+                minimized,
+                corpus.CorpusProvenance.generated(),
+                {"pipe.rs:1:1"},
+                "minimize-0001",
+                {original_digest},
+            )
+            store.supersede_entry(original_digest, minimized_digest, "minimize-0001")
+            replacement = store.corpus_dir / minimized_digest
+            for child in replacement.iterdir():
+                child.unlink()
+            replacement.rmdir()
+
+            with self.assertRaisesRegex(
+                corpus.CorpusValidationError,
+                "replacement is missing",
+            ):
+                store.load_corpus()
 
     def test_interrupted_v1_to_v2_upgrade_preserves_original_metadata(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

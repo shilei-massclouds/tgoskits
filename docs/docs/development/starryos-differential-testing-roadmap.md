@@ -256,7 +256,7 @@ StarryOS 返回 `EINVAL` 的真实差异，保存为
 
 **定位：近期至中期，投入中，两个或三个 PR。**
 
-**阶段状态：进行中。**
+**阶段状态：已完成。**
 
 ### 6.1 持久化和去重
 
@@ -271,7 +271,8 @@ StarryOS 返回 `EINVAL` 的真实差异，保存为
 | 5. 补全测试、文档和两次真实 campaign 验收 | 已完成 | 2026-07-31 | README 和设计文档已同步；40 个 Python 测试、`py_compile` 和 `git diff --check` 通过。第一次 seed 42 campaign 完成 host record、StarryOS QEMU compare 和 coverage 提取，持久化 8 个 canonical entry 及 382 个新增 pipe region；第二次重启报告 `built-in=5 disk=8 deduplicated-total=13`，完成 compare/coverage 并继续准入 2 个新 entry。两次构建得到不同 Starry ELF digest，各自保存独立的 382-region baseline；严格重载确认磁盘共有 10 个唯一 digest，且无半写目录。 |
 
 阶段 2.1 保留的 schema v1 entry 继续严格可读；阶段 2.2 只在旧 entry 再次成为
-确定贡献者时将其原子惰性升级为 schema v2。阶段 2.3 的场景最小化仍未开始。
+确定贡献者时将其原子惰性升级为 schema v2。阶段 2.3 在最终证明后才将最小 entry
+写为 schema v3，并保留 v1/v2 历史目录。
 
 按 canonical 操作序列而不是 raw input 保存成功 corpus。每个 entry 记录：
 
@@ -348,18 +349,42 @@ campaign 启动时优先恢复未完成 job；若进程终止在 evidence 保存
 
 ### 6.3 场景最小化
 
-**子阶段状态：未开始。**
+**子阶段状态：已完成。**
+
+| 步骤 | 状态 | 完成日期 | 验证证据或继续位置 |
+|---|---|---|---|
+| 1. 类型化 guest 结果、difference mask 和 failure schema v2 | 已完成 | 2026-07-31 | runner 区分 passed、semantic mismatch、oracle/panic/lockdep/timeout/infrastructure；monitor socket 回归证明基础设施故障不再误报 mismatch。C harness 输出稳定 difference mask；failure v2 固定 Starry ELF 和 fingerprint，v1 只在旧 log 可严格推导并重放确认时惰性导入。 |
+| 2. 实现确定性结构化 reducer 和谓词 | 已完成 | 2026-07-31 | reducer 保留 operation origin，按 tail/scenario block/operation block/reverse single/dup-resource/参数顺序缩减；所有候选 canonical、资源合法、complexity 严格下降并去重。coverage 使用确定性责任集，mismatch 要求 origin/fingerprint 不漂移。 |
+| 3. 实现持久 job、预算和最终证明 | 已完成 | 2026-07-31 | minimization schema v1 严格保存 validating/reducing/final-proof/completed/stale/unstable、reducer cursor、固定 ELF、best checkpoint、拒绝摘要和重型证据。候选共享预算默认 64；原始验证一次，最终连续证明两次；checkpoint/metadata 间崩溃可恢复。 |
+| 4. 接入 corpus v3、failure v2、run v3 和 campaign 启动顺序 | 已完成 | 2026-07-31 | 最小 entry 先激活再 supersede，历史 entry 保留且 mutation 只加载 active；coverage baseline 不由 minimizer 修改。启动先恢复 attribution/minimization、再加载 active corpus、最后初始化 RNG；`--no-minimize` 可回滚。 |
+| 5. 完成全部回归、文档和真实 QEMU 小预算验收 | 已完成 | 2026-07-31 | 85 个 Python/host-harness 回归、`py_compile`、workspace rustfmt 和 `git diff --check` 通过。真实 coverage job 使用固定 ELF `de330f…` 完成 1 次验证、4 次候选和2次证明，输入由 637 缩至 503 字节；两次 fresh profraw 分别覆盖全部 346 个责任 region，原 entry 保留为 superseded、最小 entry active。现有 schema-v1 poll mismatch 成功惰性导出 operation 16 的稳定 fingerprint，但当前 ELF 上 397 个 operation 已全部通过，故按设计在原始验证后标记 unstable、候选 QEMU 为 0，原 artifact digest 不变；该历史 ABI 差异已经修复，本地已无可做正向真实缩减的旧 ELF。正向 mismatch 缩减由确定性端到端回归验证（1 次验证、1 次候选、2 次证明并保留原/最小 failure）；两个旧基础设施 artifact 均在 QEMU 前被严格拒绝。 |
 
 对 mismatch 和获得新 region 的场景分别使用对应谓词最小化：
 
 - 删除整个 scenario；
 - 删除 operation 或连续片段；
-- 替换为更简单的资源关系；
+- 压缩 dup 链、重定向兼容资源引用并进行 dense slot 重命名；
 - 将参数逐步缩到边界值；
-- 删除不影响目标 mismatch 或 region 的初始化操作。
+- 删除关键 mismatch operation 之后的尾部操作。
 
 mismatch 最小化必须保持相同差异类别和关键操作；coverage 最小化必须保持指定
 region 集合，不能仅要求“仍有任意 coverage”。
+
+实现使用固定、结构感知的分层 delta debugging，不调用随机 mutation，也不隐式
+合成初始化操作。每个 job 默认最多运行 64 次候选 QEMU；无效或重复候选不计预算。
+原输入验证一次，最终当前最佳连续证明两次。预算耗尽但证明成功时以
+`budget-limited` 完成，因此目标是预算内确定性缩减，不承诺全局最小。
+
+coverage target region 按代表 digest 顺序分配给首个覆盖者，并与 entry 历史
+`attributed_regions` 取并集形成责任集。多个代表按 digest 轮转、共享预算；最终
+代表集必须连续两次覆盖全部责任集并集，之后最小 entry 才激活，原 entry 才标记
+superseded。mismatch fingerprint 包含原 operation identity、kind、差异字段、两侧
+结果类别和失败侧 errno；不同 fingerprint、关键 operation 漂移或通过均是普通拒绝。
+
+job 在新 batch 和 RNG 消耗前恢复。恢复时 Starry ELF 改变则保存为 `stale` 并停止，
+不自动 rebase；panic、基础设施故障、coverage 缩减中出现新 mismatch 或最终证明
+不稳定会保存完整异常证据并标记 `unstable`。普通拒绝只保存摘要和 evidence digest，
+重型 profraw 仅保留原始验证、当前最佳、异常现场和两次最终证明。
 
 ### 验收标准
 

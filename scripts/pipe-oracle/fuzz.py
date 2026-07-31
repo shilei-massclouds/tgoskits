@@ -11,7 +11,7 @@ import sys
 import tempfile
 import time
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -19,7 +19,8 @@ from typing import Dict, List, Optional, Set, Tuple
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from common import build_metadata, save_metadata
+from artifact import build_failure_metadata_v2
+from common import save_metadata
 from attribution import (
     AttributionInput,
     AttributionJob,
@@ -46,6 +47,16 @@ from mutation import (
     candidate_from_document,
     mutate_document,
 )
+from minimization_campaign import (
+    MinimizationOutcome,
+    MinimizationRuntime,
+    resume_minimization_job,
+)
+from minimization_source import create_or_load_job_from_source
+from minimization_store import MinimizationStore
+from guest_result import GuestExecutionResult, GuestResultCategory, normalize_guest_execution
+from fingerprint import MismatchFingerprint
+from reducer import ReductionInput
 from runner import coverage_object, run_guest_compare
 from scenario import combine_documents, parse_document, serialize_document
 
@@ -75,6 +86,7 @@ class BatchResult:
     representative_digests: Tuple[str, ...] = ()
     attribution_replays: int = 0
     attribution_duration_seconds: Optional[float] = None
+    minimization: Optional[Dict] = None
 
     def __bool__(self) -> bool:
         return self.failed
@@ -102,7 +114,15 @@ def main():
     parser.add_argument("--batches", type=int, default=DEFAULT_BATCHES)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--workspace", type=Path, default=WORKSPACE_ROOT)
+    parser.add_argument("--max-qemu", type=int, default=64)
+    parser.add_argument(
+        "--no-minimize",
+        action="store_true",
+        help="Disable automatic coverage and mismatch minimization",
+    )
     args = parser.parse_args()
+    if args.max_qemu < 0:
+        parser.error("--max-qemu must be nonnegative")
 
     workspace = args.workspace.resolve()
     store = CorpusStore(workspace)
@@ -115,20 +135,9 @@ def main():
 
 
 def _run_campaign(args, workspace: Path, store: CorpusStore) -> int:
-    corpus = CanonicalCorpus.initial()
-    built_in_count = len(corpus)
-    disk_corpus = store.load_corpus()
-    disk_count = len(disk_corpus)
-    for entry in disk_corpus.ordered_entries():
-        corpus.add(entry.document)
-    print(
-        "Corpus loaded: "
-        f"built-in={built_in_count} disk={disk_count} deduplicated-total={len(corpus)}",
-        flush=True,
-    )
-
     command = shlex.join(sys.argv)
     attribution_store = AttributionStore(workspace, store.generator_version)
+    corpus, _built_in_count, _disk_count = _load_active_corpus(store)
     if _resume_saved_jobs(
         workspace,
         store,
@@ -137,6 +146,26 @@ def _run_campaign(args, workspace: Path, store: CorpusStore) -> int:
         command,
     ):
         return 1
+
+    minimization_store = MinimizationStore(workspace, store.generator_version)
+    minimize_enabled = hasattr(args, "no_minimize") and not args.no_minimize
+    max_qemu = getattr(args, "max_qemu", 64)
+    if minimize_enabled and _resume_minimization_work(
+        workspace,
+        store,
+        attribution_store,
+        minimization_store,
+        command,
+        max_qemu,
+    ):
+        return 1
+
+    corpus, built_in_count, disk_count = _load_active_corpus(store)
+    print(
+        "Corpus loaded: "
+        f"built-in={built_in_count} disk={disk_count} deduplicated-total={len(corpus)}",
+        flush=True,
+    )
 
     rng = CampaignRng(args.seed)
     stats = CampaignStats()
@@ -158,6 +187,8 @@ def _run_campaign(args, workspace: Path, store: CorpusStore) -> int:
             store,
             fuzz_seed=args.seed,
             attribution_job_id=run_id,
+            minimize_enabled=minimize_enabled,
+            max_minimization_qemu=max_qemu,
         )
         duration = time.monotonic() - started
         run_metadata = _build_run_metadata(
@@ -171,9 +202,17 @@ def _run_campaign(args, workspace: Path, store: CorpusStore) -> int:
         store.save_run(run_id, run_metadata)
         if batch_result.attribution_job_id is not None and not batch_result.failed:
             attribution_store.mark_run_recorded(batch_result.attribution_job_id)
+        if batch_result.minimization is not None:
+            minimization_job = minimization_store.load_job(
+                batch_result.minimization["job_id"]
+            )
+            if minimization_job.metadata["state"] == "completed":
+                minimization_store.mark_run_recorded(minimization_job)
         if batch_result.failed:
             print(f"Batch {batch_index + 1} failed, stopping.", flush=True)
             return 1
+        if batch_result.minimization is not None:
+            corpus, _built_in_count, _disk_count = _load_active_corpus(store)
     print(
         "All batches completed: "
         f"executable={stats.classifications['executable']} "
@@ -182,6 +221,15 @@ def _run_campaign(args, workspace: Path, store: CorpusStore) -> int:
         flush=True,
     )
     return 0
+
+
+def _load_active_corpus(store: CorpusStore) -> Tuple[CanonicalCorpus, int, int]:
+    corpus = CanonicalCorpus.initial()
+    built_in_count = len(corpus)
+    disk_corpus = store.load_corpus()
+    for entry in disk_corpus.ordered_entries():
+        corpus.add(entry.document)
+    return corpus, built_in_count, len(disk_corpus)
 
 
 def _campaign_id() -> str:
@@ -244,6 +292,7 @@ def _build_run_metadata(
             ],
             "representative_digests": list(result.representative_digests),
         },
+        "minimization": result.minimization,
         "result": result.category,
     }
 
@@ -330,8 +379,103 @@ def _build_resumed_run_metadata(
             ],
             "representative_digests": list(result.representative_digests),
         },
+        "minimization": result.minimization,
         "resumed": True,
         "result": result.category,
+    }
+
+
+def _resume_minimization_work(
+    workspace: Path,
+    store: CorpusStore,
+    attribution_store: AttributionStore,
+    minimization_store: MinimizationStore,
+    command: str,
+    max_qemu: int,
+) -> bool:
+    attribution_store.prepare()
+    for path in sorted(attribution_store.jobs_dir.iterdir(), key=lambda item: item.name):
+        if path.name.startswith(".") or not path.is_dir():
+            continue
+        attribution_job = attribution_store.load_job(path.name)
+        if (
+            attribution_job.metadata["state"] == "completed"
+            and attribution_job.metadata["representative_digests"]
+        ):
+            create_or_load_job_from_source(
+                workspace,
+                attribution_job.path,
+                store,
+                minimization_store,
+                max_qemu=max_qemu,
+                active_starry_elf=coverage_object(workspace),
+            )
+
+    jobs = minimization_store.load_resumable_jobs()
+    if jobs:
+        print(
+            f"Resuming {len(jobs)} persisted minimization job(s) before corpus reload.",
+            flush=True,
+        )
+    runtime = _minimization_runtime()
+    for job in jobs:
+        outcome = resume_minimization_job(
+            workspace,
+            store,
+            minimization_store,
+            job,
+            runtime,
+        )
+        if outcome.failed:
+            return True
+        completed = minimization_store.load_job(job.job_id)
+        run_path = store.runs_dir / job.job_id
+        if not run_path.exists():
+            store.save_run(
+                job.job_id,
+                {
+                    "command": command,
+                    "result": "passed",
+                    "minimization": _minimization_summary(outcome, completed),
+                    "resumed": True,
+                },
+            )
+        minimization_store.mark_run_recorded(completed)
+        if completed.metadata["kind"] == "mismatch":
+            return True
+    return False
+
+
+def _minimization_runtime() -> MinimizationRuntime:
+    return MinimizationRuntime(
+        record_host=_record_host,
+        run_guest_compare=_run_guest_compare,
+        extract_regions=_extract_regions,
+        coverage_object=coverage_object,
+    )
+
+
+def _minimization_summary(
+    outcome: MinimizationOutcome,
+    job,
+) -> Dict:
+    return {
+        "job_id": outcome.job_id,
+        "kind": job.metadata["kind"],
+        "original_digests": list(outcome.original_digests),
+        "minimized_digests": list(outcome.minimized_digests),
+        "attempts": len(job.metadata["attempts"]),
+        "candidate_qemu": outcome.candidate_qemu,
+        "validation_qemu": job.metadata["validation_qemu"],
+        "proof_qemu": outcome.proof_qemu,
+        "completion": outcome.completion,
+        "size_changes": [
+            {
+                "original": item["original_size"],
+                "minimized": item["best_size"],
+            }
+            for item in job.metadata["items"]
+        ],
     }
 
 
@@ -417,6 +561,8 @@ def _run_batch(
     *,
     fuzz_seed: int = DEFAULT_SEED,
     attribution_job_id: Optional[str] = None,
+    minimize_enabled: bool = False,
+    max_minimization_qemu: int = 64,
 ) -> BatchResult:
     batch_started = time.monotonic()
     executable = [
@@ -482,10 +628,29 @@ def _run_batch(
 
         artifact_elf = temporary / "pipe-linux-oracle"
         shutil.copy2(elf_path, artifact_elf)
-        guest_log, profraws, passed = _run_guest_compare(workspace, temporary)
+        guest_result = normalize_guest_execution(
+            _run_guest_compare(workspace, temporary)
+        )
+        guest_log = guest_result.log
+        profraws = list(guest_result.profraw_paths)
 
-        if not passed:
-            failure_id = f"batch{batch_index}_mismatch_{ops_digest[:12]}"
+        if not guest_result.passed:
+            category = guest_result.category.value
+            mismatch_fingerprint = (
+                MismatchFingerprint.for_reduction_input(
+                    guest_result.difference,
+                    ReductionInput.initial(batch_document),
+                )
+                if guest_result.category == GuestResultCategory.SEMANTIC_MISMATCH
+                and guest_result.difference is not None
+                else None
+            )
+            failure_label = (
+                "mismatch"
+                if guest_result.category == GuestResultCategory.SEMANTIC_MISMATCH
+                else "guest"
+            )
+            failure_id = f"batch{batch_index}_{failure_label}_{ops_digest[:12]}"
             failure_path = failures_dir / failure_id
             _save_batch_failure(
                 failure_path,
@@ -496,13 +661,43 @@ def _run_batch(
                 guest_log,
                 profraws,
                 batch_index,
-                "mismatch",
+                fuzz_seed,
+                guest_result.category,
+                category,
+                coverage_object(workspace),
+                mismatch_fingerprint,
             )
             print(
-                f"  MISMATCH saved to {failure_path.relative_to(workspace)}",
+                "  "
+                + (
+                    "MISMATCH"
+                    if guest_result.category
+                    == GuestResultCategory.SEMANTIC_MISMATCH
+                    else category.upper()
+                )
+                + f" saved to {failure_path.relative_to(workspace)}",
                 flush=True,
             )
-            return BatchResult(True, "mismatch")
+            minimization_summary = None
+            if store is not None and minimize_enabled and (
+                guest_result.category == GuestResultCategory.SEMANTIC_MISMATCH
+            ):
+                outcome, minimization_job = _run_source_minimization(
+                    workspace,
+                    store,
+                    failure_path,
+                    max_minimization_qemu,
+                )
+                if not outcome.failed:
+                    minimization_summary = _minimization_summary(
+                        outcome,
+                        minimization_job,
+                    )
+            return BatchResult(
+                True,
+                category,
+                minimization=minimization_summary,
+            )
 
         try:
             if not profraws:
@@ -591,7 +786,11 @@ def _run_batch(
                 guest_log,
                 profraws,
                 batch_index,
-                "coverage",
+                fuzz_seed,
+                guest_result.category,
+                "coverage-failure",
+                coverage_object(workspace),
+                None,
             )
             print(
                 f"  COVERAGE FAILURE saved to {failure_path.relative_to(workspace)}",
@@ -606,6 +805,28 @@ def _run_batch(
         )
 
     if exact_result is not None:
+        if store is not None and minimize_enabled:
+            attribution_path = (
+                workspace
+                / "coverage/pipe-oracle-fuzz/attribution-jobs"
+                / exact_result.attribution_job_id
+            )
+            outcome, minimization_job = _run_source_minimization(
+                workspace,
+                store,
+                attribution_path,
+                max_minimization_qemu,
+            )
+            if outcome.failed:
+                return replace(
+                    exact_result,
+                    failed=True,
+                    category=f"minimization-{outcome.category}",
+                )
+            return replace(
+                exact_result,
+                minimization=_minimization_summary(outcome, minimization_job),
+            )
         return exact_result
     return BatchResult(
         False,
@@ -614,6 +835,36 @@ def _run_batch(
         admitted_digests,
         starry_elf_digest,
     )
+
+
+def _run_source_minimization(
+    workspace: Path,
+    corpus_store: CorpusStore,
+    source: Path,
+    max_qemu: int,
+) -> Tuple[MinimizationOutcome, object]:
+    minimization_store = MinimizationStore(
+        workspace,
+        corpus_store.generator_version,
+    )
+    job = create_or_load_job_from_source(
+        workspace,
+        source,
+        corpus_store,
+        minimization_store,
+        max_qemu=max_qemu,
+        active_starry_elf=coverage_object(workspace),
+    )
+    outcome = resume_minimization_job(
+        workspace,
+        corpus_store,
+        minimization_store,
+        job,
+        _minimization_runtime(),
+    )
+    if outcome.failed:
+        return outcome, job
+    return outcome, minimization_store.load_job(job.job_id)
 
 
 def _find_or_build_host_oracle(workspace: Path) -> Optional[Path]:
@@ -677,7 +928,7 @@ def _run_guest_compare(
     workspace: Path,
     artifact_dir: Path,
     pinned_starry_elf: Optional[Path] = None,
-) -> Tuple[str, List[Path], bool]:
+) -> GuestExecutionResult:
     return run_guest_compare(workspace, artifact_dir, pinned_starry_elf)
 
 
@@ -720,7 +971,11 @@ def _save_batch_failure(
     guest_log: str,
     profraws: List[Path],
     batch_index: int,
-    category: str,
+    fuzz_seed: int,
+    guest_category: GuestResultCategory,
+    failure_category: str,
+    starry_elf: Path,
+    mismatch_fingerprint: Optional[MismatchFingerprint],
 ):
     from common import atomic_save
 
@@ -735,7 +990,11 @@ def _save_batch_failure(
             guest_log,
             profraws,
             batch_index,
-            category,
+            fuzz_seed,
+            guest_category,
+            failure_category,
+            starry_elf,
+            mismatch_fingerprint,
         ),
     )
 
@@ -749,7 +1008,11 @@ def _write_failure_parts(
     guest_log: str,
     profraws: List[Path],
     batch_index: int,
-    category: str,
+    fuzz_seed: int,
+    guest_category: GuestResultCategory,
+    failure_category: str,
+    starry_elf: Path,
+    mismatch_fingerprint: Optional[MismatchFingerprint],
 ):
     if len(input_map) == 1:
         key = next(iter(sorted(input_map)))
@@ -758,9 +1021,11 @@ def _write_failure_parts(
         input_directory = temporary / "inputs"
         input_directory.mkdir()
         for digest in sorted(input_map):
-            (input_directory / f"{digest[:16]}.bin").write_bytes(input_map[digest])
+            (input_directory / f"{digest}.ops").write_bytes(input_map[digest])
     (temporary / "pipe.ops").write_text(ops_text)
     shutil.copy2(elf_path, temporary / "pipe-linux-oracle")
+    if starry_elf.is_file():
+        shutil.copy2(starry_elf, temporary / "starryos")
     shutil.copy2(trace_path, temporary / "linux.trace")
     (temporary / "guest.log").write_text(guest_log)
     profraw_directory = temporary / "profraws"
@@ -768,22 +1033,15 @@ def _write_failure_parts(
     for profraw in profraws:
         if profraw.exists():
             shutil.copy2(profraw, profraw_directory / profraw.name)
-    metadata = build_metadata(
-        seed=None,
-        batch_index=batch_index,
+    metadata = build_failure_metadata_v2(
+        temporary,
         generator_version=GENERATOR_VERSION,
-        input_path=(
-            temporary / "input.bin"
-            if (temporary / "input.bin").exists()
-            else None
-        ),
-        elf_path=temporary / "pipe-linux-oracle",
-        ops_path=temporary / "pipe.ops",
-        trace_path=temporary / "linux.trace",
-        guest_log_path=temporary / "guest.log",
-        profraw_paths=list(profraw_directory.iterdir()),
+        fuzz_seed=fuzz_seed,
+        batch_index=batch_index,
         command=" ".join(sys.argv),
-        result_category=category,
+        result_category=guest_category,
+        mismatch_fingerprint=mismatch_fingerprint,
+        failure_category=failure_category,
     )
     save_metadata(temporary, metadata)
 

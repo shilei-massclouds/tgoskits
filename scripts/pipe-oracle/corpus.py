@@ -30,9 +30,10 @@ from scenario import (
 
 
 LEGACY_CORPUS_SCHEMA_VERSION = 1
-CORPUS_SCHEMA_VERSION = 2
+ATTRIBUTED_CORPUS_SCHEMA_VERSION = 2
+CORPUS_SCHEMA_VERSION = 3
 COVERAGE_STATE_SCHEMA_VERSION = 1
-RUN_SCHEMA_VERSION = 2
+RUN_SCHEMA_VERSION = 3
 
 CORPUS_ENTRIES_NAME = "corpus"
 RUNS_NAME = "runs"
@@ -149,12 +150,41 @@ class CorpusStore:
     def load_corpus(self) -> CanonicalCorpus:
         self.prepare()
         corpus = CanonicalCorpus()
+        loaded_entries = []
         for path in sorted(self.corpus_dir.iterdir(), key=lambda item: item.name):
             if _ENTRY_TEMP_PATTERN.fullmatch(path.name):
                 continue
             if path.is_symlink() or not path.is_dir():
                 raise CorpusValidationError(path, "expected a canonical entry directory")
             entry = self._load_entry(path)
+            metadata = _read_json(path / METADATA_NAME)
+            loaded_entries.append((path, entry, metadata))
+        entries_by_digest = {
+            entry.digest: (path, metadata)
+            for path, entry, metadata in loaded_entries
+        }
+        for path, entry, metadata in loaded_entries:
+            if (
+                metadata["schema_version"] == CORPUS_SCHEMA_VERSION
+                and metadata["lifecycle"]["status"] == "superseded"
+            ):
+                replacement_digest = metadata["lifecycle"]["superseded_by"]
+                replacement = entries_by_digest.get(replacement_digest)
+                if replacement is None:
+                    raise CorpusValidationError(
+                        path,
+                        "superseded corpus replacement is missing",
+                    )
+                _replacement_path, replacement_metadata = replacement
+                if (
+                    replacement_metadata["schema_version"] != CORPUS_SCHEMA_VERSION
+                    or replacement_metadata["lifecycle"]["status"] != "active"
+                ):
+                    raise CorpusValidationError(
+                        path,
+                        "superseded corpus replacement is not active schema v3",
+                    )
+                continue
             if not corpus.add(entry.document):
                 raise CorpusValidationError(path, "duplicate canonical digest")
         return corpus
@@ -238,7 +268,7 @@ class CorpusStore:
 
         environment = self.verification_environment()
         metadata = {
-            "schema_version": CORPUS_SCHEMA_VERSION,
+            "schema_version": ATTRIBUTED_CORPUS_SCHEMA_VERSION,
             "canonical_digest": digest,
             "pipe_ops_sha256": digest,
             "generator_version": self.generator_version,
@@ -263,6 +293,125 @@ class CorpusStore:
         }
         self._save_new_entry(destination, encoded, metadata)
         return True
+
+    def admit_minimized_entry(
+        self,
+        document: ScenarioDocument,
+        provenance: CorpusProvenance,
+        attributed_regions: Set[str],
+        minimization_job_id: str,
+        original_digests: Set[str],
+    ) -> bool:
+        """Activate a proved minimized entry before any source is superseded."""
+        self.prepare()
+        _validate_provenance(provenance)
+        _validate_attribution(attributed_regions, minimization_job_id)
+        _validate_digest_set(original_digests, "minimization originals")
+        validate_entry_limits(document)
+        encoded = serialize_document(document).encode("utf-8")
+        digest = hashlib.sha256(encoded).hexdigest()
+        if digest in original_digests:
+            raise ValueError("minimized digest must differ from every original")
+        destination = self.corpus_dir / digest
+        if destination.exists():
+            self._merge_minimization_lineage(
+                destination,
+                attributed_regions,
+                minimization_job_id,
+                original_digests,
+            )
+            return False
+
+        environment = self.verification_environment()
+        metadata = {
+            "schema_version": CORPUS_SCHEMA_VERSION,
+            "canonical_digest": digest,
+            "pipe_ops_sha256": digest,
+            "generator_version": self.generator_version,
+            "origin": provenance.as_metadata(),
+            "coverage": {
+                "attribution": "exact",
+                "first_batch_new_regions": _sorted_regions(attributed_regions),
+                "attributed_regions": _sorted_regions(attributed_regions),
+                "attribution_jobs": [minimization_job_id],
+            },
+            "first_observed": environment,
+            "last_verified": environment,
+            "stability": {
+                "status": "stable",
+                "successful_batch_verifications": 1,
+                "successful_attribution_verifications": 1,
+            },
+            "batch_status": {"compare": "passed", "replay": "passed"},
+            "lifecycle": {"status": "active", "superseded_by": None},
+            "minimization": {
+                "original_digests": sorted(original_digests),
+                "minimization_jobs": [minimization_job_id],
+            },
+        }
+        self._save_new_entry(destination, encoded, metadata)
+        return True
+
+    def supersede_entry(
+        self,
+        original_digest: str,
+        replacement_digest: str,
+        minimization_job_id: str,
+    ) -> None:
+        """Atomically mark one historical entry superseded after replacement activation."""
+        self.prepare()
+        if not _is_digest(original_digest) or not _is_digest(replacement_digest):
+            raise ValueError("supersede requires canonical digests")
+        if original_digest == replacement_digest:
+            raise ValueError("corpus entry cannot supersede itself")
+        if not _RUN_ID_PATTERN.fullmatch(minimization_job_id):
+            raise ValueError("invalid minimization job id")
+        replacement = self.corpus_dir / replacement_digest
+        if not replacement.exists():
+            raise CorpusStorageError(f"replacement corpus entry is missing: {replacement}")
+        replacement_entry = self._load_entry(replacement)
+        replacement_metadata = _read_json(replacement / METADATA_NAME)
+        if (
+            replacement_entry.digest != replacement_digest
+            or replacement_metadata["schema_version"] != CORPUS_SCHEMA_VERSION
+            or replacement_metadata["lifecycle"]["status"] != "active"
+        ):
+            raise CorpusStorageError("replacement corpus entry is not active schema v3")
+
+        original = self.corpus_dir / original_digest
+        entry = self._load_entry(original)
+        metadata = _read_json(original / METADATA_NAME)
+        if metadata["schema_version"] == CORPUS_SCHEMA_VERSION:
+            lifecycle = metadata["lifecycle"]
+            if lifecycle["status"] == "superseded":
+                if lifecycle["superseded_by"] != replacement_digest:
+                    raise CorpusStorageError("corpus entry has a different replacement")
+                return
+        else:
+            metadata = self._upgrade_metadata_to_v3(
+                metadata,
+                entry.digest,
+                minimization_job_id,
+            )
+        metadata["lifecycle"] = {
+            "status": "superseded",
+            "superseded_by": replacement_digest,
+        }
+        metadata["minimization"]["minimization_jobs"] = sorted(
+            set(metadata["minimization"]["minimization_jobs"])
+            | {minimization_job_id}
+        )
+        metadata["last_verified"] = self.verification_environment()
+        _atomic_write_json(original / METADATA_NAME, metadata)
+
+    def entry_metadata(self, digest: str) -> Dict[str, Any]:
+        if not _is_digest(digest):
+            raise ValueError("invalid corpus digest")
+        entry_dir = self.corpus_dir / digest
+        entry = self._load_entry(entry_dir)
+        metadata = _read_json(entry_dir / METADATA_NAME)
+        self._validate_entry_metadata(metadata, entry_dir, entry.digest)
+        return metadata
 
     def update_existing_attribution(
         self,
@@ -417,9 +566,7 @@ class CorpusStore:
         entry_dir: Path,
         digest: str,
     ) -> None:
-        _require_exact_keys(
-            metadata,
-            {
+        common_keys = {
                 "schema_version",
                 "canonical_digest",
                 "pipe_ops_sha256",
@@ -430,15 +577,18 @@ class CorpusStore:
                 "last_verified",
                 "stability",
                 "batch_status",
-            },
-            entry_dir / METADATA_NAME,
-        )
+        }
         schema_version = metadata["schema_version"]
         if schema_version not in (
             LEGACY_CORPUS_SCHEMA_VERSION,
+            ATTRIBUTED_CORPUS_SCHEMA_VERSION,
             CORPUS_SCHEMA_VERSION,
         ):
             raise CorpusValidationError(entry_dir, "unsupported corpus schema")
+        expected_keys = set(common_keys)
+        if schema_version == CORPUS_SCHEMA_VERSION:
+            expected_keys |= {"lifecycle", "minimization"}
+        _require_exact_keys(metadata, expected_keys, entry_dir / METADATA_NAME)
         if metadata["generator_version"] != self.generator_version:
             raise CorpusValidationError(entry_dir, "incompatible generator version")
         if metadata["canonical_digest"] != digest:
@@ -451,6 +601,9 @@ class CorpusStore:
         _validate_environment(metadata["last_verified"], entry_dir)
         _validate_stability(metadata["stability"], entry_dir, schema_version)
         _validate_batch_status(metadata["batch_status"], entry_dir, schema_version)
+        if schema_version == CORPUS_SCHEMA_VERSION:
+            _validate_lifecycle(metadata["lifecycle"], digest, entry_dir)
+            _validate_minimization(metadata["minimization"], entry_dir)
 
     def _update_last_verified(self, entry_dir: Path) -> None:
         entry = self._load_entry(entry_dir)
@@ -472,7 +625,7 @@ class CorpusStore:
         metadata = _read_json(metadata_path)
         self._validate_entry_metadata(metadata, entry_dir, entry.digest)
         if metadata["schema_version"] == LEGACY_CORPUS_SCHEMA_VERSION:
-            metadata["schema_version"] = CORPUS_SCHEMA_VERSION
+            metadata["schema_version"] = ATTRIBUTED_CORPUS_SCHEMA_VERSION
             metadata["coverage"] = {
                 **metadata["coverage"],
                 "attribution": "exact",
@@ -499,6 +652,87 @@ class CorpusStore:
         metadata["stability"]["successful_batch_verifications"] += 1
         metadata["batch_status"]["replay"] = "passed"
         _atomic_write_json(metadata_path, metadata)
+
+    def _merge_minimization_lineage(
+        self,
+        entry_dir: Path,
+        attributed_regions: Set[str],
+        minimization_job_id: str,
+        original_digests: Set[str],
+    ) -> None:
+        entry = self._load_entry(entry_dir)
+        metadata = _read_json(entry_dir / METADATA_NAME)
+        if metadata["schema_version"] == CORPUS_SCHEMA_VERSION:
+            coverage = metadata["coverage"]
+            lineage = metadata["minimization"]
+            if (
+                minimization_job_id in lineage["minimization_jobs"]
+                and original_digests <= set(lineage["original_digests"])
+                and attributed_regions <= set(coverage["attributed_regions"])
+            ):
+                return
+        if metadata["schema_version"] != CORPUS_SCHEMA_VERSION:
+            metadata = self._upgrade_metadata_to_v3(
+                metadata,
+                entry.digest,
+                minimization_job_id,
+            )
+        if metadata["lifecycle"]["status"] != "active":
+            raise CorpusStorageError("cannot reactivate a superseded corpus entry")
+        coverage = metadata["coverage"]
+        if coverage["attribution"] != "exact":
+            coverage.update(
+                {
+                    "attribution": "exact",
+                    "attributed_regions": [],
+                    "attribution_jobs": [],
+                }
+            )
+        coverage["attributed_regions"] = _sorted_regions(
+            set(coverage["attributed_regions"]) | attributed_regions
+        )
+        coverage["attribution_jobs"] = sorted(
+            set(coverage["attribution_jobs"]) | {minimization_job_id}
+        )
+        lineage = metadata["minimization"]
+        lineage["original_digests"] = sorted(
+            set(lineage["original_digests"]) | original_digests
+        )
+        lineage["minimization_jobs"] = sorted(
+            set(lineage["minimization_jobs"]) | {minimization_job_id}
+        )
+        metadata["last_verified"] = self.verification_environment()
+        metadata["stability"]["successful_batch_verifications"] += 1
+        metadata["stability"]["successful_attribution_verifications"] += 1
+        _atomic_write_json(entry_dir / METADATA_NAME, metadata)
+
+    def _upgrade_metadata_to_v3(
+        self,
+        metadata: Dict[str, Any],
+        digest: str,
+        minimization_job_id: str,
+    ) -> Dict[str, Any]:
+        if metadata["schema_version"] == LEGACY_CORPUS_SCHEMA_VERSION:
+            regions = set(metadata["coverage"]["first_batch_new_regions"])
+            metadata["coverage"] = {
+                **metadata["coverage"],
+                "attribution": "exact",
+                "attributed_regions": _sorted_regions(regions),
+                "attribution_jobs": [minimization_job_id],
+            }
+            metadata["stability"] = {
+                **metadata["stability"],
+                "status": "stable",
+                "successful_attribution_verifications": 1,
+            }
+            metadata["batch_status"]["replay"] = "passed"
+        metadata["schema_version"] = CORPUS_SCHEMA_VERSION
+        metadata["lifecycle"] = {"status": "active", "superseded_by": None}
+        metadata["minimization"] = {
+            "original_digests": [digest],
+            "minimization_jobs": [minimization_job_id],
+        }
+        return metadata
 
     def _save_new_entry(
         self,
@@ -632,7 +866,7 @@ def _validate_environment(metadata: Any, path: Path) -> None:
 
 def _validate_stability(metadata: Any, path: Path, schema_version: int) -> None:
     keys = {"status", "successful_batch_verifications"}
-    if schema_version == CORPUS_SCHEMA_VERSION:
+    if schema_version != LEGACY_CORPUS_SCHEMA_VERSION:
         keys.add("successful_attribution_verifications")
     _require_exact_keys(metadata, keys, path)
     expected_status = (
@@ -645,7 +879,7 @@ def _validate_stability(metadata: Any, path: Path, schema_version: int) -> None:
     count = metadata["successful_batch_verifications"]
     if not _is_positive_integer(count):
         raise CorpusValidationError(path, "verification count must be positive")
-    if schema_version == CORPUS_SCHEMA_VERSION:
+    if schema_version != LEGACY_CORPUS_SCHEMA_VERSION:
         attribution_count = metadata["successful_attribution_verifications"]
         if not _is_positive_integer(attribution_count):
             raise CorpusValidationError(
@@ -671,6 +905,48 @@ def _validate_attribution(regions: Set[str], job_id: str) -> None:
     _sorted_regions(regions)
     if not isinstance(job_id, str) or not _RUN_ID_PATTERN.fullmatch(job_id):
         raise ValueError(f"invalid attribution job id: {job_id}")
+
+
+def _validate_lifecycle(metadata: Any, digest: str, path: Path) -> None:
+    _require_exact_keys(metadata, {"status", "superseded_by"}, path)
+    status = metadata["status"]
+    replacement = metadata["superseded_by"]
+    if status == "active":
+        if replacement is not None:
+            raise CorpusValidationError(path, "active corpus entry has a replacement")
+    elif status == "superseded":
+        if not _is_digest(replacement) or replacement == digest:
+            raise CorpusValidationError(path, "superseded corpus replacement is invalid")
+    else:
+        raise CorpusValidationError(path, "unsupported corpus lifecycle status")
+
+
+def _validate_minimization(metadata: Any, path: Path) -> None:
+    _require_exact_keys(
+        metadata,
+        {"original_digests", "minimization_jobs"},
+        path,
+    )
+    originals = metadata["original_digests"]
+    jobs = metadata["minimization_jobs"]
+    if (
+        not isinstance(originals, list)
+        or not originals
+        or originals != sorted(set(originals))
+        or not all(_is_digest(digest) for digest in originals)
+    ):
+        raise CorpusValidationError(path, "minimization originals are invalid")
+    if (
+        not _is_sorted_unique_strings(jobs)
+        or not jobs
+        or not all(_RUN_ID_PATTERN.fullmatch(job) for job in jobs)
+    ):
+        raise CorpusValidationError(path, "minimization jobs are invalid")
+
+
+def _validate_digest_set(values: Set[str], name: str) -> None:
+    if not isinstance(values, set) or not values or not all(_is_digest(value) for value in values):
+        raise ValueError(f"{name} must be a non-empty digest set")
 
 
 def _is_positive_integer(value: Any) -> bool:

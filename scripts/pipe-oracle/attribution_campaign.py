@@ -16,6 +16,7 @@ from attribution import (
     ReplayEvidence,
 )
 from corpus import CanonicalCorpus, CorpusStorageError, CorpusStore
+from guest_result import GuestExecutionResult, normalize_guest_execution
 from scenario import combine_documents, serialize_document
 
 
@@ -24,7 +25,7 @@ class AttributionReplayRuntime:
     record_host: Callable[[Path, Path, Path], Any]
     run_guest_compare: Callable[
         [Path, Path, Optional[Path]],
-        Tuple[str, List[Path], bool],
+        Any,
     ]
     extract_regions: Callable[[List[Path], Path], Set[str]]
     coverage_object: Callable[[Path], Path]
@@ -326,12 +327,16 @@ def _run_attribution_replay(
             if trace_missing and host_record.passed:
                 guest_log += "\nHost record reported success without a trace.\n"
         else:
-            guest_log, profraws, guest_passed = runtime.run_guest_compare(
-                workspace,
-                temporary,
-                pinned_starry_elf,
+            guest_result = normalize_guest_execution(
+                runtime.run_guest_compare(
+                    workspace,
+                    temporary,
+                    pinned_starry_elf,
+                )
             )
-            category = "passed" if guest_passed else "mismatch"
+            guest_log = guest_result.log
+            profraws = list(guest_result.profraw_paths)
+            category = guest_result.category.value
 
         active_starry_elf = runtime.coverage_object(workspace)
         if not active_starry_elf.is_file():

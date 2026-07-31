@@ -10,7 +10,9 @@ from typing import Dict, List, Tuple
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 from artifact import validate_failure
+from corpus_errors import CorpusValidationError
 from common import build_metadata, save_metadata
+from guest_result import GuestExecutionResult, normalize_guest_execution
 from runner import run_guest_compare
 
 
@@ -34,7 +36,12 @@ def main():
 
     try:
         meta = validate_failure(failure_dir)
-    except (AssertionError, FileNotFoundError, json.JSONDecodeError) as e:
+    except (
+        AssertionError,
+        FileNotFoundError,
+        json.JSONDecodeError,
+        CorpusValidationError,
+    ) as e:
         print(f"Validation error: {e}", file=sys.stderr)
         sys.exit(1)
 
@@ -60,7 +67,16 @@ def _replay_guest(failure_dir: Path, meta: Dict):
     run_path = run_dir / run_id
     run_path.mkdir()
 
-    guest_log, profraws, passed = _run_guest_compare(WORKSPACE_ROOT, failure_dir)
+    pinned_starry_elf = (
+        failure_dir / "starryos"
+        if meta.get("schema_version") == 2
+        else None
+    )
+    result = normalize_guest_execution(
+        _run_guest_compare(WORKSPACE_ROOT, failure_dir, pinned_starry_elf)
+    )
+    guest_log = result.log
+    profraws = list(result.profraw_paths)
     (run_path / "guest.log").write_text(guest_log)
     for p in profraws:
         shutil.copy2(p, run_path / p.name)
@@ -76,11 +92,11 @@ def _replay_guest(failure_dir: Path, meta: Dict):
         guest_log_path=run_path / "guest.log",
         profraw_paths=list(run_path.glob("*.profraw")),
         command=" ".join(sys.argv),
-        result_category="passed" if passed else meta.get("guest_result_category", "mismatch"),
+        result_category=result.category.value,
     )
     save_metadata(run_path, replay_meta)
 
-    if passed:
+    if result.passed:
         print(f"  REPLAY PASSED: saved to {run_path}")
     else:
         print(f"  REPLAY FAILED: saved to {run_path}")
@@ -88,9 +104,11 @@ def _replay_guest(failure_dir: Path, meta: Dict):
 
 
 def _run_guest_compare(
-    workspace: Path, artifact_dir: Path
-) -> Tuple[str, List[Path], bool]:
-    return run_guest_compare(workspace, artifact_dir)
+    workspace: Path,
+    artifact_dir: Path,
+    pinned_starry_elf: Path | None = None,
+) -> GuestExecutionResult:
+    return run_guest_compare(workspace, artifact_dir, pinned_starry_elf)
 
 
 def _refresh_host(failure_dir: Path, meta: Dict):

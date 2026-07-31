@@ -13,6 +13,9 @@ Linux 差分测试，以及如何重放失败。
 ./scripts/pipe-oracle/fuzz.py --batches 5 --batch-size 4
 ```
 
+productive coverage 和 semantic mismatch 默认会进入可恢复的结构化最小化。每个
+job 最多运行 64 次候选 QEMU；原始输入验证和两次最终证明不计入该候选预算。
+
 失败时会打印并保存 `coverage/pipe-oracle-fuzz/failures/<failure-id>`，使用以下
 命令重现：
 
@@ -88,11 +91,13 @@ baseline 和固定 profraw 路径。锁文件本身可以保留，是否持锁�
 - `--seed`：变异随机种子，用于重复同一 campaign。
 - `--batches`：覆盖反馈迭代次数；每个 batch 启动一次 QEMU。
 - `--batch-size`：一个 batch 中合并执行的候选输入数量。
+- `--max-qemu`：每个 minimization job 共享的候选 QEMU 上限，默认 `64`。
+- `--no-minimize`：关闭自动最小化；精确归因和原始 failure 保存仍然启用。
 - `--workspace`：仓库根目录；通常无需设置。
 
-`--batch-size 1` 的覆盖归因最精确。`4` 到 `8` 适合作为日常吞吐与
-归因精度的折中。更大的 batch 可以在一次 QEMU 中测试更多输入，但只知道
-整个 batch 是否产生了新覆盖，不能定位到某个输入。
+`--batch-size 1` 可以减少 productive batch 后的逐 entry 归因成本。`4` 到 `8`
+适合作为日常吞吐与额外 QEMU 次数的折中；productive batch 会通过后续精确重放
+把每个 target region 归因到具体 canonical entry。
 
 ## 4. 理解输出
 
@@ -123,16 +128,22 @@ coverage/pipe-oracle-fuzz/
   runs/<run-id>/
     metadata.json
   coverage-state/<starry-elf-sha256>.json
+  attribution-jobs/<job-id>/...
+  minimization-jobs/<job-id>/...
   failures/...
   .campaign.lock
 ```
 
-corpus entry 的 `metadata.json` 使用 schema v1，记录 generator 版本、来源、parent、
-donor、mutation 类型、首次 batch 新增 region、Git/host 环境、稳定性以及
-compare/replay 状态。由于当前仍是 batch 级反馈，region attribution 明确标为
-`batch-pending`，不表示该 entry 单独贡献了这些 region。`runs/` 原子记录每个
-batch 的 seed、命令、实际耗时、候选分类、亲缘关系、新增 region、准入 digest
-和结果。
+corpus 严格读取 schema v1/v2/v3。v1 是带 `batch-pending` 声明的历史格式；v2
+保存精确的 `attributed_regions`；v3 在此基础上增加 `active`/`superseded` 生命周期
+和 minimization lineage。旧 entry 只在被精确归因或最小化时惰性升级。最小 entry
+完成两次证明并激活后，原 entry 才会原子标记为 superseded；历史目录不删除，变异
+只加载 active entry。
+
+run schema v3 原子记录 batch、attribution 和 minimization 结果，包括原始/最小
+digest、候选与证明 QEMU 数、完成方式和尺寸变化。启动顺序固定为：先恢复
+attribution，再生成或恢复 minimization，重新加载 active corpus，最后才初始化 RNG
+并生成新 batch。
 
 启动时会严格验证目录名与 `pipe.ops` SHA-256、canonical 编码、场景资源上限、
 schema 和 generator 版本。任何不兼容或损坏 entry 都会报告具体路径并立即失败；
@@ -145,7 +156,10 @@ generator 前也应先归档或清理这些目录；当前没有自动迁移工�
 
 ## 5. 失败信息
 
-发现 differential mismatch、panic、timeout 或 coverage 分析失败时，fuzzer
+guest 结果分为 `passed`、`semantic-mismatch`、`oracle-failure`、`kernel-panic`、
+`lockdep-failure`、`timeout` 和 `infrastructure-failure`。QEMU 启动、monitor socket
+或 coverage 工具故障不会再记录为语义 mismatch。发现 mismatch、panic、timeout
+或 coverage 分析失败时，fuzzer
 立即停止并打印可以直接传给 replay 的仓库相对路径：
 
 ```text
@@ -165,15 +179,42 @@ failure 目录包含：
 pipe.ops             本批次的完整操作语料
 linux.trace          原始 host Linux 结果
 pipe-linux-oracle    本次使用的静态 x86_64 ELF
+starryos             schema v2 保存的固定 instrumented StarryOS ELF
 guest.log            QEMU、StarryOS 和 runner 输出
 profraws/            已成功提取的 coverage profile
 input.bin 或 inputs/ 生成该批次的二进制输入
 metadata.json        Git、host、digest 和结果元数据
 ```
 
-failure schema 和原始证据不会在 replay 时被覆盖。
+failure schema v2 保存类型化 guest 结果和 mismatch fingerprint。fingerprint 锚定
+原 operation 身份、operation kind、差异字段集合、expected/actual 结果类别和失败侧
+精确 errno。schema v1 继续支持 replay；从 v1 启动 mismatch 最小化时，会先从旧 log
+严格推导 fingerprint，再用当前固定 ELF 重放确认，原 artifact 始终只读。
 
-## 6. 重现失败测试
+## 6. 最小化与恢复
+
+手动最小化 failure artifact 或已完成 attribution job：
+
+```bash
+./scripts/pipe-oracle/minimize.py SOURCE --max-qemu 64
+```
+
+reducer 按确定性顺序删除 mismatch 关键操作之后的尾部、scenario 块、operation
+连续片段和单个 operation，然后简化 dup/resource slot 与 length、byte、pipe size、
+poll mask。它不调用随机 mutation，也不会合成初始化操作；候选必须 canonical、资源
+关系合法且 complexity key 严格下降。无效或重复候选不消耗 QEMU 预算。
+
+coverage 候选必须保留该代表负责的全部 region；最终代表集连续重放两次，均须覆盖
+责任集并集。mismatch 候选必须在原关键 operation 上产生完全相同的 fingerprint。
+候选谓词执行一次，最终结果连续证明两次。预算耗尽后证明当前最佳，成功时以
+`budget-limited` 完成；这里承诺确定性缩减，不承诺全局最小。
+
+job 状态为 `validating -> reducing -> final-proof -> completed`。恢复时固定 Starry ELF
+digest 改变会将完整 job 移到 `failures/minimization-<job-id>/` 并标记 `stale`；谓词
+不稳定、panic 或基础设施错误标记 `unstable`。coverage 最小化成功后 campaign 可以
+继续；mismatch 无论完成或异常都会停止 campaign，并同时保留原始和最小 failure。
+
+## 7. 重现失败测试
 
 将 fuzzer 打印的路径直接复制到命令中：
 
@@ -199,19 +240,19 @@ replay 会验证 artifact digest，并将 failure 目录中的 exact ELF、`pipe
 
 新 trace 保存在 `refresh-runs/run-NNNN/`，原始 `linux.trace` 保持不变。
 
-## 7. 当前限制
+## 8. 当前限制
 
 - 仅支持 x86_64 StarryOS QEMU 和 host x86_64 静态测试基准。
 - 覆盖反馈目前只关注 StarryOS `pipe.rs`。
-- batch 覆盖是集合反馈；一个 batch 产生新覆盖时，该 batch 的全部候选输入都会
-  加入持久 corpus，并标记为 `batch-pending`；阶段 2.1 不做逐输入精确归因。
+- productive batch 会进行精确 entry 归因和结构化最小化，但结果只是在固定变换顺序
+  和预算下的当前最佳，不是全局最小。
 - campaign 串行使用固定的 StarryOS build 和 profraw 路径；同一 workspace 的
   并行 campaign 会被进程锁拒绝。
 
 更详细的 artifact 注入、deferred-fail 和 coverage 提取设计见
 `book/design/starry-pipe-linux-oracle.md`。
 
-## 8. 原理摘要
+## 9. 原理摘要
 
 测试覆盖率来自启用 `AXTEST_COVERAGE=y` 后由 Rust coverage instrumentation
 插桩的 StarryOS 内核，不来自 host Linux 或 C 测试基准。guest 完成差分测试后写

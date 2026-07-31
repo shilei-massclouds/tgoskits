@@ -59,7 +59,7 @@ class PipeOracleRegressionTests(unittest.TestCase):
         cls._oracle_temp.cleanup()
 
     def test_script_help_works_from_the_command_path(self):
-        for script in ("analyze.py", "fuzz.py", "replay.py"):
+        for script in ("analyze.py", "fuzz.py", "minimize.py", "replay.py"):
             result = subprocess.run(
                 [sys.executable, str(SCRIPT_DIR / script), "--help"],
                 cwd=WORKSPACE_ROOT,
@@ -272,6 +272,34 @@ class PipeOracleRegressionTests(unittest.TestCase):
         )
         self._assert_host_record_compare(canonical)
 
+    def test_compare_reports_stable_difference_mask(self):
+        corpus_text = "version 1\nscenario generated-0001\npipe2 0 1\n"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary = Path(temporary_directory)
+            ops = temporary / "pipe.ops"
+            trace = temporary / "linux.trace"
+            ops.write_text(corpus_text)
+            recorded = subprocess.run(
+                [str(self.oracle), "--record", str(ops), str(trace)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(recorded.returncode, 0, recorded.stderr)
+            encoded = bytearray(trace.read_bytes())
+            # trace_header is 128 bytes; operation_result.result begins 16 bytes
+            # into the first 8-byte-aligned record.
+            encoded[144:152] = int(-1).to_bytes(8, "little", signed=True)
+            trace.write_bytes(encoded)
+
+            compared = subprocess.run(
+                [str(self.oracle), "--compare", str(ops), str(trace)],
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertNotEqual(compared.returncode, 0)
+        self.assertIn("difference_mask=0x00000008", compared.stderr)
+
     def test_multi_entry_batch_is_one_canonical_corpus_accepted_by_the_oracle(self):
         documents = [
             generator.legacy_document_from_input(raw_input)
@@ -468,7 +496,7 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
             store = corpus.CorpusStore(Path(temporary_directory))
             run_path = store.save_run("run-0001", metadata)
             saved = json.loads((run_path / "metadata.json").read_text())
-        self.assertEqual(saved["schema_version"], 2)
+        self.assertEqual(saved["schema_version"], 3)
         self.assertEqual(saved["generator_version"], generator.GENERATOR_VERSION)
         self.assertEqual(saved["result"], "passed")
 
@@ -849,7 +877,7 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
             with mock.patch.object(replay, "run_guest_compare") as run:
                 run.return_value = ("guest", [], True)
                 replay._run_guest_compare(WORKSPACE_ROOT, failure_directory)
-        run.assert_called_once_with(WORKSPACE_ROOT, failure_directory)
+        run.assert_called_once_with(WORKSPACE_ROOT, failure_directory, None)
 
     def test_qemu_subprocess_gets_absolute_artifact_environment(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
