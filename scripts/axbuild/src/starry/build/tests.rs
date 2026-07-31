@@ -740,3 +740,45 @@ fn ensure_starry_bin_arg_keeps_existing_bin_arg() {
 
     assert_eq!(args, vec!["--bin".to_string(), "starryos".to_string()]);
 }
+
+#[test]
+fn pinned_kallsyms_accepts_matching_executable_sections() {
+    let active = vec![ComparableElfSection {
+        name: ".text".to_string(),
+        address: 0x1000,
+        size: 4,
+        data: vec![1, 2, 3, 4],
+    }];
+    let pinned = vec![ComparableElfSection {
+        name: ".text".to_string(),
+        address: 0x1000,
+        size: 4,
+        data: vec![1, 2, 3, 4],
+    }];
+
+    ensure_section_snapshots_match(&active, &pinned).unwrap();
+}
+
+#[test]
+fn pinned_kallsyms_rejects_changed_executable_sections() {
+    let active = vec![ComparableElfSection {
+        name: ".text".to_string(),
+        address: 0x1000,
+        size: 4,
+        data: vec![1, 2, 3, 4],
+    }];
+    let pinned = vec![ComparableElfSection {
+        name: ".text".to_string(),
+        address: 0x1000,
+        size: 4,
+        data: vec![1, 2, 3, 5],
+    }];
+
+    let error = ensure_section_snapshots_match(&active, &pinned).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("executable or coverage sections")
+    );
+}

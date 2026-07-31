@@ -20,6 +20,16 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from common import build_metadata, save_metadata
+from attribution import (
+    AttributionInput,
+    AttributionJob,
+    AttributionStore,
+    ReplayEvidence,
+)
+from attribution_campaign import (
+    AttributionReplayRuntime,
+    resume_attribution_job,
+)
 from corpus import (
     CanonicalCorpus,
     CorpusStorageError,
@@ -60,6 +70,11 @@ class BatchResult:
     new_regions: Tuple[str, ...] = ()
     admitted_digests: Tuple[str, ...] = ()
     starry_elf_sha256: Optional[str] = None
+    attribution_job_id: Optional[str] = None
+    entry_regions: Tuple[Tuple[str, Tuple[str, ...]], ...] = ()
+    representative_digests: Tuple[str, ...] = ()
+    attribution_replays: int = 0
+    attribution_duration_seconds: Optional[float] = None
 
     def __bool__(self) -> bool:
         return self.failed
@@ -112,14 +127,25 @@ def _run_campaign(args, workspace: Path, store: CorpusStore) -> int:
         flush=True,
     )
 
+    command = shlex.join(sys.argv)
+    attribution_store = AttributionStore(workspace, store.generator_version)
+    if _resume_saved_jobs(
+        workspace,
+        store,
+        attribution_store,
+        corpus,
+        command,
+    ):
+        return 1
+
     rng = CampaignRng(args.seed)
     stats = CampaignStats()
     campaign_id = _campaign_id()
-    command = shlex.join(sys.argv)
 
     for batch_index in range(args.batches):
         print(f"=== Batch {batch_index + 1}/{args.batches} ===", flush=True)
         batch_candidates = _select_batch(rng, corpus, args.batch_size, stats)
+        run_id = f"{campaign_id}-batch-{batch_index + 1:04d}"
         started = time.monotonic()
         batch_result = _run_batch(
             workspace,
@@ -130,6 +156,8 @@ def _run_campaign(args, workspace: Path, store: CorpusStore) -> int:
             store.failures_dir,
             stats,
             store,
+            fuzz_seed=args.seed,
+            attribution_job_id=run_id,
         )
         duration = time.monotonic() - started
         run_metadata = _build_run_metadata(
@@ -140,10 +168,9 @@ def _run_campaign(args, workspace: Path, store: CorpusStore) -> int:
             batch_candidates,
             batch_result,
         )
-        store.save_run(
-            f"{campaign_id}-batch-{batch_index + 1:04d}",
-            run_metadata,
-        )
+        store.save_run(run_id, run_metadata)
+        if batch_result.attribution_job_id is not None and not batch_result.failed:
+            attribution_store.mark_run_recorded(batch_result.attribution_job_id)
         if batch_result.failed:
             print(f"Batch {batch_index + 1} failed, stopping.", flush=True)
             return 1
@@ -207,8 +234,140 @@ def _build_run_metadata(
         "new_regions": list(result.new_regions),
         "admitted_digests": list(result.admitted_digests),
         "starry_elf_sha256": result.starry_elf_sha256,
+        "attribution": {
+            "mode": "exact",
+            "job_id": result.attribution_job_id,
+            "qemu_replays": result.attribution_replays,
+            "entry_regions": [
+                {"digest": digest, "regions": list(regions)}
+                for digest, regions in result.entry_regions
+            ],
+            "representative_digests": list(result.representative_digests),
+        },
         "result": result.category,
     }
+
+
+def _resume_saved_jobs(
+    workspace: Path,
+    store: CorpusStore,
+    attribution_store: AttributionStore,
+    corpus: CanonicalCorpus,
+    command: str,
+) -> bool:
+    jobs = attribution_store.load_resumable_jobs()
+    if jobs:
+        print(
+            f"Resuming {len(jobs)} persisted attribution job(s) before new batches.",
+            flush=True,
+        )
+    for saved_job in jobs:
+        result = _resume_attribution_job(
+            workspace,
+            store,
+            attribution_store,
+            corpus,
+            saved_job,
+        )
+        run_path = store.runs_dir / saved_job.job_id
+        if not run_path.exists():
+            store.save_run(
+                saved_job.job_id,
+                _build_resumed_run_metadata(saved_job, result, command),
+            )
+        if result.failed:
+            return True
+        attribution_store.mark_run_recorded(saved_job.job_id)
+    return False
+
+
+def _build_resumed_run_metadata(
+    job: AttributionJob,
+    result: BatchResult,
+    command: str,
+) -> Dict:
+    entries = job.metadata["entries"]
+    sources = Counter(entry["origin"]["source"] for entry in entries)
+    relationships = [
+        {
+            "digest": entry["digest"],
+            "classification": CandidateClassification.EXECUTABLE.value,
+            "source": entry["origin"]["source"],
+            "parent_digest": entry["origin"]["parent_digest"],
+            "donor_digest": entry["origin"]["donor_digest"],
+            "mutation_type": entry["origin"]["mutation_type"],
+            "error_category": None,
+        }
+        for entry in entries
+    ]
+    return {
+        "fuzz_seed": job.metadata["fuzz_seed"],
+        "command": command,
+        "batch_index": job.metadata["batch_index"],
+        "batch_duration_seconds": (
+            result.attribution_duration_seconds
+            if result.attribution_duration_seconds is not None
+            else job.metadata["duration_seconds"]
+        ),
+        "candidate_counts": {
+            "candidates": len(entries),
+            "executable": len(entries),
+            "malformed": 0,
+            "unique_inputs": len(entries),
+        },
+        "candidate_sources": dict(sorted(sources.items())),
+        "candidate_relationships": relationships,
+        "new_regions": list(result.new_regions),
+        "admitted_digests": list(result.admitted_digests),
+        "starry_elf_sha256": result.starry_elf_sha256,
+        "attribution": {
+            "mode": "exact",
+            "job_id": result.attribution_job_id,
+            "qemu_replays": result.attribution_replays,
+            "entry_regions": [
+                {"digest": digest, "regions": list(regions)}
+                for digest, regions in result.entry_regions
+            ],
+            "representative_digests": list(result.representative_digests),
+        },
+        "resumed": True,
+        "result": result.category,
+    }
+
+
+def _resume_attribution_job(
+    workspace: Path,
+    store: CorpusStore,
+    attribution_store: AttributionStore,
+    corpus: CanonicalCorpus,
+    job: AttributionJob,
+) -> BatchResult:
+    runtime = AttributionReplayRuntime(
+        record_host=_record_host,
+        run_guest_compare=_run_guest_compare,
+        extract_regions=_extract_regions,
+        coverage_object=coverage_object,
+    )
+    outcome = resume_attribution_job(
+        workspace,
+        store,
+        attribution_store,
+        corpus,
+        job,
+        runtime,
+    )
+    return BatchResult(
+        outcome.failed,
+        outcome.category,
+        outcome.new_regions,
+        outcome.admitted_digests,
+        outcome.starry_elf_sha256,
+        outcome.job_id,
+        outcome.entry_regions,
+        outcome.representative_digests,
+        outcome.qemu_replays,
+        outcome.duration_seconds,
+    )
 
 
 def _select_batch(
@@ -255,7 +414,11 @@ def _run_batch(
     failures_dir: Path,
     stats: Optional[CampaignStats] = None,
     store: Optional[CorpusStore] = None,
+    *,
+    fuzz_seed: int = DEFAULT_SEED,
+    attribution_job_id: Optional[str] = None,
 ) -> BatchResult:
+    batch_started = time.monotonic()
     executable = [
         candidate
         for candidate in candidates
@@ -347,42 +510,74 @@ def _run_batch(
                     "QEMU passed without producing the expected Starry profraw"
                 )
             starry_elf = coverage_object(workspace)
-            active_covered_regions = (
-                store.load_coverage_regions(starry_elf)
-                if store is not None
-                else covered_regions if covered_regions is not None else set()
-            )
-            new_regions = _extract_new_regions(
-                profraws,
-                starry_elf,
-                active_covered_regions,
-            )
-
-            admitted_digests = tuple(sorted(candidate_map)) if new_regions else ()
-            if new_regions:
-                for digest in admitted_digests:
-                    candidate = candidate_map[digest]
-                    document = candidate.document
-                    if document is None:
-                        raise AssertionError("executable candidate lost its document")
-                    added_in_memory = corpus.add(document)
-                    added_on_disk = (
-                        store.save_entry(
-                            document,
-                            candidate.provenance,
-                            new_regions,
-                        )
-                        if store is not None
-                        else False
+            if store is None:
+                active_covered_regions = (
+                    covered_regions if covered_regions is not None else set()
+                )
+                new_regions = _extract_new_regions(
+                    profraws,
+                    starry_elf,
+                    active_covered_regions,
+                )
+                admitted_digests = tuple(sorted(candidate_map)) if new_regions else ()
+                starry_elf_digest = None
+                exact_result = None
+            else:
+                baseline_regions = store.load_coverage_regions(starry_elf)
+                replay_regions = _extract_regions(profraws, starry_elf)
+                new_regions = replay_regions - baseline_regions
+                starry_elf_digest = store.elf_digest(starry_elf)
+                if new_regions:
+                    job_id = attribution_job_id or (
+                        f"manual-{_campaign_id()}-batch-{batch_index + 1:04d}"
                     )
-                    if added_in_memory or added_on_disk:
-                        print(f"  New corpus entry: {digest[:12]}...", flush=True)
-
-            starry_elf_digest = (
-                store.save_coverage_regions(starry_elf, active_covered_regions)
-                if store is not None
-                else None
-            )
+                    attribution_store = AttributionStore(
+                        workspace,
+                        store.generator_version,
+                    )
+                    entries = tuple(
+                        AttributionInput(
+                            digest,
+                            candidate_map[digest].encoded,
+                            candidate_map[digest].provenance,
+                        )
+                        for digest in sorted(candidate_map)
+                    )
+                    initial_evidence = ReplayEvidence(
+                        ops_path=ops_path,
+                        trace_path=trace_path,
+                        guest_log=guest_log,
+                        profraw_paths=tuple(profraws),
+                        starry_elf_path=starry_elf,
+                        host_oracle_path=artifact_elf,
+                        covered_regions=frozenset(replay_regions),
+                        result_category="passed",
+                    )
+                    job = attribution_store.create_job(
+                        job_id,
+                        fuzz_seed=fuzz_seed,
+                        batch_index=batch_index,
+                        entries=entries,
+                        baseline_regions=baseline_regions,
+                        target_regions=new_regions,
+                        initial_evidence=initial_evidence,
+                        duration_seconds=time.monotonic() - batch_started,
+                    )
+                    exact_result = _resume_attribution_job(
+                        workspace,
+                        store,
+                        attribution_store,
+                        corpus,
+                        job,
+                    )
+                    if exact_result.failed:
+                        return exact_result
+                    admitted_digests = exact_result.admitted_digests
+                    starry_elf_digest = exact_result.starry_elf_sha256
+                else:
+                    store.save_coverage_regions(starry_elf, baseline_regions)
+                    admitted_digests = ()
+                    exact_result = None
         except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
             guest_log += f"\nCoverage analysis failed: {error}\n"
             failure_id = f"batch{batch_index}_coverage_{ops_digest[:12]}"
@@ -410,6 +605,8 @@ def _run_batch(
             flush=True,
         )
 
+    if exact_result is not None:
+        return exact_result
     return BatchResult(
         False,
         "passed",
@@ -479,8 +676,9 @@ def _is_host_parser_rejection(stderr: str) -> bool:
 def _run_guest_compare(
     workspace: Path,
     artifact_dir: Path,
+    pinned_starry_elf: Optional[Path] = None,
 ) -> Tuple[str, List[Path], bool]:
-    return run_guest_compare(workspace, artifact_dir)
+    return run_guest_compare(workspace, artifact_dir, pinned_starry_elf)
 
 
 def _extract_new_regions(
@@ -500,6 +698,17 @@ def _extract_new_regions(
         new_regions = regions - covered_regions
         covered_regions.update(new_regions)
         return new_regions
+
+
+def _extract_regions(profraws: List[Path], elf: Path) -> Set[str]:
+    if not profraws:
+        return set()
+    from coverage import merge_profraws, pipe_region_set
+
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        profdata = Path(temporary_directory) / "merged.profdata"
+        merge_profraws(profraws, profdata)
+        return pipe_region_set(profdata, elf)
 
 
 def _save_batch_failure(

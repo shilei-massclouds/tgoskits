@@ -5,19 +5,32 @@ from typing import List, Optional, Tuple
 
 
 ARTIFACT_DIR_ENV = "STARRY_PIPE_ORACLE_ARTIFACT_DIR"
+PINNED_STARRY_ELF_ENV = "AXBUILD_STARRY_KALLSYMS_SOURCE_ELF"
 REQUIRED_ARTIFACTS = ("pipe-linux-oracle", "pipe.ops", "linux.trace")
 STARRY_PROFRAW = Path("coverage/starryos-x86_64-unknown-none.profraw")
 STARRY_COVERAGE_OBJECT = Path("target/x86_64-unknown-none/release/starryos")
 
 
 def run_guest_compare(
-    workspace: Path, artifact_dir: Path
+    workspace: Path,
+    artifact_dir: Path,
+    pinned_starry_elf: Optional[Path] = None,
 ) -> Tuple[str, List[Path], bool]:
     workspace = workspace.resolve()
     artifact_dir = artifact_dir.resolve()
     _validate_artifact_dir(artifact_dir)
     env = os.environ.copy()
     env[ARTIFACT_DIR_ENV] = str(artifact_dir)
+    env.pop(PINNED_STARRY_ELF_ENV, None)
+    if pinned_starry_elf is not None:
+        pinned_starry_elf = pinned_starry_elf.resolve()
+        if not pinned_starry_elf.is_file():
+            raise FileNotFoundError(
+                f"pinned StarryOS ELF does not exist: {pinned_starry_elf}"
+            )
+        env[PINNED_STARRY_ELF_ENV] = str(pinned_starry_elf)
+    profraw_path = workspace / STARRY_PROFRAW
+    profraw_path.unlink(missing_ok=True)
 
     try:
         result = subprocess.run(
@@ -44,7 +57,6 @@ def run_guest_compare(
         guest_log = _timeout_output(error) + "\nQEMU command timed out\n"
         passed = False
 
-    profraw_path = workspace / STARRY_PROFRAW
     profraws = [profraw_path] if profraw_path.is_file() else []
     return guest_log, profraws, passed
 

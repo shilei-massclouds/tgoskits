@@ -63,7 +63,8 @@ replay 和 LLVM region 反馈，但场景演进仍有以下限制：
 - corpus 以原始 bytes 为单位，而 coverage 实际对应生成后的操作序列；不同输入
   可能产生重复或等价场景。
 - 成功 corpus 只存在于当前进程，campaign 重启后从内置 seed 重新开始。
-- batch 获得新 coverage 时，当前无法确定由 batch 中哪个输入贡献。
+- productive batch 已能逐 entry 重放并保存完整 coverage 映射；后续缺口是阶段
+  2.3 的 operation/scenario 最小化，而不是继续按整批粗粒度准入。
 - 随机参数没有优先覆盖 `0`、`PAGE_SIZE`、`PIPE_BUF`、capacity 等语义边界。
 - generator 尚不能产生固定 corpus 已有的所有操作，也很少主动产生非法资源、
   错误 fd 类型和异常 flags。
@@ -269,8 +270,8 @@ StarryOS 返回 `EINVAL` 的真实差异，保存为
 | 4. 接入 campaign provenance、run metadata 和持久 coverage 基线 | 已完成 | 2026-07-31 | `MutationCandidate` 已贯穿 generated/mutation、parent、donor 和 mutation 类型；`fuzz.py` 启动合并磁盘 corpus，原子记录 run metadata，并按 Starry ELF digest 恢复/保存 coverage baseline。40 个 Python 测试通过，固定 seed 的 batch digest golden 保持不变。 |
 | 5. 补全测试、文档和两次真实 campaign 验收 | 已完成 | 2026-07-31 | README 和设计文档已同步；40 个 Python 测试、`py_compile` 和 `git diff --check` 通过。第一次 seed 42 campaign 完成 host record、StarryOS QEMU compare 和 coverage 提取，持久化 8 个 canonical entry 及 382 个新增 pipe region；第二次重启报告 `built-in=5 disk=8 deduplicated-total=13`，完成 compare/coverage 并继续准入 2 个新 entry。两次构建得到不同 Starry ELF digest，各自保存独立的 382-region baseline；严格重载确认磁盘共有 10 个唯一 digest，且无半写目录。 |
 
-阶段 2.2 的精确 coverage 归因和阶段 2.3 的场景最小化仍未开始，不属于当前
-2.1 提交。
+阶段 2.1 保留的 schema v1 entry 继续严格可读；阶段 2.2 只在旧 entry 再次成为
+确定贡献者时将其原子惰性升级为 schema v2。阶段 2.3 的场景最小化仍未开始。
 
 按 canonical 操作序列而不是 raw input 保存成功 corpus。每个 entry 记录：
 
@@ -288,21 +289,62 @@ campaign 启动时加载兼容版本的 corpus。版本不兼容时必须显式�
 
 ### 6.2 精确 coverage 归因
 
-**子阶段状态：未开始。**
+**子阶段状态：已完成。**
+
+| 步骤 | 状态 | 完成日期 | 验证证据或继续位置 |
+|---|---|---|---|
+| 1. 固定重放、ELF 和兼容策略 | 已完成 | 2026-07-31 | 默认使用精确归因；productive batch 对每个唯一 entry 重放，并最终重放代表集，最多增加 `N + 1` 次 QEMU。每次重放重新生成 Linux trace；连续归因只接受同一 Starry ELF。 |
+| 2. 定义 attribution job/run schema v2 和 corpus schema v2 | 已完成 | 2026-07-31 | job 保存完整输入、ELF、初始/逐项/代表集 replay 证据、状态、映射和 ELF transition；run 保存 job ID、全部映射、代表集和额外 QEMU 数；corpus 严格读取 v1/v2，并仅在旧 entry 再次贡献时原子惰性升级。 |
+| 3. 实现中断恢复、失败保全和固定 ELF 转换流程 | 已完成 | 2026-07-31 | campaign 在新 batch 前恢复 job；证据先于 metadata 持久化并可在重启时对账。跨 campaign ELF 改变时先对完整原 batch 重放并重置归因；连续重放中 ELF 改变或归因不稳定时移动完整 job 到 failure，不更新 baseline。 |
+| 4. 实现确定性代表集和原子最终提交 | 已完成 | 2026-07-31 | 保存所有 `entry -> target regions` 映射；按最大新增覆盖、digest 破同分，再确定性删除冗余项；只有代表集最终重放覆盖全部 target 后才准入代表 entry 并提交 baseline。 |
+| 5. 完成回归、文档和真实 campaign 验收 | 已完成 | 2026-07-31 | 59 个 Python 回归、2 个 axbuild kallsyms 固定测试、`cargo xtask clippy --package axbuild`、`py_compile` 和 `git diff --check` 通过。真实 seed 4246、`batch-size=1` campaign 完成初始 batch、逐 entry 和代表集三次 QEMU；后两次正好满足 `N + 1 = 2`。三份 fresh trace/profraw evidence 均覆盖 346 个 target region，Starry ELF SHA-256 均为 `de330f7778459ac401f5891dab69f130812b2064a9845657db5687051f5b7c3d`；job/run/corpus v2 和 ELF-scoped baseline 完成原子提交。验收期间发现 `gen_ksym` 会单独改变 `.kallsyms` 排序；重放现固定 job ELF 的 kallsyms，并在替换前校验全部运行时及 coverage section、替换后校验完整 ELF 逐字节一致。阶段 2.3 不在本步骤范围。 |
 
 常规路径继续使用 batch 降低 QEMU 次数。只有 batch 获得新 region 时，才对子集
-进行重放：
+进行精确重放：
 
-1. 保存该 batch 的候选集合和 region 差异；
-2. 二分或逐项重放候选；
-3. 找到能覆盖目标 region 的最小输入集合；
-4. 只将实际贡献者加入持久 corpus。
+1. 原子保存该 batch 的唯一候选、ELF-scoped baseline、target region 和初始证据；
+2. 为每个 entry 重新执行 host record，并用 fresh profraw 启动一次 StarryOS QEMU；
+3. 保存所有 entry 对 target region 的交集，包括空集合；
+4. 确定性选择去冗余、inclusion-minimal 的代表覆盖；
+5. 为完整代表集重新生成 Linux trace 并执行一次最终 QEMU 证明；
+6. 只将新代表 entry 加入持久 corpus，同时更新已有的非代表贡献者。
 
-归因不能使用后续不同构建产生的 coverage 与原 batch 混合。用于比较的 profraw
-必须来自相同 instrumented StarryOS ELF。
+成功路径在初始 batch 之外最多增加 `N + 1` 次 QEMU。这里的“去冗余”只删除能由
+其他 entry 覆盖替代的完整 entry，不删除 scenario、operation 或参数，因此不属于
+阶段 2.3 的最小化。
+
+归因不能使用不同构建产生的 coverage 与原 batch 混合。一次连续归因中 Starry
+ELF digest 改变会立即失败；为消除 `gen_ksym` 对相同符号表产生的 `.kallsyms` 排序
+抖动，entry 和代表集 replay 固定使用 job 保存 ELF 的 kallsyms。axbuild 在替换前
+比较非零地址运行时 section 与 `__llvm_covfun`/`__llvm_covmap`，替换后要求完整 ELF
+逐字节等于保存版本，真实代码或 coverage metadata 改变仍会失败。若中断恢复时
+active ELF 已改变，则先对完整保存 batch 重新执行 host record/QEMU，在新 ELF
+baseline 上计算 target，记录 transition 并从逐 entry 归因重新开始。用于比较的
+每个 profraw 都由对应 replay 产生，QEMU 启动前先删除固定 profraw 路径，禁止复用
+陈旧文件。
+
+job metadata、每个 replay evidence 和最终 run record 都使用 schema v2 严格校验。
+campaign 启动时优先恢复未完成 job；若进程终止在 evidence 保存和 metadata 更新
+之间，下次启动从 evidence 对账而不重复已完成 QEMU。归因缺失 region、最终代表集
+不能复现、host/guest/coverage 失败或 ELF 不稳定时，完整 job 原子移动到
+`failures/attribution-<job-id>/`，campaign 停止，corpus 和 coverage baseline 均不
+接收未经最终证明的结果。
 
 归因结果记录每个 batch 的新增 region，以及每个真实 corpus entry 对这些 region
-的具体贡献，作为后续评估单位 QEMU 时间收益的基础。
+的具体贡献、代表集和额外 QEMU 次数，作为后续评估单位 QEMU 时间收益的基础。
+
+#### 6.2 验收标准
+
+- productive batch 的每个 target region 至少映射到一个具体 entry；
+- 相同映射始终选择相同代表集，最终代表集重放覆盖所有 target region；
+- 成功路径在初始 batch 外不超过 `N + 1` 次 QEMU，且每次使用新的 Linux trace
+  和当前 run 的 profraw；
+- 中断 job 在新 batch 和 RNG 消耗前恢复，已保存 evidence 不会重复执行；
+- v1/v2 corpus 严格兼容读取，旧 contributor 的 v2 升级和所有 job 状态转换均为
+  原子操作；
+- 归因不稳定时保留完整证据、停止 campaign，且 baseline 不变；
+- 连续 QEMU 的 Starry ELF digest 稳定；跨 campaign digest 改变严格执行完整 batch
+  rebase 流程。
 
 ### 6.3 场景最小化
 
@@ -324,7 +366,7 @@ region 集合，不能仅要求“仍有任意 coverage”。
 - campaign 重启后能够继续使用已保存 corpus；
 - raw 输入不同但 canonical 场景相同的 entry 只保存一次；
 - 每个新 region 能追溯到至少一个具体场景；
-- 最小化前后的 predicate 有自动化测试；
+- 阶段 2.3 完成后，最小化前后的 predicate 有自动化测试；
 - 中断保存不会留下被下次 campaign 当作有效 entry 的半写目录。
 
 ## 7. 阶段 3：扩展确定性 Pipe 场景
@@ -527,10 +569,11 @@ wakeup、EOF、`EPIPE` 的合法状态转换。
 3. `feat(pipe-oracle): add canonical corpus and structured mutations`
 4. `test(pipe-oracle): add boundary and invalid-resource scenarios`
 5. `feat(pipe-oracle): persist and deduplicate coverage corpus`
-6. `feat(pipe-oracle): attribute and minimize coverage inputs`
-7. `test(pipe-oracle): expand deterministic fd and boundary scenarios`
+6. `feat(pipe-oracle): attribute coverage inputs exactly`
+7. `feat(pipe-oracle): minimize attributed coverage inputs`
+8. `test(pipe-oracle): expand deterministic fd and boundary scenarios`
 
-阶段 4 的 syzkaller importer 应在这七项完成后开始。否则导入更多程序仍会受到
+阶段 4 的 syzkaller importer 应在这些项目完成后开始。否则导入更多程序仍会受到
 弱 mutation、粗粒度归因和不可持久化 corpus 的限制。
 
 ## 13. 验证分层

@@ -468,7 +468,7 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
             store = corpus.CorpusStore(Path(temporary_directory))
             run_path = store.save_run("run-0001", metadata)
             saved = json.loads((run_path / "metadata.json").read_text())
-        self.assertEqual(saved["schema_version"], 1)
+        self.assertEqual(saved["schema_version"], 2)
         self.assertEqual(saved["generator_version"], generator.GENERATOR_VERSION)
         self.assertEqual(saved["result"], "passed")
 
@@ -494,11 +494,6 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
                 trace.write_bytes(b"trace")
                 return fuzz.HostRecordResult(True, False, "recorded")
 
-            def first_extract(_profraws, _elf, covered_regions):
-                self.assertEqual(covered_regions, set())
-                covered_regions.add("pipe.rs:7:3")
-                return {"pipe.rs:7:3"}
-
             with (
                 mock.patch.object(fuzz, "_find_or_build_host_oracle", return_value=oracle),
                 mock.patch.object(fuzz, "_record_host", side_effect=record_host),
@@ -507,7 +502,15 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
                     "_run_guest_compare",
                     return_value=("guest", [profraw], True),
                 ),
-                mock.patch.object(fuzz, "_extract_new_regions", side_effect=first_extract),
+                mock.patch.object(
+                    fuzz,
+                    "_extract_regions",
+                    side_effect=(
+                        {"pipe.rs:7:3"},
+                        {"pipe.rs:7:3"},
+                        {"pipe.rs:7:3"},
+                    ),
+                ),
             ):
                 first = fuzz._run_batch(
                     workspace,
@@ -525,10 +528,6 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
             for entry in disk_corpus.ordered_entries():
                 restarted_corpus.add(entry.document)
 
-            def second_extract(_profraws, _elf, covered_regions):
-                self.assertEqual(covered_regions, {"pipe.rs:7:3"})
-                return set()
-
             with (
                 mock.patch.object(fuzz, "_find_or_build_host_oracle", return_value=oracle),
                 mock.patch.object(fuzz, "_record_host", side_effect=record_host),
@@ -537,7 +536,11 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
                     "_run_guest_compare",
                     return_value=("guest", [profraw], True),
                 ),
-                mock.patch.object(fuzz, "_extract_new_regions", side_effect=second_extract),
+                mock.patch.object(
+                    fuzz,
+                    "_extract_regions",
+                    return_value={"pipe.rs:7:3"},
+                ),
             ):
                 second = fuzz._run_batch(
                     workspace,
@@ -788,7 +791,7 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
             with mock.patch.object(fuzz, "run_guest_compare") as run:
                 run.return_value = ("guest", [], True)
                 fuzz._run_guest_compare(WORKSPACE_ROOT, artifact_directory)
-        run.assert_called_once_with(WORKSPACE_ROOT, artifact_directory)
+        run.assert_called_once_with(WORKSPACE_ROOT, artifact_directory, None)
 
     def test_fuzz_failure_reports_replayable_artifact_path(self):
         candidate = mutation.candidate_from_document(
@@ -860,6 +863,56 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
                 run_guest_compare(WORKSPACE_ROOT, artifact_directory)
         child_environment = run.call_args.kwargs["env"]
         self.assertEqual(child_environment[ARTIFACT_ENV], str(artifact_directory))
+
+    def test_attribution_qemu_pins_the_saved_starry_elf(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary = Path(temporary_directory)
+            workspace = temporary / "workspace"
+            artifact_directory = temporary / "artifacts"
+            pinned_starry_elf = temporary / "saved-starryos"
+            workspace.mkdir()
+            artifact_directory.mkdir()
+            pinned_starry_elf.write_bytes(b"saved Starry ELF")
+            for name in ("pipe-linux-oracle", "pipe.ops", "linux.trace"):
+                (artifact_directory / name).write_bytes(name.encode())
+            with mock.patch("runner.subprocess.run") as run:
+                run.return_value = subprocess.CompletedProcess([], 0, "ok", "")
+                from runner import run_guest_compare
+
+                run_guest_compare(
+                    workspace,
+                    artifact_directory.resolve(),
+                    pinned_starry_elf.resolve(),
+                )
+
+        child_environment = run.call_args.kwargs["env"]
+        self.assertEqual(
+            child_environment["AXBUILD_STARRY_KALLSYMS_SOURCE_ELF"],
+            str(pinned_starry_elf.resolve()),
+        )
+
+    def test_qemu_run_does_not_reuse_a_stale_profraw(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            artifact_directory = workspace / "artifacts"
+            artifact_directory.mkdir()
+            for name in ("pipe-linux-oracle", "pipe.ops", "linux.trace"):
+                (artifact_directory / name).write_bytes(name.encode())
+            stale_profraw = workspace / "coverage/starryos-x86_64-unknown-none.profraw"
+            stale_profraw.parent.mkdir(parents=True)
+            stale_profraw.write_bytes(b"stale profile")
+
+            with mock.patch("runner.subprocess.run") as run:
+                run.return_value = subprocess.CompletedProcess([], 1, "failed", "")
+                from runner import run_guest_compare
+
+                _guest_log, profraws, passed = run_guest_compare(
+                    workspace,
+                    artifact_directory.resolve(),
+                )
+
+        self.assertFalse(passed)
+        self.assertEqual(profraws, [])
 
     def test_cmake_external_artifacts_are_installed_byte_for_byte(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -125,7 +125,7 @@ class PersistentCorpusRegressionTests(unittest.TestCase):
 
     def test_schema_and_generator_incompatibility_fail_closed(self):
         cases = (
-            ("schema_version", 2, "unsupported corpus schema"),
+            ("schema_version", 3, "unsupported corpus schema"),
             ("generator_version", "future", "incompatible generator version"),
         )
         for field, value, reason in cases:
@@ -142,6 +142,93 @@ class PersistentCorpusRegressionTests(unittest.TestCase):
 
                 self.assertEqual(caught.exception.path, entry_dir)
                 self.assertIn(reason, str(caught.exception))
+
+    def test_v1_entry_lazily_upgrades_to_exact_v2_when_it_contributes_again(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store, entry_dir = self._saved_entry(Path(temporary_directory))
+            document = scenario.parse_document((entry_dir / corpus.OPS_NAME).read_bytes())
+
+            self.assertEqual(self._metadata(entry_dir)["schema_version"], 1)
+
+            self.assertTrue(
+                store.update_existing_attribution(
+                    document,
+                    {"pipe.rs:8:2", "pipe.rs:9:3"},
+                    "campaign-batch-0002",
+                )
+            )
+
+            upgraded = self._metadata(entry_dir)
+            self.assertEqual(upgraded["schema_version"], 2)
+            self.assertEqual(upgraded["coverage"]["attribution"], "exact")
+            self.assertEqual(
+                upgraded["coverage"]["attributed_regions"],
+                ["pipe.rs:8:2", "pipe.rs:9:3"],
+            )
+            self.assertEqual(
+                upgraded["coverage"]["attribution_jobs"],
+                ["campaign-batch-0002"],
+            )
+            self.assertEqual(upgraded["batch_status"]["replay"], "passed")
+            self.assertEqual(upgraded["stability"]["status"], "stable")
+            self.assertEqual(
+                upgraded["stability"]["successful_attribution_verifications"],
+                1,
+            )
+            self.assertEqual(len(store.load_corpus()), 1)
+
+    def test_new_exact_entry_is_written_as_strict_v2(self):
+        document = scenario.parse_document(
+            "version 1\nscenario exact\npipe2 0 1\nwrite 1 1 97\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = corpus.CorpusStore(Path(temporary_directory))
+
+            self.assertTrue(
+                store.admit_attributed_entry(
+                    document,
+                    corpus.CorpusProvenance.generated(),
+                    {"pipe.rs:10:4"},
+                    "campaign-batch-0001",
+                )
+            )
+
+            entry_dir = store.corpus_dir / scenario.canonical_digest(document)
+            metadata = self._metadata(entry_dir)
+            self.assertEqual(metadata["schema_version"], 2)
+            self.assertEqual(
+                set(metadata["coverage"]),
+                {
+                    "attribution",
+                    "first_batch_new_regions",
+                    "attributed_regions",
+                    "attribution_jobs",
+                },
+            )
+            self.assertEqual(len(store.load_corpus()), 1)
+
+    def test_interrupted_v1_to_v2_upgrade_preserves_original_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store, entry_dir = self._saved_entry(Path(temporary_directory))
+            document = scenario.parse_document((entry_dir / corpus.OPS_NAME).read_bytes())
+            original = (entry_dir / corpus.METADATA_NAME).read_bytes()
+
+            with mock.patch.object(
+                corpus.os,
+                "replace",
+                side_effect=OSError("simulated lazy-upgrade interruption"),
+            ):
+                with self.assertRaisesRegex(
+                    OSError, "simulated lazy-upgrade interruption"
+                ):
+                    store.update_existing_attribution(
+                        document,
+                        {"pipe.rs:8:2"},
+                        "campaign-batch-0002",
+                    )
+
+            self.assertEqual((entry_dir / corpus.METADATA_NAME).read_bytes(), original)
+            self.assertEqual(len(corpus.CorpusStore(Path(temporary_directory)).load_corpus()), 1)
 
     def test_digest_noncanonical_and_corrupt_entries_fail_closed(self):
         mutations = (

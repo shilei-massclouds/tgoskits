@@ -1,6 +1,5 @@
 """Persistent canonical corpus, run records, and ELF-scoped coverage state."""
 
-import fcntl
 import hashlib
 import json
 import os
@@ -15,6 +14,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 from common import CORPUS_DIR
+from campaign_lock import CampaignLock
+from corpus_errors import (
+    CampaignLockError,
+    CorpusStorageError,
+    CorpusValidationError,
+)
 from generator import GENERATOR_VERSION, legacy_document_from_input
 from scenario import (
     ScenarioDocument,
@@ -24,9 +29,10 @@ from scenario import (
 )
 
 
-CORPUS_SCHEMA_VERSION = 1
+LEGACY_CORPUS_SCHEMA_VERSION = 1
+CORPUS_SCHEMA_VERSION = 2
 COVERAGE_STATE_SCHEMA_VERSION = 1
-RUN_SCHEMA_VERSION = 1
+RUN_SCHEMA_VERSION = 2
 
 CORPUS_ENTRIES_NAME = "corpus"
 RUNS_NAME = "runs"
@@ -48,23 +54,6 @@ _DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _ENTRY_TEMP_PATTERN = re.compile(r"^\.[0-9a-f]{64}\.tmp-.+$")
 _METADATA_TEMP_PATTERN = re.compile(r"^\.metadata\.json\.tmp-.+$")
 _RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-
-
-class CorpusStorageError(RuntimeError):
-    """Base error for persistent campaign state."""
-
-
-class CorpusValidationError(CorpusStorageError):
-    """A persisted entry or coverage state failed closed validation."""
-
-    def __init__(self, path: Path, reason: str):
-        self.path = path
-        self.reason = reason
-        super().__init__(f"invalid persistent state at {path}: {reason}")
-
-
-class CampaignLockError(CorpusStorageError):
-    """Another campaign already owns the workspace persistence lock."""
 
 
 @dataclass(frozen=True)
@@ -189,7 +178,7 @@ class CorpusStore:
 
         environment = self.verification_environment()
         metadata = {
-            "schema_version": CORPUS_SCHEMA_VERSION,
+            "schema_version": LEGACY_CORPUS_SCHEMA_VERSION,
             "canonical_digest": digest,
             "pipe_ops_sha256": digest,
             "generator_version": self.generator_version,
@@ -221,6 +210,80 @@ class CorpusStore:
         except BaseException:
             shutil.rmtree(temporary, ignore_errors=True)
             raise
+        return True
+
+    def admit_attributed_entry(
+        self,
+        document: ScenarioDocument,
+        provenance: CorpusProvenance,
+        attributed_regions: Set[str],
+        attribution_job_id: str,
+    ) -> bool:
+        """Admit an exact-attribution representative or update it atomically."""
+        self.prepare()
+        _validate_provenance(provenance)
+        _validate_attribution(attributed_regions, attribution_job_id)
+        validate_entry_limits(document)
+        encoded = serialize_document(document).encode("utf-8")
+        digest = hashlib.sha256(encoded).hexdigest()
+        destination = self.corpus_dir / digest
+
+        if destination.exists():
+            self._update_exact_attribution(
+                destination,
+                attributed_regions,
+                attribution_job_id,
+            )
+            return False
+
+        environment = self.verification_environment()
+        metadata = {
+            "schema_version": CORPUS_SCHEMA_VERSION,
+            "canonical_digest": digest,
+            "pipe_ops_sha256": digest,
+            "generator_version": self.generator_version,
+            "origin": provenance.as_metadata(),
+            "coverage": {
+                "attribution": "exact",
+                "first_batch_new_regions": _sorted_regions(attributed_regions),
+                "attributed_regions": _sorted_regions(attributed_regions),
+                "attribution_jobs": [attribution_job_id],
+            },
+            "first_observed": environment,
+            "last_verified": environment,
+            "stability": {
+                "status": "stable",
+                "successful_batch_verifications": 1,
+                "successful_attribution_verifications": 1,
+            },
+            "batch_status": {
+                "compare": "passed",
+                "replay": "passed",
+            },
+        }
+        self._save_new_entry(destination, encoded, metadata)
+        return True
+
+    def update_existing_attribution(
+        self,
+        document: ScenarioDocument,
+        attributed_regions: Set[str],
+        attribution_job_id: str,
+    ) -> bool:
+        """Lazily upgrade an existing contributor without admitting a new entry."""
+        self.prepare()
+        _validate_attribution(attributed_regions, attribution_job_id)
+        validate_entry_limits(document)
+        encoded = serialize_document(document).encode("utf-8")
+        digest = hashlib.sha256(encoded).hexdigest()
+        destination = self.corpus_dir / digest
+        if not destination.exists():
+            return False
+        self._update_exact_attribution(
+            destination,
+            attributed_regions,
+            attribution_job_id,
+        )
         return True
 
     def elf_digest(self, elf_path: Path) -> str:
@@ -370,7 +433,11 @@ class CorpusStore:
             },
             entry_dir / METADATA_NAME,
         )
-        if metadata["schema_version"] != CORPUS_SCHEMA_VERSION:
+        schema_version = metadata["schema_version"]
+        if schema_version not in (
+            LEGACY_CORPUS_SCHEMA_VERSION,
+            CORPUS_SCHEMA_VERSION,
+        ):
             raise CorpusValidationError(entry_dir, "unsupported corpus schema")
         if metadata["generator_version"] != self.generator_version:
             raise CorpusValidationError(entry_dir, "incompatible generator version")
@@ -379,11 +446,11 @@ class CorpusStore:
         if metadata["pipe_ops_sha256"] != digest:
             raise CorpusValidationError(entry_dir, "pipe.ops metadata digest mismatch")
         _validate_origin_metadata(metadata["origin"], entry_dir)
-        _validate_coverage_metadata(metadata["coverage"], entry_dir)
+        _validate_coverage_metadata(metadata["coverage"], entry_dir, schema_version)
         _validate_environment(metadata["first_observed"], entry_dir)
         _validate_environment(metadata["last_verified"], entry_dir)
-        _validate_stability(metadata["stability"], entry_dir)
-        _validate_batch_status(metadata["batch_status"], entry_dir)
+        _validate_stability(metadata["stability"], entry_dir, schema_version)
+        _validate_batch_status(metadata["batch_status"], entry_dir, schema_version)
 
     def _update_last_verified(self, entry_dir: Path) -> None:
         entry = self._load_entry(entry_dir)
@@ -394,33 +461,64 @@ class CorpusStore:
         metadata["stability"]["successful_batch_verifications"] += 1
         _atomic_write_json(metadata_path, metadata)
 
+    def _update_exact_attribution(
+        self,
+        entry_dir: Path,
+        attributed_regions: Set[str],
+        attribution_job_id: str,
+    ) -> None:
+        entry = self._load_entry(entry_dir)
+        metadata_path = entry_dir / METADATA_NAME
+        metadata = _read_json(metadata_path)
+        self._validate_entry_metadata(metadata, entry_dir, entry.digest)
+        if metadata["schema_version"] == LEGACY_CORPUS_SCHEMA_VERSION:
+            metadata["schema_version"] = CORPUS_SCHEMA_VERSION
+            metadata["coverage"] = {
+                **metadata["coverage"],
+                "attribution": "exact",
+                "attributed_regions": _sorted_regions(attributed_regions),
+                "attribution_jobs": [attribution_job_id],
+            }
+            metadata["stability"] = {
+                **metadata["stability"],
+                "status": "stable",
+                "successful_attribution_verifications": 1,
+            }
+        else:
+            coverage = metadata["coverage"]
+            if attribution_job_id in coverage["attribution_jobs"]:
+                return
+            coverage["attributed_regions"] = _sorted_regions(
+                set(coverage["attributed_regions"]) | attributed_regions
+            )
+            coverage["attribution_jobs"] = sorted(
+                set(coverage["attribution_jobs"]) | {attribution_job_id}
+            )
+            metadata["stability"]["successful_attribution_verifications"] += 1
+        metadata["last_verified"] = self.verification_environment()
+        metadata["stability"]["successful_batch_verifications"] += 1
+        metadata["batch_status"]["replay"] = "passed"
+        _atomic_write_json(metadata_path, metadata)
 
-class CampaignLock:
-    def __init__(self, path: Path):
-        self.path = path
-        self._file = None
-
-    def __enter__(self) -> "CampaignLock":
-        self._file = self.path.open("a+", encoding="utf-8")
+    def _save_new_entry(
+        self,
+        destination: Path,
+        encoded: bytes,
+        metadata: Dict[str, Any],
+    ) -> None:
+        digest = destination.name
+        temporary = Path(
+            tempfile.mkdtemp(prefix=f".{digest}.tmp-", dir=self.corpus_dir)
+        )
         try:
-            fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            self._file.close()
-            self._file = None
-            raise CampaignLockError(
-                f"another pipe-oracle campaign holds {self.path}"
-            ) from error
-        self._file.seek(0)
-        self._file.truncate()
-        self._file.write(f"pid={os.getpid()}\n")
-        self._file.flush()
-        return self
-
-    def __exit__(self, _error_type, _error, _traceback) -> None:
-        if self._file is not None:
-            fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
-            self._file.close()
-            self._file = None
+            _write_bytes(temporary / OPS_NAME, encoded)
+            _write_json(temporary / METADATA_NAME, metadata)
+            _sync_directory(temporary)
+            os.replace(temporary, destination)
+            _sync_directory(self.corpus_dir)
+        except BaseException:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise
 
 
 def _validate_provenance(provenance: CorpusProvenance) -> None:
@@ -463,10 +561,49 @@ def _validate_origin_metadata(metadata: Any, path: Path) -> None:
         raise CorpusValidationError(path, str(error)) from error
 
 
-def _validate_coverage_metadata(metadata: Any, path: Path) -> None:
-    _require_exact_keys(metadata, {"attribution", "first_batch_new_regions"}, path)
-    if metadata["attribution"] != "batch-pending":
-        raise CorpusValidationError(path, "unsupported coverage attribution")
+def _validate_coverage_metadata(
+    metadata: Any,
+    path: Path,
+    schema_version: int,
+) -> None:
+    if schema_version == LEGACY_CORPUS_SCHEMA_VERSION:
+        _require_exact_keys(
+            metadata,
+            {"attribution", "first_batch_new_regions"},
+            path,
+        )
+        if metadata["attribution"] != "batch-pending":
+            raise CorpusValidationError(path, "unsupported coverage attribution")
+    else:
+        _require_exact_keys(
+            metadata,
+            {
+                "attribution",
+                "first_batch_new_regions",
+                "attributed_regions",
+                "attribution_jobs",
+            },
+            path,
+        )
+        if metadata["attribution"] != "exact":
+            raise CorpusValidationError(path, "unsupported coverage attribution")
+        if not _is_sorted_unique_strings(metadata["attributed_regions"]):
+            raise CorpusValidationError(
+                path,
+                "attributed regions must be sorted unique strings",
+            )
+        if not metadata["attributed_regions"]:
+            raise CorpusValidationError(path, "exact attribution must not be empty")
+        jobs = metadata["attribution_jobs"]
+        if (
+            not _is_sorted_unique_strings(jobs)
+            or not jobs
+            or not all(_RUN_ID_PATTERN.fullmatch(job) for job in jobs)
+        ):
+            raise CorpusValidationError(
+                path,
+                "attribution jobs must be sorted unique run ids",
+            )
     if not _is_sorted_unique_strings(metadata["first_batch_new_regions"]):
         raise CorpusValidationError(path, "new regions must be sorted unique strings")
 
@@ -493,19 +630,51 @@ def _validate_environment(metadata: Any, path: Path) -> None:
         raise CorpusValidationError(path, "host page size must be positive")
 
 
-def _validate_stability(metadata: Any, path: Path) -> None:
-    _require_exact_keys(metadata, {"status", "successful_batch_verifications"}, path)
-    if metadata["status"] != "unverified":
+def _validate_stability(metadata: Any, path: Path, schema_version: int) -> None:
+    keys = {"status", "successful_batch_verifications"}
+    if schema_version == CORPUS_SCHEMA_VERSION:
+        keys.add("successful_attribution_verifications")
+    _require_exact_keys(metadata, keys, path)
+    expected_status = (
+        "unverified"
+        if schema_version == LEGACY_CORPUS_SCHEMA_VERSION
+        else "stable"
+    )
+    if metadata["status"] != expected_status:
         raise CorpusValidationError(path, "unsupported stability status")
     count = metadata["successful_batch_verifications"]
-    if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+    if not _is_positive_integer(count):
         raise CorpusValidationError(path, "verification count must be positive")
+    if schema_version == CORPUS_SCHEMA_VERSION:
+        attribution_count = metadata["successful_attribution_verifications"]
+        if not _is_positive_integer(attribution_count):
+            raise CorpusValidationError(
+                path,
+                "attribution verification count must be positive",
+            )
 
 
-def _validate_batch_status(metadata: Any, path: Path) -> None:
+def _validate_batch_status(metadata: Any, path: Path, schema_version: int) -> None:
     _require_exact_keys(metadata, {"compare", "replay"}, path)
-    if metadata["compare"] != "passed" or metadata["replay"] != "not-run":
+    expected_replay = (
+        "not-run"
+        if schema_version == LEGACY_CORPUS_SCHEMA_VERSION
+        else "passed"
+    )
+    if metadata["compare"] != "passed" or metadata["replay"] != expected_replay:
         raise CorpusValidationError(path, "unsupported batch compare/replay status")
+
+
+def _validate_attribution(regions: Set[str], job_id: str) -> None:
+    if not regions:
+        raise ValueError("exact attribution requires at least one region")
+    _sorted_regions(regions)
+    if not isinstance(job_id, str) or not _RUN_ID_PATTERN.fullmatch(job_id):
+        raise ValueError(f"invalid attribution job id: {job_id}")
+
+
+def _is_positive_integer(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
 
 
 def _require_exact_keys(metadata: Any, keys: Set[str], path: Path) -> None:

@@ -2,9 +2,10 @@
 
 ## Status
 
-Implemented on 2026-07-30, extended with structured scenario generation and a
-persistent canonical coverage corpus on 2026-07-31. This document records the
-design and implementation of the script-driven pipe differential oracle.
+Implemented on 2026-07-30, extended with structured scenario generation,
+persistent canonical coverage corpus, and resumable exact coverage attribution
+on 2026-07-31. This document records the design and implementation of the
+script-driven pipe differential oracle.
 
 Base: `dev-cov2` at `fb399d055`.
 
@@ -85,6 +86,11 @@ The implementation is complete when all of the following hold:
   `--batches`, `--batch-size`;
 - compatible canonical corpus entries and ELF-scoped coverage baselines survive
   campaign restart without admitting duplicate scenarios;
+- every region from a productive batch is attributed to at least one concrete
+  entry, and only a deterministically selected representative cover is admitted;
+- an interrupted attribution job resumes before new batches, while unstable
+  attribution preserves its complete evidence and leaves the coverage baseline
+  unchanged;
 - `scripts/pipe-oracle/replay.py` replays saved failure artifacts;
 - failure artifacts include `input.bin`, `pipe.ops`, `linux.trace`,
   `pipe-linux-oracle` ELF, `guest.log`, profraw files, and `metadata.json`;
@@ -102,6 +108,7 @@ The first implementation deliberately excludes:
   protocol;
 - a Linux VM pinned to a specific kernel release;
 - coverage-guided mutation in the regular PR path or CI;
+- coverage or mismatch scenario minimization (stage 2.3);
 - using output from `strace` as expected data;
 - dynamic `axbuild` subcommands for fuzzing (all host orchestration is in
   Python scripts outside `cargo xtask`).
@@ -208,9 +215,16 @@ does not exist and the production kernel carries no coverage-related code.
 
 - `common.py`: SHA-256 hashing, atomic directory save, `build_metadata()` that
   captures git commit, dirty state, host uname, page size, and file digests.
-- `corpus.py`: Canonical digest map, schema-v1 persistent entry validation,
-  atomic entry/run/coverage-state saves, ELF-scoped region baselines, and the
-  workspace campaign lock.
+- `corpus.py`: Canonical digest map, strict schema-v1/v2 persistent entry
+  validation, atomic entry/run/coverage-state saves, ELF-scoped region
+  baselines, and exact-attribution admission.
+- `campaign_lock.py` and `corpus_errors.py`: Process-lock ownership and shared
+  persistent-state error types.
+- `attribution.py` and `attribution_schema.py`: Atomic schema-v2 attribution
+  jobs, strict evidence validation, deterministic representative selection,
+  and resumable state transitions.
+- `attribution_campaign.py`: Fresh host-trace and QEMU replay orchestration,
+  cross-campaign ELF restart, final representative proof, and baseline commit.
 - `scenario.py`: Immutable scenario/operation IR plus the version-1 `pipe.ops`
   parser, canonical serializer, digest, typed codec errors, and campaign limits.
 - `generator.py`: Version-2 deterministic operation generation using a
@@ -225,8 +239,10 @@ does not exist and the production kernel carries no coverage-related code.
 - `artifact.py`: Failure artifact validation (ELF header, digest match) and
   atomic save.
 - `runner.py`: validates one absolute artifact directory, passes it to the QEMU
-  build through `STARRY_PIPE_ORACLE_ARTIFACT_DIR`, and returns only this run's
-  `starryos-x86_64-unknown-none.profraw`.
+  build through `STARRY_PIPE_ORACLE_ARTIFACT_DIR`, deletes the fixed profraw
+  before every launch, and returns only this run's
+  `starryos-x86_64-unknown-none.profraw`. Attribution replays also pass their
+  content-addressed Starry ELF to axbuild's internal kallsyms pinning contract.
 - `coverage.py`: `llvm-profdata merge -sparse` and `llvm-cov export` against
   `target/x86_64-unknown-none/release/starryos`; covered pipe regions use stable
   `source:line:column` string IDs.
@@ -260,6 +276,7 @@ coverage/pipe-oracle-fuzz/
   corpus/<canonical-sha256>/{pipe.ops,metadata.json}
   runs/<run-id>/metadata.json
   coverage-state/<starry-elf-sha256>.json
+  attribution-jobs/<job-id>/...
   failures/...
   .campaign.lock
 ```
@@ -271,21 +288,22 @@ prints the built-in, disk, and deduplicated counts. A nonblocking process-level
 `flock` is held for the complete campaign so two fuzzers cannot concurrently
 update the same corpus, coverage baseline, or fixed profraw path.
 
-Corpus metadata schema v1 records the canonical and `pipe.ops` digests,
-generator version, generated/mutation origin, parent and selected donor digest,
-mutation type, first batch's new regions, first-observed and last-verified Git
-and host environment, stability state, and batch compare/replay state. New
-regions are explicitly attributed as `batch-pending`: stage 2.1 admits all
-unique executable entries from a productive batch and makes no claim that an
-individual entry covered a region by itself. Exact attribution and minimization
-remain separate later stages.
+Corpus metadata schema v1 remains a strict readable legacy format. It records
+the canonical and `pipe.ops` digests, generator version, provenance,
+first-observed and last-verified environments, and its original
+`batch-pending` coverage claim. Schema v2 replaces that claim with `exact`, the
+sorted union of `attributed_regions`, the attribution job IDs that proved it,
+and a successful-attribution verification count. New representatives are
+written directly as v2. A v1 entry is upgraded atomically and lazily only when
+it contributes again in a completed exact-attribution job; merely loading or
+selecting it does not rewrite metadata.
 
 Loading fails closed on an unknown schema or generator version, a directory or
 file digest mismatch, noncanonical UTF-8 encoding, codec/resource-limit error,
-invalid metadata, symlink, or unexpected finalized file. There is no implicit
-migration. Mutation provenance adds no RNG calls and does not participate in
-the canonical digest, preserving generator and mutation output for a fixed
-seed.
+invalid metadata, symlink, or unexpected finalized file. The only implicit
+transition is the contributor-triggered v1-to-v2 atomic upgrade described
+above. Mutation provenance adds no RNG calls and does not participate in the
+canonical digest, preserving generator and mutation output for a fixed seed.
 
 A new entry is written to a hidden uniquely named temporary directory, fsynced,
 and atomically renamed to its digest directory. Revalidation updates
@@ -295,16 +313,81 @@ Only finalized 64-hex digest directories are loaded, so a process killed during
 its initial write cannot expose a half entry.
 
 Coverage state schema v1 is keyed by the SHA-256 of the instrumented StarryOS
-ELF. A batch loads only that ELF's region set, admits productive inputs, and
-then atomically saves the enlarged baseline. Saving entries before the baseline
-ensures an interrupted baseline update can retry admission, rather than losing
-the productive batch permanently. A different ELF starts with an independent
-empty baseline.
+ELF. A batch loads only that ELF's region set. A nonproductive batch saves the
+same baseline; a productive batch must finish exact attribution and the final
+representative replay before the enlarged baseline is atomically committed. A
+different ELF therefore has an independent baseline.
 
-Each atomic run record stores the seed, exact command, measured batch duration,
+Run metadata schema v2 stores the seed, exact command, measured duration,
 candidate/executable/malformed/unique counts, sources and ancestry, new regions,
-admitted digests, Starry ELF digest, and result. Run records are observational;
-corpus entry directories remain the authoritative identity used for selection.
+admitted digests, Starry ELF digest, result category, attribution job ID, every
+entry-to-region mapping, the representative digests, and the number of extra
+QEMU replays. Run records are observational; corpus entry directories remain
+the authoritative identity used for selection.
+
+### Exact attribution state machine
+
+Exact attribution is enabled by default for every productive batch. After the
+initial batch QEMU reports regions outside the active ELF baseline, the
+orchestrator atomically creates a schema-v2 job containing the canonical input
+set and the initial batch evidence. It then:
+
+1. re-records a fresh Linux trace and starts a fresh QEMU for each of the `N`
+   unique entries;
+2. intersects each entry's covered regions with the batch target and persists
+   the complete `entry -> region` mapping, including empty mappings;
+3. greedily chooses the entry with the largest uncovered-region gain, breaking
+   ties by canonical digest, then removes redundant choices in deterministic
+   order to obtain an inclusion-minimal representative cover;
+4. re-records a fresh Linux trace and starts one final QEMU for the complete
+   representative set; and
+5. only after that replay covers every target region, admits new
+   representatives, updates existing contributing entries, and commits the
+   ELF-scoped baseline.
+
+Thus a successful productive batch adds at most `N + 1` QEMU invocations beyond
+its initial batch execution. This is exact per-entry attribution and
+deterministic set deduplication, not stage-2.3 operation or scenario
+minimization.
+
+The job states are `entry-replays`, `representative-replay`, and `completed`.
+Metadata, replay directories, and initial job directories use fsync plus atomic
+replace/rename. Campaign startup strictly loads resumable jobs before consuming
+RNG state or generating a new batch. Saved replay evidence is reconciled with
+metadata, so termination between evidence persistence and a state update does
+not repeat a completed QEMU. A completed job also remains resumable until its
+run record is atomically saved and `run_recorded` is set.
+
+Each job owns its canonical inputs, host oracle, content-addressed Starry ELF
+copies, and per-replay `pipe.ops`, fresh `linux.trace`, `guest.log`, profraw
+files, and coverage metadata. Schema validation checks the exact directory
+shape, canonical input digests, ELF and evidence digests, sorted region sets,
+state invariants, and rejects symlinks or unknown fields.
+
+The Starry ELF digest must remain constant throughout one continuous
+attribution attempt. Repeated validation exposed that `gen_ksym` can emit a
+different `.kallsyms` byte order for an otherwise identical build. The initial
+batch and a cross-campaign full-batch rebase therefore build normally, while
+each entry and representative replay sets the internal
+`AXBUILD_STARRY_KALLSYMS_SOURCE_ELF` contract to the job's content-addressed
+ELF. Before copying the saved `.kallsyms`, axbuild requires every nonzero-address
+runtime section plus `__llvm_covfun` and `__llvm_covmap` to match the saved ELF.
+After replacement it requires the complete generated ELF to be byte-identical
+to that saved file. This removes kallsyms-only nondeterminism without accepting
+a changed executable or changed coverage metadata.
+
+A digest change during an entry or representative replay remains instability.
+If campaign restart observes that the active ELF differs from the saved job,
+the fixed recovery flow first re-records and replays the full saved batch
+against the active build, recomputes that ELF's baseline and target, records the
+digest transition, clears the old mapping, and restarts attribution as a new
+attempt. It never mixes coverage from two ELFs.
+
+Any host replay failure, guest mismatch, missing profraw, coverage extraction
+failure, missing target region, representative-proof failure, or continuous-run
+ELF change stops the campaign. The job is marked `unstable` and atomically moved
+to `failures/attribution-<job-id>/` with all evidence retained. Corpus admission
+and coverage-baseline update do not occur on that path.
 
 ### Artifact injection contract
 
@@ -342,6 +425,9 @@ fuzz seed, batch index, SHA-256 digests, exact command, coverage region
 summary, and `guest_result_category`.
 
 Saves use a temp-directory + atomic rename to prevent half-written artifacts.
+Attribution instability uses the separate schema-v2 job layout described above
+under `failures/attribution-<job-id>/`; moving the complete job preserves all
+initial, per-entry, representative, and ELF-transition evidence.
 
 ### Data flow and ownership
 
@@ -380,11 +466,12 @@ generated trace (owned by one test run)
 The checked-in regression corpus is repository-owned. The fuzz campaign owns a
 canonical-digest-sorted selection map merged from built-in and persistent
 entries; the ignored `CorpusStore` owns cross-process corpus identity, run
-records, and ELF-scoped coverage baselines. Trace, profraw, guest log, and
-prepared rootfs are run-owned build artifacts. Failure artifacts are saved
-under `coverage/pipe-oracle-fuzz/failures/` for replay. Version-1 failure replay
-keeps using the saved `pipe.ops`; it does not reinterpret an old raw
-`input.bin`.
+records, and ELF-scoped coverage baselines. `AttributionStore` owns resumable
+jobs and their immutable replay evidence. Trace, profraw, guest log, and
+prepared rootfs are run-owned build artifacts until copied into a job or
+failure artifact. Failure artifacts are saved under
+`coverage/pipe-oracle-fuzz/failures/`. Version-1 failure replay keeps using the
+saved `pipe.ops`; it does not reinterpret an old raw `input.bin`.
 
 ## Linux version and environment policy
 
@@ -427,7 +514,7 @@ remove the `pipe-linux-oracle` case directory and the `default_run` field from
 axbuild. Production pipe fixes and existing axtest coverage remain valid
 independently.
 
-Future work may add precise coverage attribution and minimization,
-blocking/concurrent scenarios, cross-architecture differential coverage, or
-automatic CI regression detection. Those changes require their own design
-evidence and must continue to keep the default test path clean.
+Future work may add stage-2.3 scenario minimization, blocking/concurrent
+scenarios, cross-architecture differential coverage, or automatic CI
+regression detection. Those changes require their own design evidence and must
+continue to keep the default test path clean.

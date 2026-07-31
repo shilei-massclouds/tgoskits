@@ -20,6 +20,8 @@ use crate::{
     support::process::ProcessExt,
 };
 
+const STARRY_KALLSYMS_SOURCE_ELF_ENV: &str = "AXBUILD_STARRY_KALLSYMS_SOURCE_ELF";
+
 pub(crate) fn default_starry_build_info() -> StarryBuildInfo {
     // The package and board configuration own feature selection; a generated
     // default must remain an empty capability set.
@@ -191,31 +193,43 @@ pub(crate) fn postprocess_starry_artifact(
 fn generate_kallsyms(kernel_elf: &Path) -> anyhow::Result<()> {
     let stage = StageLog::start(format!("starry kallsyms elf={}", kernel_elf.display()));
     ensure_kallsyms_tools()?;
-    let symbols = rust_nm_symbols(kernel_elf)?;
-    println!("[axbuild] starry kallsyms symbols={}", symbols.len());
-    let mut child = Command::new("gen_ksym")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .context("failed to spawn gen_ksym")?;
-    {
-        let mut stdin = child
-            .stdin
-            .take()
-            .context("failed to open gen_ksym stdin")?;
-        for symbol in symbols {
-            writeln!(stdin, "{symbol}").context("failed to write symbols to gen_ksym")?;
+    let source_elf = env::var_os(STARRY_KALLSYMS_SOURCE_ELF_ENV).map(PathBuf::from);
+    let mut kallsyms = if let Some(source_elf) = source_elf.as_deref() {
+        if !source_elf.is_absolute() {
+            bail!("{STARRY_KALLSYMS_SOURCE_ELF_ENV} must name an absolute ELF path");
         }
-    }
-    let output = child
-        .wait_with_output()
-        .context("failed to wait for gen_ksym")?;
-    if !output.status.success() {
-        bail!("gen_ksym exited with status {}", output.status);
-    }
+        println!(
+            "[axbuild] starry kallsyms pinned source={}",
+            source_elf.display()
+        );
+        pinned_kallsyms_bytes(kernel_elf, source_elf)?
+    } else {
+        let symbols = rust_nm_symbols(kernel_elf)?;
+        println!("[axbuild] starry kallsyms symbols={}", symbols.len());
+        let mut child = Command::new("gen_ksym")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .context("failed to spawn gen_ksym")?;
+        {
+            let mut stdin = child
+                .stdin
+                .take()
+                .context("failed to open gen_ksym stdin")?;
+            for symbol in symbols {
+                writeln!(stdin, "{symbol}").context("failed to write symbols to gen_ksym")?;
+            }
+        }
+        let output = child
+            .wait_with_output()
+            .context("failed to wait for gen_ksym")?;
+        if !output.status.success() {
+            bail!("gen_ksym exited with status {}", output.status);
+        }
+        output.stdout
+    };
 
     let section_size = kallsyms_section_size(kernel_elf)?;
-    let mut kallsyms = output.stdout;
     if kallsyms.len() > section_size {
         bail!(
             "generated kallsyms ({} bytes) exceed .kallsyms section ({section_size} bytes); \
@@ -232,7 +246,106 @@ fn generate_kallsyms(kernel_elf: &Path) -> anyhow::Result<()> {
         fs::remove_file(&temp).with_context(|| format!("failed to remove {}", temp.display()));
     result?;
     cleanup?;
+    if let Some(source_elf) = source_elf.as_deref() {
+        ensure_pinned_elf_restored(kernel_elf, source_elf)?;
+    }
     stage.done();
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ComparableElfSection {
+    name: String,
+    address: u64,
+    size: u64,
+    data: Vec<u8>,
+}
+
+fn pinned_kallsyms_bytes(kernel_elf: &Path, source_elf: &Path) -> anyhow::Result<Vec<u8>> {
+    let source_metadata = fs::symlink_metadata(source_elf)
+        .with_context(|| format!("failed to inspect pinned ELF {}", source_elf.display()))?;
+    if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
+        bail!(
+            "pinned Starry ELF is not a regular file: {}",
+            source_elf.display()
+        );
+    }
+
+    let active = fs::read(kernel_elf)
+        .with_context(|| format!("failed to read active ELF {}", kernel_elf.display()))?;
+    let pinned = fs::read(source_elf)
+        .with_context(|| format!("failed to read pinned ELF {}", source_elf.display()))?;
+    ensure_section_snapshots_match(
+        &comparable_elf_sections(&active, kernel_elf)?,
+        &comparable_elf_sections(&pinned, source_elf)?,
+    )?;
+    kallsyms_section_bytes(&pinned, source_elf)
+}
+
+fn comparable_elf_sections(
+    elf_bytes: &[u8],
+    elf_path: &Path,
+) -> anyhow::Result<Vec<ComparableElfSection>> {
+    let file = object::File::parse(elf_bytes)
+        .with_context(|| format!("failed to parse {}", elf_path.display()))?;
+    let mut sections = Vec::new();
+    for section in file.sections() {
+        let name = section
+            .name()
+            .with_context(|| format!("invalid section name in {}", elf_path.display()))?;
+        let coverage_metadata = matches!(name, "__llvm_covfun" | "__llvm_covmap");
+        // objcopy may rewrite non-runtime ELF bookkeeping. Pinning is safe only
+        // when every loaded section and LLVM's zero-address coverage metadata
+        // still match; exact whole-file equality is checked after replacement.
+        if name == ".kallsyms" || section.address() == 0 && !coverage_metadata {
+            continue;
+        }
+        sections.push(ComparableElfSection {
+            name: name.to_string(),
+            address: section.address(),
+            size: section.size(),
+            data: section
+                .data()
+                .with_context(|| {
+                    format!("failed to read section {name} in {}", elf_path.display())
+                })?
+                .to_vec(),
+        });
+    }
+    sections.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(sections)
+}
+
+fn ensure_section_snapshots_match(
+    active: &[ComparableElfSection],
+    pinned: &[ComparableElfSection],
+) -> anyhow::Result<()> {
+    if active != pinned {
+        bail!("active Starry ELF executable or coverage sections differ from the pinned ELF");
+    }
+    Ok(())
+}
+
+fn kallsyms_section_bytes(elf_bytes: &[u8], elf_path: &Path) -> anyhow::Result<Vec<u8>> {
+    let file = object::File::parse(elf_bytes)
+        .with_context(|| format!("failed to parse {}", elf_path.display()))?;
+    let section = file
+        .section_by_name(".kallsyms")
+        .ok_or_else(|| anyhow!("failed to find .kallsyms section in {}", elf_path.display()))?;
+    section
+        .data()
+        .with_context(|| format!("failed to read .kallsyms in {}", elf_path.display()))
+        .map(<[u8]>::to_vec)
+}
+
+fn ensure_pinned_elf_restored(kernel_elf: &Path, source_elf: &Path) -> anyhow::Result<()> {
+    let active = fs::read(kernel_elf)
+        .with_context(|| format!("failed to verify active ELF {}", kernel_elf.display()))?;
+    let pinned = fs::read(source_elf)
+        .with_context(|| format!("failed to verify pinned ELF {}", source_elf.display()))?;
+    if active != pinned {
+        bail!("failed to restore the byte-identical pinned Starry ELF");
+    }
     Ok(())
 }
 
