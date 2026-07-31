@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from common import CORPUS_DIR
 from corpus import CorpusProvenance
+from coverage import TARGET_SET_ID
 from corpus_errors import CorpusStorageError, CorpusValidationError
 from fingerprint import MismatchFingerprint
 from minimization import (
@@ -25,6 +26,7 @@ from minimization_schema import (
     HOST_ORACLE_NAME,
     INPUTS_NAME,
     JOB_ID_PATTERN,
+    job_target_set_id,
     METADATA_NAME,
     MINIMIZATION_JOBS_NAME,
     MINIMIZATION_SCHEMA_VERSION,
@@ -104,6 +106,7 @@ class MinimizationStore:
         metadata = {
             "schema_version": MINIMIZATION_SCHEMA_VERSION,
             "generator_version": self.generator_version,
+            "target_set_id": TARGET_SET_ID,
             "job_id": job_id,
             "kind": kind,
             "source": dict(source),
@@ -436,7 +439,7 @@ class MinimizationStore:
                     {"name": name, "sha256": sha256_file(copied), "size": copied.stat().st_size}
                 )
             result = {
-                "schema_version": MINIMIZATION_SCHEMA_VERSION,
+                "schema_version": job.metadata["schema_version"],
                 "starry_elf_sha256": job.metadata["starry_elf_sha256"],
                 "result_category": evidence.result_category,
                 "covered_regions": sorted(set(evidence.covered_regions)),
@@ -450,6 +453,8 @@ class MinimizationStore:
                 "guest_log_sha256": sha256_file(temporary / "guest.log"),
                 "profraws": profraw_metadata,
             }
+            if job.metadata["schema_version"] == MINIMIZATION_SCHEMA_VERSION:
+                result["target_set_id"] = job_target_set_id(job.metadata)
             _write_json(temporary / "result.json", result)
             _sync_directory(profraws_dir)
             _sync_directory(temporary)

@@ -27,7 +27,7 @@ from minimization import (
     coverage_decision,
     mismatch_decision,
 )
-from minimization_schema import HOST_ORACLE_NAME, STARRY_ELF_NAME
+from minimization_schema import HOST_ORACLE_NAME, STARRY_ELF_NAME, job_target_set_id
 from minimization_store import (
     MinimizationEvidence,
     MinimizationJob,
@@ -41,7 +41,7 @@ from scenario import combine_documents, serialize_document
 class MinimizationRuntime:
     record_host: Callable[[Path, Path, Path], Any]
     run_guest_compare: Callable[[Path, Path, Optional[Path]], Any]
-    extract_regions: Callable[[List[Path], Path], Set[str]]
+    extract_regions: Callable[[List[Path], Path, str], Set[str]]
     coverage_object: Callable[[Path], Path]
 
 
@@ -441,6 +441,7 @@ def _run_replay(
                 covered_regions = runtime.extract_regions(
                     profraws,
                     job.path / STARRY_ELF_NAME,
+                    job_target_set_id(job.metadata),
                 )
             except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
                 category = GuestResultCategory.INFRASTRUCTURE_FAILURE

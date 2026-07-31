@@ -171,6 +171,43 @@ class StructuredReducerRegressionTests(unittest.TestCase):
         self.assertTrue(any("set-size 15 4096" in text for text in texts))
         self.assertTrue(any("pipe2 0 1" in text for text in texts))
 
+    def test_v2_reducer_simplifies_flags_redirects_dup_targets_and_never_repairs(self):
+        document = scenario.parse_document(
+            "version 2\n"
+            "scenario flags\n"
+            "pipe2 8 9 526336\n"
+            "dup2 9 12\n"
+            "set-fd-flags 12 3\n"
+            "set-status-flags 12 526336\n"
+            "write 12 8 65\n"
+            "dup3 12 14 524288\n"
+            "get-fd-flags 14\n"
+        )
+        reduction_input = self.reducer.ReductionInput.initial(document)
+        reducer = self.reducer.StructuredReducer(reduction_input)
+        candidates = self._collect(reducer)
+
+        self.assertTrue(any(item.transform.startswith("compress-dup") for item in candidates))
+        self.assertTrue(any(item.transform.startswith("shrink-pipe2-flags") for item in candidates))
+        self.assertTrue(any(item.transform.startswith("shrink-fd-flags") for item in candidates))
+        self.assertEqual(
+            len({item.digest for item in candidates}),
+            len(candidates),
+        )
+        original_operation_count = sum(
+            len(item.operations) for item in document.scenarios
+        )
+        self.assertTrue(
+            all(
+                sum(
+                    len(item.operations)
+                    for item in candidate.reduction_input.document.scenarios
+                )
+                <= original_operation_count
+                for candidate in candidates
+            )
+        )
+
     def test_snapshot_resumes_after_last_yielded_candidate(self):
         first = self.reducer.StructuredReducer(
             self.reducer.ReductionInput.initial(self.document)
@@ -598,6 +635,51 @@ class MinimizationPersistenceRegressionTests(unittest.TestCase):
             with self.assertRaisesRegex(Exception, "metadata keys mismatch"):
                 store.load_job(job.job_id)
 
+    def test_legacy_schema_v1_job_loads_with_pipe_only_target(self):
+        import generator
+        import minimization
+        import minimization_schema
+        import minimization_store
+        import reducer
+
+        document = scenario.parse_document(
+            "version 1\nscenario legacy\npipe2 0 1\n"
+        )
+        item = minimization.MinimizationItem(
+            scenario.canonical_digest(document),
+            reducer.ReductionInput.initial(document),
+            frozenset({"pipe-region"}),
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            executable = Path(sys.executable).resolve()
+            store = minimization_store.MinimizationStore(
+                workspace,
+                generator.GENERATOR_VERSION,
+            )
+            job = store.create_job(
+                "legacy-minimization",
+                kind="coverage",
+                source={"kind": "attribution", "path": "/job", "id": "attr-1"},
+                items=(item,),
+                starry_elf=executable,
+                host_oracle=executable,
+                max_qemu=4,
+                expected_fingerprint=None,
+            )
+            metadata_path = job.path / "metadata.json"
+            metadata = __import__("json").loads(metadata_path.read_text())
+            metadata["schema_version"] = 1
+            metadata["generator_version"] = "2"
+            del metadata["target_set_id"]
+            metadata_path.write_text(__import__("json").dumps(metadata))
+
+            loaded = store.load_job(job.job_id)
+            self.assertEqual(
+                minimization_schema.job_target_set_id(loaded.metadata),
+                "pipe-v1",
+            )
+
     def test_changed_active_elf_moves_job_to_stale_failure(self):
         import minimization
         import minimization_store
@@ -759,7 +841,7 @@ class MinimizationPersistenceRegressionTests(unittest.TestCase):
             runtime = minimization_campaign.MinimizationRuntime(
                 record_host=record_host,
                 run_guest_compare=qemu,
-                extract_regions=lambda _profraws, _elf: {"pipe.rs:1:1"},
+                extract_regions=lambda _profraws, _elf, _target: {"pipe.rs:1:1"},
                 coverage_object=lambda _workspace: executable,
             )
 
@@ -876,7 +958,7 @@ class MinimizationPersistenceRegressionTests(unittest.TestCase):
                 if mutation == "version":
                     metadata_path = job.path / "metadata.json"
                     metadata = __import__("json").loads(metadata_path.read_text())
-                    metadata["schema_version"] = 2
+                    metadata["schema_version"] = 3
                     metadata_path.write_text(__import__("json").dumps(metadata))
                 elif mutation == "elf-digest":
                     with (job.path / "starryos").open("ab") as output:
@@ -954,7 +1036,7 @@ class MinimizationPersistenceRegressionTests(unittest.TestCase):
             runtime = minimization_campaign.MinimizationRuntime(
                 record_host=record_host,
                 run_guest_compare=run_guest,
-                extract_regions=lambda _profraws, _elf: {"pipe.rs:1:1"},
+                extract_regions=lambda _profraws, _elf, _target: {"pipe.rs:1:1"},
                 coverage_object=lambda _workspace: active_elf,
             )
 
@@ -1093,7 +1175,7 @@ class MinimizationPersistenceRegressionTests(unittest.TestCase):
             runtime = minimization_campaign.MinimizationRuntime(
                 record_host=record_host,
                 run_guest_compare=run_guest,
-                extract_regions=lambda _profraws, _elf: set(),
+                extract_regions=lambda _profraws, _elf, _target: set(),
                 coverage_object=lambda _workspace: executable,
             )
 

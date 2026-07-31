@@ -1,4 +1,4 @@
-"""Strict schema-v1 validation for persistent minimization jobs."""
+"""Strict schema-v1/v2 validation for persistent minimization jobs."""
 
 import hashlib
 import json
@@ -8,13 +8,16 @@ from typing import Any, Dict, Set
 
 from corpus_errors import CorpusValidationError
 from corpus import CorpusProvenance
+from coverage import LEGACY_TARGET_SET_ID, TARGET_SET_ID
+from generator import SUPPORTED_CORPUS_GENERATOR_VERSIONS
 from fingerprint import MismatchFingerprint
 from guest_result import GuestResultCategory
 from reducer import OperationOrigin, ReductionInput, StructuredReducer
 from scenario import ScenarioDocument, parse_document, serialize_document
 
 
-MINIMIZATION_SCHEMA_VERSION = 1
+LEGACY_MINIMIZATION_SCHEMA_VERSION = 1
+MINIMIZATION_SCHEMA_VERSION = 2
 MINIMIZATION_JOBS_NAME = "minimization-jobs"
 JOB_STATES = {
     "validating",
@@ -68,11 +71,27 @@ def validate_job_metadata(
         "validation",
         "failure_reason",
     }
+    schema_version = metadata.get("schema_version")
+    if schema_version == MINIMIZATION_SCHEMA_VERSION:
+        expected_keys.add("target_set_id")
     require_exact_keys(metadata, expected_keys, path)
-    if metadata["schema_version"] != MINIMIZATION_SCHEMA_VERSION:
+    if schema_version not in (
+        LEGACY_MINIMIZATION_SCHEMA_VERSION,
+        MINIMIZATION_SCHEMA_VERSION,
+    ):
         raise CorpusValidationError(path, "unsupported minimization schema")
-    if metadata["generator_version"] != generator_version:
+    compatible_generator_versions = (
+        SUPPORTED_CORPUS_GENERATOR_VERSIONS
+        if generator_version == SUPPORTED_CORPUS_GENERATOR_VERSIONS[-1]
+        else (generator_version,)
+    )
+    if metadata["generator_version"] not in compatible_generator_versions:
         raise CorpusValidationError(path, "incompatible generator version")
+    if (
+        schema_version == MINIMIZATION_SCHEMA_VERSION
+        and metadata["target_set_id"] != TARGET_SET_ID
+    ):
+        raise CorpusValidationError(path, "unsupported minimization target set")
     job_id = path.name if expected_job_id is None else expected_job_id
     if metadata["job_id"] != job_id or not JOB_ID_PATTERN.fullmatch(job_id):
         raise CorpusValidationError(path, "minimization job id mismatch")
@@ -198,7 +217,13 @@ def validate_job_files(path: Path, metadata: Dict[str, Any]) -> None:
     for evidence in (path / EVIDENCE_NAME).iterdir():
         if TEMP_PATTERN.fullmatch(evidence.name):
             continue
-        _validate_evidence(evidence, metadata["starry_elf_sha256"])
+        _validate_evidence(evidence, metadata)
+
+
+def job_target_set_id(metadata: Dict[str, Any]) -> str:
+    if metadata["schema_version"] == LEGACY_MINIMIZATION_SCHEMA_VERSION:
+        return LEGACY_TARGET_SET_ID
+    return metadata["target_set_id"]
 
 
 def read_json(path: Path) -> Dict[str, Any]:
@@ -431,7 +456,7 @@ def _validate_validation(validation: Any, path: Path) -> None:
         raise CorpusValidationError(path, "minimization validation evidence is invalid")
 
 
-def _validate_evidence(path: Path, starry_elf_sha256: str) -> None:
+def _validate_evidence(path: Path, job_metadata: Dict[str, Any]) -> None:
     if path.is_symlink() or not path.is_dir():
         raise CorpusValidationError(path, "invalid minimization evidence directory")
     expected = {"pipe.ops", "linux.trace", "guest.log", "profraws", "result.json"}
@@ -443,24 +468,34 @@ def _validate_evidence(path: Path, starry_elf_sha256: str) -> None:
     if profraws_dir.is_symlink() or not profraws_dir.is_dir():
         raise CorpusValidationError(profraws_dir, "invalid evidence profraw directory")
     result = read_json(path / "result.json")
-    require_exact_keys(
-        result,
-        {
-            "schema_version",
-            "starry_elf_sha256",
-            "result_category",
-            "covered_regions",
-            "fingerprint",
-            "ops_sha256",
-            "trace_sha256",
-            "guest_log_sha256",
-            "profraws",
-        },
-        path,
-    )
-    if result["schema_version"] != MINIMIZATION_SCHEMA_VERSION:
+    evidence_version = result.get("schema_version")
+    expected_keys = {
+        "schema_version",
+        "starry_elf_sha256",
+        "result_category",
+        "covered_regions",
+        "fingerprint",
+        "ops_sha256",
+        "trace_sha256",
+        "guest_log_sha256",
+        "profraws",
+    }
+    if evidence_version == MINIMIZATION_SCHEMA_VERSION:
+        expected_keys.add("target_set_id")
+    require_exact_keys(result, expected_keys, path)
+    if evidence_version not in (
+        LEGACY_MINIMIZATION_SCHEMA_VERSION,
+        MINIMIZATION_SCHEMA_VERSION,
+    ):
         raise CorpusValidationError(path, "unsupported minimization evidence schema")
-    if result["starry_elf_sha256"] != starry_elf_sha256:
+    if evidence_version != job_metadata["schema_version"]:
+        raise CorpusValidationError(path, "minimization evidence schema mismatch")
+    if (
+        evidence_version == MINIMIZATION_SCHEMA_VERSION
+        and result["target_set_id"] != job_target_set_id(job_metadata)
+    ):
+        raise CorpusValidationError(path, "minimization evidence target set mismatch")
+    if result["starry_elf_sha256"] != job_metadata["starry_elf_sha256"]:
         raise CorpusValidationError(path, "minimization evidence ELF mismatch")
     if result["result_category"] not in RESULT_CATEGORIES:
         raise CorpusValidationError(path, "invalid minimization evidence result")

@@ -1,4 +1,4 @@
-"""Strict schema-v2 validation for persisted attribution jobs and evidence."""
+"""Strict schema-v2/v3 validation for persisted attribution jobs and evidence."""
 
 import hashlib
 import json
@@ -7,10 +7,13 @@ from pathlib import Path
 from typing import Any, Dict, Set, Tuple
 
 from corpus import CorpusProvenance, CorpusValidationError
+from coverage import LEGACY_TARGET_SET_ID, TARGET_SET_ID
+from generator import SUPPORTED_CORPUS_GENERATOR_VERSIONS
 from scenario import parse_document, serialize_document
 
 
-ATTRIBUTION_SCHEMA_VERSION = 2
+LEGACY_ATTRIBUTION_SCHEMA_VERSION = 2
+ATTRIBUTION_SCHEMA_VERSION = 3
 ATTRIBUTION_JOBS_NAME = "attribution-jobs"
 FAILURES_NAME = "failures"
 METADATA_NAME = "metadata.json"
@@ -56,11 +59,27 @@ def validate_job_metadata(
         "elf_transitions",
         "failure_reason",
     }
+    schema_version = metadata.get("schema_version")
+    if schema_version == ATTRIBUTION_SCHEMA_VERSION:
+        expected.add("target_set_id")
     require_exact_keys(metadata, expected, path)
-    if metadata["schema_version"] != ATTRIBUTION_SCHEMA_VERSION:
+    if schema_version not in (
+        LEGACY_ATTRIBUTION_SCHEMA_VERSION,
+        ATTRIBUTION_SCHEMA_VERSION,
+    ):
         raise CorpusValidationError(path, "unsupported attribution schema")
-    if metadata["generator_version"] != generator_version:
+    compatible_generator_versions = (
+        SUPPORTED_CORPUS_GENERATOR_VERSIONS
+        if generator_version == SUPPORTED_CORPUS_GENERATOR_VERSIONS[-1]
+        else (generator_version,)
+    )
+    if metadata["generator_version"] not in compatible_generator_versions:
         raise CorpusValidationError(path, "incompatible generator version")
+    if (
+        schema_version == ATTRIBUTION_SCHEMA_VERSION
+        and metadata["target_set_id"] != TARGET_SET_ID
+    ):
+        raise CorpusValidationError(path, "unsupported attribution target set")
     if metadata["job_id"] != path.name:
         raise CorpusValidationError(path, "attribution job id mismatch")
     if metadata["state"] not in JOB_STATES:
@@ -168,21 +187,32 @@ def validate_replay(job_path: Path, replay: Path) -> Dict[str, Any]:
     if profraws_dir.is_symlink() or not profraws_dir.is_dir():
         raise CorpusValidationError(profraws_dir, "invalid profraw directory")
     coverage = read_json(replay / "coverage.json")
-    require_exact_keys(
-        coverage,
-        {
-            "schema_version",
-            "starry_elf_sha256",
-            "covered_regions",
-            "result_category",
-            "ops_sha256",
-            "trace_sha256",
-            "profraws",
-        },
-        replay,
-    )
-    if coverage["schema_version"] != ATTRIBUTION_SCHEMA_VERSION:
+    job_metadata = read_json(job_path / METADATA_NAME)
+    evidence_version = coverage.get("schema_version")
+    evidence_keys = {
+        "schema_version",
+        "starry_elf_sha256",
+        "covered_regions",
+        "result_category",
+        "ops_sha256",
+        "trace_sha256",
+        "profraws",
+    }
+    if evidence_version == ATTRIBUTION_SCHEMA_VERSION:
+        evidence_keys.add("target_set_id")
+    require_exact_keys(coverage, evidence_keys, replay)
+    if evidence_version not in (
+        LEGACY_ATTRIBUTION_SCHEMA_VERSION,
+        ATTRIBUTION_SCHEMA_VERSION,
+    ):
         raise CorpusValidationError(replay, "unsupported replay evidence schema")
+    if evidence_version != job_metadata.get("schema_version"):
+        raise CorpusValidationError(replay, "replay evidence schema mismatch")
+    if (
+        evidence_version == ATTRIBUTION_SCHEMA_VERSION
+        and coverage["target_set_id"] != job_target_set_id(job_metadata)
+    ):
+        raise CorpusValidationError(replay, "replay evidence target set mismatch")
     for key in ("starry_elf_sha256", "ops_sha256", "trace_sha256"):
         if not is_digest(coverage[key]):
             raise CorpusValidationError(replay, f"invalid replay {key}")
@@ -215,6 +245,12 @@ def batch_label(attempt: int) -> str:
 
 def entry_label(attempt: int, digest: str) -> str:
     return f"attempt-{attempt:04d}-entry-{digest}"
+
+
+def job_target_set_id(metadata: Dict[str, Any]) -> str:
+    if metadata["schema_version"] == LEGACY_ATTRIBUTION_SCHEMA_VERSION:
+        return LEGACY_TARGET_SET_ID
+    return metadata["target_set_id"]
 
 
 def require_exact_keys(metadata: Any, expected: Set[str], path: Path) -> None:

@@ -2,26 +2,41 @@
 
 import hashlib
 import struct
-from typing import List
+from dataclasses import dataclass, field
+from typing import Dict, List
 
 from scenario import (
     Close,
     Dup,
+    Dup2,
+    Dup3,
+    DUP3_ALLOWED_FLAGS,
+    DUP3_FLAG_VALUES,
+    FD_CLOEXEC,
     Fionread,
+    GetFdFlags,
     GetSize,
+    GetStatusFlags,
+    LEGACY_CORPUS_VERSION,
     MAX_ENTRY_BYTES,
     MAX_IO_BYTES,
     MAX_LOGICAL_SLOTS,
     MAX_OPS_PER_SCENARIO,
     MAX_PIPE_SIZE,
     MAX_POLL_MASK,
+    O_CLOEXEC,
+    O_NONBLOCK,
+    PIPE2_ALLOWED_FLAGS,
+    PIPE2_FLAG_VALUES,
     Pipe2,
     Poll,
     Read,
     ReadNull,
     Scenario,
     ScenarioDocument,
+    SetFdFlags,
     SetSize,
+    SetStatusFlags,
     Write,
     WriteNull,
     canonical_digest,
@@ -30,8 +45,13 @@ from scenario import (
 )
 
 
-GENERATOR_VERSION = "2"
+GENERATOR_VERSION = "3"
+PREVIOUS_GENERATOR_VERSION = "2"
 LEGACY_GENERATOR_VERSION = "1"
+SUPPORTED_CORPUS_GENERATOR_VERSIONS = (
+    PREVIOUS_GENERATOR_VERSION,
+    GENERATOR_VERSION,
+)
 
 MAX_INPUT_BYTES = MAX_ENTRY_BYTES
 
@@ -70,6 +90,50 @@ _GENERATION_POLL_BOUNDARIES = (
     0x4000,
     MAX_POLL_MASK,
 )
+_PIPE2_FLAG_BOUNDARIES = PIPE2_FLAG_VALUES
+_STATUS_FLAG_BOUNDARIES = (0, O_NONBLOCK, O_CLOEXEC, PIPE2_ALLOWED_FLAGS)
+_FD_FLAG_BOUNDARIES = (0, FD_CLOEXEC, 2, 3)
+_DUP3_FLAG_BOUNDARIES = DUP3_FLAG_VALUES
+
+
+@dataclass
+class _GenerationState:
+    slots: List[int] = field(default_factory=lambda: [FREE] * MAX_LOGICAL_SLOTS)
+    descriptions: List[int] = field(
+        default_factory=lambda: [-1] * MAX_LOGICAL_SLOTS
+    )
+    close_on_exec: List[bool] = field(
+        default_factory=lambda: [False] * MAX_LOGICAL_SLOTS
+    )
+    nonblocking: Dict[int, bool] = field(default_factory=dict)
+    next_description: int = 0
+
+    def open_endpoint(
+        self,
+        slot: int,
+        endpoint: int,
+        flags: int,
+    ) -> None:
+        description = self.next_description
+        self.next_description += 1
+        self.slots[slot] = endpoint
+        self.descriptions[slot] = description
+        self.close_on_exec[slot] = bool(flags & O_CLOEXEC)
+        self.nonblocking[description] = bool(flags & O_NONBLOCK)
+
+    def duplicate(self, source: int, destination: int, close_on_exec: bool) -> None:
+        self.slots[destination] = self.slots[source]
+        self.descriptions[destination] = self.descriptions[source]
+        self.close_on_exec[destination] = close_on_exec
+
+    def close(self, slot: int) -> None:
+        self.slots[slot] = CLOSED
+        self.descriptions[slot] = -1
+        self.close_on_exec[slot] = False
+
+    def is_nonblocking(self, slot: int) -> bool:
+        description = self.descriptions[slot]
+        return description >= 0 and self.nonblocking[description]
 
 
 class CampaignRng:
@@ -115,7 +179,7 @@ class LegacyLcgRng:
 
 
 def generate_document(rng) -> ScenarioDocument:
-    """Generate one bounded version-2 corpus entry directly as scenario IR."""
+    """Generate one bounded version-3 corpus entry directly as scenario IR."""
 
     scenario_count = rng.range(1, 5)
     scenarios = []
@@ -133,7 +197,10 @@ def legacy_document_from_input(data: bytes) -> ScenarioDocument:
     if not data:
         rng = LegacyLcgRng(0)
         operation_count = max(1, rng.range(1, 6))
-        return ScenarioDocument([_generate_legacy_scenario(rng, operation_count)])
+        return ScenarioDocument(
+            [_generate_legacy_scenario(rng, operation_count)],
+            version=LEGACY_CORPUS_VERSION,
+        )
     if len(data) > MAX_INPUT_BYTES:
         data = data[:MAX_INPUT_BYTES]
     rng = LegacyLcgRng(_bytes_to_seed(data))
@@ -142,7 +209,7 @@ def legacy_document_from_input(data: bytes) -> ScenarioDocument:
     for _ in range(scenario_count):
         operation_count = max(1, rng.range(1, MAX_OPS_PER_SCENARIO + 1))
         scenarios.append(_generate_legacy_scenario(rng, operation_count))
-    return ScenarioDocument(scenarios)
+    return ScenarioDocument(scenarios, version=LEGACY_CORPUS_VERSION)
 
 
 def expand_input(data: bytes) -> ScenarioDocument:
@@ -162,17 +229,17 @@ def ops_to_text(document: ScenarioDocument) -> str:
 
 def _generate_structured_scenario(rng, operation_count: int) -> Scenario:
     operations = []
-    slots = [FREE] * MAX_LOGICAL_SLOTS
+    state = _GenerationState()
     for _ in range(operation_count):
-        families = _structured_operation_families(slots)
+        families = _structured_operation_families(state)
         family = families[rng.range(0, len(families))]
-        operations.append(_emit_structured_operation(rng, family, slots))
+        operations.append(_emit_structured_operation(rng, family, state))
     return Scenario(operations)
 
 
-def _structured_operation_families(slots: List[int]):
-    open_slots = _slots_with_states(slots, READER, WRITER)
-    available_slots = _slots_with_states(slots, FREE, CLOSED)
+def _structured_operation_families(state: _GenerationState):
+    open_slots = _slots_with_states(state.slots, READER, WRITER)
+    available_slots = _slots_with_states(state.slots, FREE, CLOSED)
     if not open_slots:
         return ("pipe2",)
 
@@ -186,6 +253,12 @@ def _structured_operation_families(slots: List[int]):
         "set-size",
         "get-size",
         "fionread",
+        "get-status-flags",
+        "set-status-flags",
+        "get-fd-flags",
+        "set-fd-flags",
+        "dup2",
+        "dup3",
         "resource-error",
     ]
     if len(available_slots) >= 2:
@@ -195,26 +268,30 @@ def _structured_operation_families(slots: List[int]):
     return tuple(families)
 
 
-def _emit_structured_operation(rng, family: str, slots: List[int]):
-    readers = _slots_with_states(slots, READER)
-    writers = _slots_with_states(slots, WRITER)
+def _emit_structured_operation(rng, family: str, state: _GenerationState):
+    readers = _slots_with_states(state.slots, READER)
+    writers = _slots_with_states(state.slots, WRITER)
     open_slots = readers + writers
-    available_slots = _slots_with_states(slots, FREE, CLOSED)
+    available_slots = _slots_with_states(state.slots, FREE, CLOSED)
 
     if family == "pipe2":
         read_slot = _take_random(rng, available_slots)
         write_slot = _take_random(rng, available_slots)
-        slots[read_slot] = READER
-        slots[write_slot] = WRITER
-        return Pipe2(read_slot, write_slot)
+        flags = _choose(rng, _PIPE2_FLAG_BOUNDARIES)
+        if flags & ~PIPE2_ALLOWED_FLAGS == 0:
+            state.open_endpoint(read_slot, READER, flags)
+            state.open_endpoint(write_slot, WRITER, flags)
+        return Pipe2(read_slot, write_slot, flags)
     if family == "read":
-        return Read(_choose(rng, readers or open_slots), _generation_length(rng))
+        slot = _choose(rng, readers or open_slots)
+        return Read(slot, _safe_generation_length(rng, state, slot))
     if family == "read-null":
         return ReadNull(_choose(rng, readers or open_slots))
     if family == "write":
+        slot = _choose(rng, writers or open_slots)
         return Write(
-            _choose(rng, writers or open_slots),
-            _generation_length(rng),
+            slot,
+            _safe_generation_length(rng, state, slot),
             rng.range(0, 256),
         )
     if family == "write-null":
@@ -222,11 +299,11 @@ def _emit_structured_operation(rng, family: str, slots: List[int]):
     if family == "dup":
         source = _choose(rng, open_slots)
         destination = _choose(rng, available_slots)
-        slots[destination] = slots[source]
+        state.duplicate(source, destination, False)
         return Dup(source, destination)
     if family == "close":
         slot = _choose(rng, open_slots)
-        slots[slot] = CLOSED
+        state.close(slot)
         return Close(slot)
     if family == "poll":
         return Poll(_choose(rng, open_slots), _generation_poll_mask(rng))
@@ -236,14 +313,47 @@ def _emit_structured_operation(rng, family: str, slots: List[int]):
         return GetSize(_choose(rng, open_slots))
     if family == "fionread":
         return Fionread(_choose(rng, open_slots))
-    return _emit_resource_error(rng, slots)
+    if family == "get-status-flags":
+        return GetStatusFlags(_choose_any_slot(rng, open_slots, available_slots))
+    if family == "set-status-flags":
+        slot = _choose_any_slot(rng, open_slots, available_slots)
+        flags = _choose(rng, _STATUS_FLAG_BOUNDARIES)
+        if state.slots[slot] in (READER, WRITER):
+            state.nonblocking[state.descriptions[slot]] = bool(flags & O_NONBLOCK)
+        return SetStatusFlags(slot, flags)
+    if family == "get-fd-flags":
+        return GetFdFlags(_choose_any_slot(rng, open_slots, available_slots))
+    if family == "set-fd-flags":
+        slot = _choose_any_slot(rng, open_slots, available_slots)
+        flags = _choose(rng, _FD_FLAG_BOUNDARIES)
+        if state.slots[slot] in (READER, WRITER):
+            state.close_on_exec[slot] = bool(flags & FD_CLOEXEC)
+        return SetFdFlags(slot, flags)
+    if family == "dup2":
+        source = _choose_any_slot(rng, open_slots, available_slots)
+        destination = rng.range(0, MAX_LOGICAL_SLOTS)
+        if state.slots[source] in (READER, WRITER) and source != destination:
+            state.duplicate(source, destination, False)
+        return Dup2(source, destination)
+    if family == "dup3":
+        source = _choose_any_slot(rng, open_slots, available_slots)
+        destination = rng.range(0, MAX_LOGICAL_SLOTS)
+        flags = _choose(rng, _DUP3_FLAG_BOUNDARIES)
+        if (
+            state.slots[source] in (READER, WRITER)
+            and source != destination
+            and flags & ~DUP3_ALLOWED_FLAGS == 0
+        ):
+            state.duplicate(source, destination, bool(flags & O_CLOEXEC))
+        return Dup3(source, destination, flags)
+    return _emit_resource_error(rng, state)
 
 
-def _emit_resource_error(rng, slots: List[int]):
-    readers = _slots_with_states(slots, READER)
-    writers = _slots_with_states(slots, WRITER)
-    free_slots = _slots_with_states(slots, FREE)
-    closed_slots = _slots_with_states(slots, CLOSED)
+def _emit_resource_error(rng, state: _GenerationState):
+    readers = _slots_with_states(state.slots, READER)
+    writers = _slots_with_states(state.slots, WRITER)
+    free_slots = _slots_with_states(state.slots, FREE)
+    closed_slots = _slots_with_states(state.slots, CLOSED)
     choices = []
     if free_slots:
         choices.append(("free", free_slots))
@@ -259,11 +369,15 @@ def _emit_resource_error(rng, slots: List[int]):
         return Close(slot)
     if category == "wrong-write":
         if rng.range(0, 2) == 0:
-            return Write(slot, _generation_length(rng), rng.range(0, 256))
+            return Write(
+                slot,
+                _safe_generation_length(rng, state, slot),
+                rng.range(0, 256),
+            )
         return WriteNull(slot)
     if category == "wrong-read":
         if rng.range(0, 2) == 0:
-            return Read(slot, _generation_length(rng))
+            return Read(slot, _safe_generation_length(rng, state, slot))
         return ReadNull(slot)
 
     operation_kind = rng.range(0, 7)
@@ -286,6 +400,18 @@ def _generation_length(rng) -> int:
     if rng.range(0, 2) == 0:
         return _choose(rng, _GENERATION_LENGTH_BOUNDARIES)
     return rng.range(0, MAX_IO_BYTES + 1)
+
+
+def _safe_generation_length(rng, state: _GenerationState, slot: int) -> int:
+    if state.slots[slot] in (READER, WRITER) and not state.is_nonblocking(slot):
+        return 0
+    return _generation_length(rng)
+
+
+def _choose_any_slot(rng, open_slots, available_slots) -> int:
+    if available_slots and rng.range(0, 4) == 0:
+        return _choose(rng, available_slots)
+    return _choose(rng, open_slots)
 
 
 def _generation_pipe_size(rng) -> int:

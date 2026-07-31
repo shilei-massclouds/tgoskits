@@ -20,7 +20,12 @@ from corpus_errors import (
     CorpusStorageError,
     CorpusValidationError,
 )
-from generator import GENERATOR_VERSION, legacy_document_from_input
+from coverage import LEGACY_TARGET_SET_ID, TARGET_SET_ID
+from generator import (
+    GENERATOR_VERSION,
+    SUPPORTED_CORPUS_GENERATOR_VERSIONS,
+    legacy_document_from_input,
+)
 from scenario import (
     ScenarioDocument,
     parse_document,
@@ -32,8 +37,9 @@ from scenario import (
 LEGACY_CORPUS_SCHEMA_VERSION = 1
 ATTRIBUTED_CORPUS_SCHEMA_VERSION = 2
 CORPUS_SCHEMA_VERSION = 3
-COVERAGE_STATE_SCHEMA_VERSION = 1
-RUN_SCHEMA_VERSION = 3
+LEGACY_COVERAGE_STATE_SCHEMA_VERSION = 1
+COVERAGE_STATE_SCHEMA_VERSION = 2
+RUN_SCHEMA_VERSION = 4
 
 CORPUS_ENTRIES_NAME = "corpus"
 RUNS_NAME = "runs"
@@ -440,19 +446,61 @@ class CorpusStore:
             raise CorpusValidationError(elf_path, "instrumented StarryOS ELF is missing")
         return _sha256_file(elf_path)
 
-    def load_coverage_regions(self, elf_path: Path) -> Set[str]:
+    def load_coverage_regions(
+        self,
+        elf_path: Path,
+        target_set_id: str = TARGET_SET_ID,
+    ) -> Set[str]:
         self.prepare()
         elf_digest = self.elf_digest(elf_path)
-        state_path = self.coverage_state_dir / f"{elf_digest}.json"
+        state_path = self._coverage_state_path(elf_digest, target_set_id)
+        if target_set_id == LEGACY_TARGET_SET_ID and not state_path.exists():
+            state_path = self.coverage_state_dir / f"{elf_digest}.json"
         if not state_path.exists():
             return set()
+        if state_path.is_symlink() or not state_path.is_file():
+            raise CorpusValidationError(
+                state_path,
+                "coverage-state is not a regular file",
+            )
         metadata = _read_json(state_path)
-        _require_exact_keys(
-            metadata,
-            {"schema_version", "starry_elf_sha256", "covered_regions", "last_updated"},
-            state_path,
-        )
-        if metadata["schema_version"] != COVERAGE_STATE_SCHEMA_VERSION:
+        if metadata.get("schema_version") == LEGACY_COVERAGE_STATE_SCHEMA_VERSION:
+            _require_exact_keys(
+                metadata,
+                {
+                    "schema_version",
+                    "starry_elf_sha256",
+                    "covered_regions",
+                    "last_updated",
+                },
+                state_path,
+            )
+            if target_set_id != LEGACY_TARGET_SET_ID:
+                raise CorpusValidationError(
+                    state_path,
+                    "legacy coverage-state belongs to the pipe-v1 target set",
+                )
+        else:
+            _require_exact_keys(
+                metadata,
+                {
+                    "schema_version",
+                    "target_set_id",
+                    "starry_elf_sha256",
+                    "covered_regions",
+                    "last_updated",
+                },
+                state_path,
+            )
+            if metadata.get("target_set_id") != target_set_id:
+                raise CorpusValidationError(
+                    state_path,
+                    "coverage-state target set mismatch",
+                )
+        if metadata["schema_version"] not in (
+            LEGACY_COVERAGE_STATE_SCHEMA_VERSION,
+            COVERAGE_STATE_SCHEMA_VERSION,
+        ):
             raise CorpusValidationError(state_path, "unsupported coverage-state schema")
         if metadata["starry_elf_sha256"] != elf_digest:
             raise CorpusValidationError(state_path, "coverage-state ELF digest mismatch")
@@ -464,20 +512,31 @@ class CorpusStore:
         _validate_environment(metadata["last_updated"], state_path)
         return set(regions)
 
-    def save_coverage_regions(self, elf_path: Path, regions: Set[str]) -> str:
+    def save_coverage_regions(
+        self,
+        elf_path: Path,
+        regions: Set[str],
+        target_set_id: str = TARGET_SET_ID,
+    ) -> str:
         self.prepare()
         elf_digest = self.elf_digest(elf_path)
-        state_path = self.coverage_state_dir / f"{elf_digest}.json"
+        state_path = self._coverage_state_path(elf_digest, target_set_id)
         if state_path.exists():
-            self.load_coverage_regions(elf_path)
+            self.load_coverage_regions(elf_path, target_set_id)
         metadata = {
             "schema_version": COVERAGE_STATE_SCHEMA_VERSION,
+            "target_set_id": target_set_id,
             "starry_elf_sha256": elf_digest,
             "covered_regions": _sorted_regions(regions),
             "last_updated": self.verification_environment(),
         }
         _atomic_write_json(state_path, metadata)
         return elf_digest
+
+    def _coverage_state_path(self, elf_digest: str, target_set_id: str) -> Path:
+        if target_set_id not in (LEGACY_TARGET_SET_ID, TARGET_SET_ID):
+            raise ValueError(f"unknown coverage target set: {target_set_id}")
+        return self.coverage_state_dir / f"{elf_digest}-{target_set_id}.json"
 
     def save_run(self, run_id: str, metadata: Dict[str, Any]) -> Path:
         self.prepare()
@@ -490,6 +549,7 @@ class CorpusStore:
             **metadata,
             "schema_version": RUN_SCHEMA_VERSION,
             "generator_version": self.generator_version,
+            "target_set_id": TARGET_SET_ID,
         }
         temporary = Path(
             tempfile.mkdtemp(prefix=f".{run_id}.tmp-", dir=self.runs_dir)
@@ -589,7 +649,7 @@ class CorpusStore:
         if schema_version == CORPUS_SCHEMA_VERSION:
             expected_keys |= {"lifecycle", "minimization"}
         _require_exact_keys(metadata, expected_keys, entry_dir / METADATA_NAME)
-        if metadata["generator_version"] != self.generator_version:
+        if metadata["generator_version"] not in SUPPORTED_CORPUS_GENERATOR_VERSIONS:
             raise CorpusValidationError(entry_dir, "incompatible generator version")
         if metadata["canonical_digest"] != digest:
             raise CorpusValidationError(entry_dir, "canonical digest mismatch")

@@ -800,7 +800,7 @@ def _run_batch(
 
         print(
             f"  Coverage saved: {len(profraws)} profraw(s), "
-            f"{len(new_regions)} new pipe regions",
+            f"{len(new_regions)} new target regions",
             flush=True,
         )
 
@@ -871,8 +871,6 @@ def _find_or_build_host_oracle(workspace: Path) -> Optional[Path]:
     source_dir = workspace / "test-suit/starryos/qemu/pipe-linux-oracle/c"
     build_dir = workspace / "target/pipe-oracle-host"
     elf_path = build_dir / "pipe-linux-oracle"
-    if elf_path.is_file():
-        return elf_path
 
     build_environment = os.environ.copy()
     build_environment.pop("STARRY_PIPE_ORACLE_ARTIFACT_DIR", None)
@@ -936,6 +934,7 @@ def _extract_new_regions(
     profraws: List[Path],
     elf: Path,
     covered_regions: Set[str],
+    target_set_id: str = "pipe-fd-v2",
 ) -> Set[str]:
     if not profraws:
         return set()
@@ -945,13 +944,17 @@ def _extract_new_regions(
         temporary = Path(temporary_directory)
         profdata = temporary / "merged.profdata"
         merge_profraws(profraws, profdata)
-        regions = pipe_region_set(profdata, elf)
+        regions = pipe_region_set(profdata, elf, target_set_id)
         new_regions = regions - covered_regions
         covered_regions.update(new_regions)
         return new_regions
 
 
-def _extract_regions(profraws: List[Path], elf: Path) -> Set[str]:
+def _extract_regions(
+    profraws: List[Path],
+    elf: Path,
+    target_set_id: str = "pipe-fd-v2",
+) -> Set[str]:
     if not profraws:
         return set()
     from coverage import merge_profraws, pipe_region_set
@@ -959,7 +962,7 @@ def _extract_regions(profraws: List[Path], elf: Path) -> Set[str]:
     with tempfile.TemporaryDirectory() as temporary_directory:
         profdata = Path(temporary_directory) / "merged.profdata"
         merge_profraws(profraws, profdata)
-        return pipe_region_set(profdata, elf)
+        return pipe_region_set(profdata, elf, target_set_id)
 
 
 def _save_batch_failure(

@@ -4,7 +4,8 @@
 
 Implemented on 2026-07-30, extended with structured scenario generation,
 persistent canonical coverage corpus, resumable exact coverage attribution,
-and persistent coverage/mismatch minimization on 2026-07-31. This document
+and persistent coverage/mismatch minimization on 2026-07-31. Stage 3.2a added
+pipe fd/status flags and `dup2`/`dup3` coverage on 2026-07-31. This document
 records the design and implementation of the script-driven pipe differential
 oracle.
 
@@ -70,8 +71,9 @@ The implementation is complete when all of the following hold:
   host Linux and generates a fresh expected trace;
 - fuzz and replay runs inject their exact saved/generated ELF, corpus, and trace
   into the guest instead of re-recording or substituting checked-in artifacts;
-- Starry compares return values, normalized errno, poll events, capacity/query
-  values, queued byte counts, and bytes returned by reads;
+- Starry compares return values, exact errno, poll events, capacity/query
+  values, queued byte counts, bytes returned by reads, normalized
+  `O_NONBLOCK`, and per-fd `FD_CLOEXEC`;
 - a mismatch identifies the scenario, operation index, operation text, expected
   result, actual result, and recorded host environment;
 - malformed corpus or trace input fails closed and returns a nonzero status;
@@ -114,6 +116,8 @@ The first implementation deliberately excludes:
   concurrent writers, and signal-delivery timing;
 - `epoll`, `select`, FIFO pathname/open semantics, `splice`, `tee`, and
   `vmsplice`;
+- `readv`/`writev`, multi-fd `poll`, `select`/`epoll`, exec-time fd lifecycle,
+  and blocking fd/pipe semantics in stage 3.2a;
 - a general syscall differential framework or a stable public corpus/trace
   protocol;
 - a Linux VM pinned to a specific kernel release;
@@ -172,6 +176,53 @@ metadata.
 
 During `--compare`, the same ELF reads the ops corpus, executes operations in
 Starry, and compares each result with the expected trace.
+
+### Version-2 fd and flag operations
+
+`pipe.ops` version 1 remains readable byte-for-byte. Its two-argument `pipe2`
+continues to mean `O_NONBLOCK | O_CLOEXEC`, so legacy canonical digests do not
+change. New generation and mutation use version 2, whose added forms are:
+
+```
+pipe2 READ_SLOT WRITE_SLOT FLAGS
+get-status-flags SLOT
+set-status-flags SLOT FLAGS
+get-fd-flags SLOT
+set-fd-flags SLOT FLAGS
+dup2 SOURCE_SLOT DESTINATION_SLOT
+dup3 SOURCE_SLOT DESTINATION_SLOT FLAGS
+```
+
+Flags are canonical unsigned decimal integers. The version-2 pipe dictionary
+contains the four combinations of `O_NONBLOCK` (`2048`) and `O_CLOEXEC`
+(`524288`), plus the fixed unknown bit `1073741824` for `EINVAL`. The `dup3`
+dictionary contains `0`, `O_CLOEXEC`, deterministic illegal nonblocking
+combinations, and the same unknown bit. Other spellings fail codec validation
+instead of depending on host-specific flag discovery.
+
+The IR assigns each live logical fd an endpoint, an open-file-description
+identity, and a per-fd close-on-exec bit. `O_NONBLOCK` belongs to the shared
+description, while `FD_CLOEXEC` belongs to one descriptor. Successful `dup`
+and `dup2` clear the destination close-on-exec bit; successful
+`dup3(O_CLOEXEC)` sets it. `dup2`/`dup3` atomically replace an occupied
+destination. A failed `pipe2`, `fcntl`, `dup2`, or `dup3` leaves the modeled
+state unchanged.
+
+The harness stores only `O_NONBLOCK` in `value` for `F_GETFL` and only
+`FD_CLOEXEC` for `F_GETFD`. Successful `dup2`/`dup3` results are normalized to
+zero, so host and guest fd allocation numbers never enter comparison. Empty
+logical destinations use an internal reserved fd range; this detail is not part
+of corpus identity. Errno remains exact.
+
+Version 2 rejects positive-length I/O whenever a live description is not
+statically known to have `O_NONBLOCK`. Zero-length I/O, operations on a known
+invalid slot, and pure fd/flag operations remain safe. Mutation repair may add
+explicit nonblocking setup; the reducer never synthesizes initialization.
+
+The trace writer emits version 2 and appends operation-kind numbers 12 through
+17 for the six new kinds. It does not reorder the version-1 numbering. Compare
+mode still accepts a version-1 trace for a version-1 corpus, while a version-2
+corpus requires a version-2 trace.
 
 ### Coverage capture and deferred fail
 
@@ -233,14 +284,15 @@ does not exist and the production kernel carries no coverage-related code.
   exact-attribution admission.
 - `campaign_lock.py` and `corpus_errors.py`: Process-lock ownership and shared
   persistent-state error types.
-- `attribution.py` and `attribution_schema.py`: Atomic schema-v2 attribution
-  jobs, strict evidence validation, deterministic representative selection,
-  and resumable state transitions.
+- `attribution.py` and `attribution_schema.py`: Atomic schema-v3 attribution
+  jobs (plus strict schema-v2 recovery), target-set-aware evidence validation,
+  deterministic representative selection, and resumable state transitions.
 - `attribution_campaign.py`: Fresh host-trace and QEMU replay orchestration,
   cross-campaign ELF restart, final representative proof, and baseline commit.
-- `scenario.py`: Immutable scenario/operation IR plus the version-1 `pipe.ops`
-  parser, canonical serializer, digest, typed codec errors, and campaign limits.
-- `generator.py`: Version-2 deterministic operation generation using a
+- `scenario.py`: Immutable scenario/operation IR plus the version-1/version-2
+  `pipe.ops` parser, canonical serializer, digest, typed codec errors, shared
+  open-file-description state, per-fd flags, and campaign limits.
+- `generator.py`: Version-3 deterministic operation generation using a
   versioned SHA-256 counter stream and rejection sampling. It maintains only
   logical fd resource state and never predicts return values, errno, poll
   readiness, or any semantic result. The version-1 LCG remains only for the five
@@ -257,9 +309,10 @@ does not exist and the production kernel carries no coverage-related code.
 - `reducer.py` and `minimization.py`: Pure deterministic hierarchical reduction,
   operation-origin tracking, coverage responsibility assignment, mismatch
   predicate checks, digest deduplication, and shared candidate-QEMU budgets.
-- `minimization_schema.py` and `minimization_store.py`: Strict schema-v1 job and
-  evidence validation, atomic checkpoints, reducer cursor persistence, and
-  stale/unstable failure preservation.
+- `minimization_schema.py` and `minimization_store.py`: Strict schema-v2 job and
+  evidence validation (plus schema-v1 recovery), atomic checkpoints, reducer
+  cursor persistence, target-set pinning, and stale/unstable failure
+  preservation.
 - `minimization_source.py`, `minimization_campaign.py`, and `minimize.py`:
   failure/attribution source import, fresh trace/profraw predicate execution,
   two final proofs, corpus/failure commit, automatic recovery, and the manual
@@ -271,8 +324,8 @@ does not exist and the production kernel carries no coverage-related code.
   Attribution and minimization replays also pass their content-addressed Starry
   ELF to axbuild's internal kallsyms pinning contract.
 - `coverage.py`: `llvm-profdata merge -sparse` and `llvm-cov export` against
-  `target/x86_64-unknown-none/release/starryos`; covered pipe regions use stable
-  `source:line:column` string IDs.
+  `target/x86_64-unknown-none/release/starryos`; target-set source regions use
+  stable `source:line:column` string IDs.
 - `fuzz.py`: Batch fuzzing with seed, batch count, batch size, minimization
   budget, and a `--no-minimize` rollback switch. Startup resumes attribution,
   creates or resumes minimization, reloads active corpus entries, and only then
@@ -303,7 +356,7 @@ The ignored campaign state has this layout:
 coverage/pipe-oracle-fuzz/
   corpus/<canonical-sha256>/{pipe.ops,metadata.json}
   runs/<run-id>/metadata.json
-  coverage-state/<starry-elf-sha256>.json
+  coverage-state/<starry-elf-sha256>-<target-set-id>.json
   attribution-jobs/<job-id>/...
   minimization-jobs/<job-id>/...
   failures/...
@@ -336,7 +389,11 @@ entries to mutation. If a minimized digest already exists, its historical
 region union and minimization lineage are merged instead of creating a duplicate
 directory.
 
-Loading fails closed on an unknown schema or generator version, a directory or
+The current generator strictly reads corpus entries created by generator v2 or
+v3. Existing v2 metadata and provenance are not rewritten merely because the
+entry is loaded; a newly generated or mutated child records generator v3 and
+uses `pipe.ops` v2. Loading fails closed on an unknown schema or generator
+version, a directory or
 file digest mismatch, noncanonical UTF-8 encoding, codec/resource-limit error,
 invalid metadata, symlink, or unexpected finalized file. The only implicit
 transition is the contributor-triggered v1-to-v2 atomic upgrade described
@@ -350,13 +407,18 @@ replace. Run directories use the same temporary-directory/rename protocol.
 Only finalized 64-hex digest directories are loaded, so a process killed during
 its initial write cannot expose a half entry.
 
-Coverage state schema v1 is keyed by the SHA-256 of the instrumented StarryOS
-ELF. A batch loads only that ELF's region set. A nonproductive batch saves the
-same baseline; a productive batch must finish exact attribution and the final
-representative replay before the enlarged baseline is atomically committed. A
-different ELF therefore has an independent baseline.
+Coverage state schema v2 is keyed by both the SHA-256 of the instrumented
+StarryOS ELF and a fixed target-set ID. New campaigns use `pipe-fd-v2`, which
+contains exactly `kernel/src/file/pipe.rs`, `kernel/src/syscall/fs/pipe.rs`, and
+`kernel/src/syscall/fs/fd_ops.rs`. Schema-v1 state is read only as the implicit
+`pipe-v1` target and never seeds a `pipe-fd-v2` baseline. A nonproductive batch
+saves the same baseline; a productive batch must finish exact attribution and
+the final representative replay before the enlarged baseline is atomically
+committed. Different ELFs and target sets therefore have independent
+baselines.
 
-Run metadata schema v3 stores the seed, exact command, measured duration,
+Run metadata schema v4 stores the fixed `target_set_id`, seed, exact command,
+measured duration,
 candidate/executable/malformed/unique counts, sources and ancestry, new regions,
 admitted digests, Starry ELF digest, result category, attribution job ID, every
 entry-to-region mapping, the representative digests, and the number of extra
@@ -369,7 +431,7 @@ for selection.
 
 Exact attribution is enabled by default for every productive batch. After the
 initial batch QEMU reports regions outside the active ELF baseline, the
-orchestrator atomically creates a schema-v2 job containing the canonical input
+orchestrator atomically creates a schema-v3 job containing the canonical input
 set and the initial batch evidence. It then:
 
 1. re-records a fresh Linux trace and starts a fresh QEMU for each of the `N`
@@ -453,9 +515,11 @@ canonical, strictly lower-complexity candidates in this order:
 2. delete coarse-to-fine contiguous scenario blocks;
 3. delete coarse-to-fine contiguous operation blocks;
 4. try individual operations in reverse order;
-5. compress duplicate chains, redirect compatible resource references, and
+5. compress `dup`/`dup2`/`dup3` chains, redirect compatible resource
+   references, and
    rename live slots densely; and
-6. reduce length, byte, pipe size, and poll masks through fixed simple values.
+6. reduce length, byte, pipe size, poll masks, pipe/status/fd flags, and `dup3`
+   flags through fixed simple values.
 
 It neither consumes campaign RNG nor synthesizes initialization operations.
 Every candidate passes the canonical codec and must lower a well-founded
@@ -479,7 +543,8 @@ side. A mismatch candidate is accepted only when the observed difference maps
 back to that same origin and produces the identical fingerprint. A pass or a
 different fingerprint is an ordinary rejection, not a new failure.
 
-Each strict schema-v1 minimization job owns its source identity, original
+Each strict schema-v2 minimization job owns its fixed target set, source
+identity, original
 inputs, fixed host and Starry ELFs, current-best checkpoints with operation
 origins, reducer cursors and seen digests, shared budget/cursor, compact attempt
 summaries, original validation, and two final proofs. States are
@@ -515,6 +580,18 @@ candidates, and two final proofs. The representative shrank from 637 to 503
 bytes; both proof launches produced independent fresh profraw files and covered
 all 346 responsibility regions. Only then was the original corpus entry marked
 superseded and the minimized entry activated.
+
+The stage-3.2a acceptance used the version-2 checked-in corpus for 115
+host/Starry operations and exported a fresh x86_64 coverage profile without a
+semantic mismatch. Two small real-campaign runs used separate fixed Starry ELF
+digests and attributed 693 and 674 new `pipe-fd-v2` regions, respectively. Each
+coverage minimization executed one validation, four candidates, and two final
+proofs; the entries shrank from 631 to 476 bytes and from 1171 to 843 bytes.
+Both jobs completed as `budget-limited`, retained every responsibility region
+in both fresh final profiles, activated the minimized entries, and preserved
+the originals as superseded. An ENOSPC interruption after the first batch also
+demonstrated schema-v3 attribution recovery from its atomic checkpoint. No
+production Starry syscall change was required.
 
 The retained schema-v1 poll-mismatch artifact also passed strict lazy import:
 its old log yielded a fingerprint at original operation 16 with
@@ -571,7 +648,7 @@ monitor-socket, or other infrastructure errors therefore cannot be imported or
 reported as semantic mismatches.
 
 Saves use a temp-directory + atomic rename to prevent half-written artifacts.
-Attribution instability uses the separate schema-v2 job layout described above
+Attribution instability uses the separate schema-v3 job layout described above
 under `failures/attribution-<job-id>/`; moving the complete job preserves all
 initial, per-entry, representative, and ELF-transition evidence.
 
@@ -632,17 +709,27 @@ There is no pinned release check. The test requires:
 The host release, machine, and page size are printed and stored in the trace.
 If a Linux upgrade changes an observable result, the differential test fails.
 
+The fd semantics follow the public Linux contracts in
+[`pipe2(2)`](https://man7.org/linux/man-pages/man2/pipe.2.html),
+[`fcntl(2)`](https://man7.org/linux/man-pages/man2/fcntl.2.html), and
+[`dup(2)`](https://man7.org/linux/man-pages/man2/dup.2.html). The execution
+oracle, rather than a hard-coded kernel version, determines the exact result
+and errno for the recorded host release. Stage 3.2a changes only the oracle and
+its test formats; it does not claim a new Starry production-syscall change.
+
 ## Syscall impact map
 
 | Syscall | Comparison scope |
 |---|---|
-| `pipe2` | Create nonblocking close-on-exec endpoints; normalize fd numbers to logical slots |
+| `pipe2` | Four `O_NONBLOCK`/`O_CLOEXEC` combinations, fixed unknown-bit `EINVAL`, and logical slots |
 | `read` | Zero-length success, nonblocking `EAGAIN`, EOF, byte count, exact bytes |
 | `write` | Zero-length success, `EPIPE`, `PIPE_BUF` atomicity, partial writes |
 | `close` | Endpoint lifetime transitions, `EBADF` for invalid slots |
-| `dup` | Success/error; verify duplicated endpoints keep the pipe alive |
+| `dup` | Success/error; shared description state and cleared destination `FD_CLOEXEC` |
+| `dup2` | Same-fd behavior, invalid source, occupied-destination replacement, cleared destination `FD_CLOEXEC`, normalized success |
+| `dup3` | Same-fd/invalid-flag `EINVAL`, replacement, optional destination `FD_CLOEXEC`, normalized success |
 | `poll` | Timeout-zero return count and `revents` (slot-based writer readiness, closed-peer events) |
-| `fcntl` | `F_SETPIPE_SZ` / `F_GETPIPE_SZ` controlled sizes, errno, rounding, busy shrink |
+| `fcntl` | `F_SETPIPE_SZ`/`F_GETPIPE_SZ`; normalized `F_GETFL`/`F_GETFD`; shared `F_SETFL(O_NONBLOCK)` and per-fd `F_SETFD(FD_CLOEXEC)` |
 | `ioctl(FIONREAD)` | Return/errno, exact unread-byte count |
 
 ## Cost, rollback, and limitations

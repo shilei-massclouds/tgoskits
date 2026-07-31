@@ -10,13 +10,20 @@ from corpus import CorpusProvenance
 from scenario import (
     Close,
     Dup,
+    Dup2,
+    Dup3,
     Fionread,
+    GetFdFlags,
     GetSize,
+    GetStatusFlags,
     MAX_IO_BYTES,
     MAX_LOGICAL_SLOTS,
     MAX_OPS_PER_SCENARIO,
     MAX_PIPE_SIZE,
     MAX_POLL_MASK,
+    O_CLOEXEC,
+    O_NONBLOCK,
+    PIPE2_ALLOWED_FLAGS,
     Pipe2,
     Poll,
     Read,
@@ -24,8 +31,10 @@ from scenario import (
     Scenario,
     ScenarioCodecError,
     ScenarioDocument,
+    SetFdFlags,
     ScenarioEntryLimitError,
     SetSize,
+    SetStatusFlags,
     Write,
     WriteNull,
     parse_document,
@@ -77,6 +86,14 @@ POLL_MASK_BOUNDARIES = (
 )
 BYTE_BOUNDARIES = (0, 1, 0x61, 0xFE, 0xFF, 0x100)
 SLOT_BOUNDARIES = (0, 1, MAX_LOGICAL_SLOTS - 1, MAX_LOGICAL_SLOTS)
+FLAG_BOUNDARIES = (
+    0,
+    1,
+    O_NONBLOCK,
+    O_CLOEXEC,
+    PIPE2_ALLOWED_FLAGS,
+    0x40000000,
+)
 
 FREE = 0
 READER = 1
@@ -312,6 +329,7 @@ def _parameter_locations(document):
         "byte": [],
         "pipe-size": [],
         "poll-mask": [],
+        "flags": [],
     }
     for scenario_index, scenario in enumerate(document.scenarios):
         for operation_index, operation in enumerate(scenario.operations):
@@ -324,6 +342,11 @@ def _parameter_locations(document):
                 locations["pipe-size"].append((scenario_index, operation_index))
             if isinstance(operation, Poll):
                 locations["poll-mask"].append((scenario_index, operation_index))
+            if isinstance(
+                operation,
+                (Pipe2, SetStatusFlags, SetFdFlags, Dup3),
+            ):
+                locations["flags"].append((scenario_index, operation_index))
     return locations
 
 
@@ -351,6 +374,15 @@ def _mutate_operation_parameter(rng, operation, family):
             MAX_PIPE_SIZE,
         )
         return replace(operation, size=value)
+    if family == "flags":
+        value = _mutated_number(
+            rng,
+            operation.flags,
+            FLAG_BOUNDARIES,
+            0,
+            2147483647,
+        )
+        return replace(operation, flags=value)
     value = _mutated_number(
         rng,
         operation.events,
@@ -365,7 +397,7 @@ def _replace_one_slot(rng, operation):
     fields = []
     if isinstance(operation, Pipe2):
         fields = ["read_slot", "write_slot"]
-    elif isinstance(operation, Dup):
+    elif isinstance(operation, (Dup, Dup2, Dup3)):
         fields = ["source_slot", "destination_slot"]
     else:
         fields = ["slot"]
@@ -405,11 +437,13 @@ def _repair_scenario(scenario: Scenario) -> Scenario:
             if len(free_slots) < 2:
                 continue
             read_slot, write_slot = free_slots[:2]
-            repaired.append(Pipe2(read_slot, write_slot))
-            slots[read_slot] = READER
-            slots[write_slot] = WRITER
-            logical_mapping[operation.read_slot] = read_slot
-            logical_mapping[operation.write_slot] = write_slot
+            repaired_flags = operation.flags
+            repaired.append(Pipe2(read_slot, write_slot, repaired_flags))
+            if repaired_flags & ~PIPE2_ALLOWED_FLAGS == 0:
+                slots[read_slot] = READER
+                slots[write_slot] = WRITER
+                logical_mapping[operation.read_slot] = read_slot
+                logical_mapping[operation.write_slot] = write_slot
             continue
         if isinstance(operation, Dup):
             source = _resolve_endpoint(
@@ -429,6 +463,33 @@ def _repair_scenario(scenario: Scenario) -> Scenario:
             slots[destination] = slots[source]
             logical_mapping[operation.destination_slot] = destination
             continue
+        if isinstance(operation, (Dup2, Dup3)):
+            source = _resolve_endpoint(
+                operation.source_slot,
+                (READER, WRITER),
+                logical_mapping,
+                slots,
+                repaired,
+            )
+            if source is None:
+                continue
+            destination = logical_mapping.get(
+                operation.destination_slot,
+                operation.destination_slot,
+            )
+            rewritten = replace(
+                operation,
+                source_slot=source,
+                destination_slot=destination,
+            )
+            repaired.append(rewritten)
+            if source != destination and (
+                isinstance(operation, Dup2)
+                or operation.flags & ~O_CLOEXEC == 0
+            ):
+                slots[destination] = slots[source]
+                logical_mapping[operation.destination_slot] = destination
+            continue
 
         required_states = _required_states(operation)
         slot = _resolve_endpoint(
@@ -441,6 +502,13 @@ def _repair_scenario(scenario: Scenario) -> Scenario:
         if slot is None or len(repaired) >= MAX_OPS_PER_SCENARIO:
             continue
         repaired_operation = replace(operation, slot=slot)
+        if (
+            isinstance(repaired_operation, (Read, Write))
+            and repaired_operation.length > 0
+        ):
+            repaired.append(SetStatusFlags(slot, O_NONBLOCK))
+            if len(repaired) >= MAX_OPS_PER_SCENARIO:
+                break
         repaired.append(repaired_operation)
         if isinstance(operation, Close):
             slots[slot] = FREE
@@ -469,7 +537,7 @@ def _resolve_endpoint(
     if len(free_slots) < 2:
         return None
     read_slot, write_slot = free_slots[:2]
-    repaired.append(Pipe2(read_slot, write_slot))
+    repaired.append(Pipe2(read_slot, write_slot, PIPE2_ALLOWED_FLAGS))
     slots[read_slot] = READER
     slots[write_slot] = WRITER
     resolved = read_slot if READER in required_states else write_slot
@@ -564,6 +632,7 @@ def _choose(rng, values):
 __all__ = [
     "BYTE_BOUNDARIES",
     "CandidateClassification",
+    "FLAG_BOUNDARIES",
     "LENGTH_BOUNDARIES",
     "MUTATION_KINDS",
     "MutationCandidate",

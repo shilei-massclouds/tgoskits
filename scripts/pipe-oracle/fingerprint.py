@@ -19,6 +19,12 @@ _OPERATION_KINDS = {
     "set-size": 9,
     "get-size": 10,
     "fionread": 11,
+    "get-status-flags": 12,
+    "set-status-flags": 13,
+    "get-fd-flags": 14,
+    "set-fd-flags": 15,
+    "dup2": 16,
+    "dup3": 17,
 }
 _DIFFERENCE_FIELDS = ("result", "errno", "value", "data_len", "data")
 _RESULT_CLASSES = {"error", "zero", "positive"}

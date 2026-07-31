@@ -314,6 +314,70 @@ class ExactAttributionRegressionTests(unittest.TestCase):
             ):
                 store.load_job(job.job_id)
 
+    def test_legacy_schema_v2_job_loads_with_pipe_only_target(self):
+        import attribution_schema
+
+        document = scenario.parse_document(
+            "version 1\nscenario legacy\npipe2 0 1\n"
+        )
+        entry = attribution.AttributionInput.from_document(
+            document,
+            corpus.CorpusProvenance.generated(),
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            store = attribution.AttributionStore(workspace)
+            with self._evidence(
+                workspace,
+                "legacy",
+                {"pipe-region"},
+                b"legacy elf",
+            ) as evidence:
+                job = store.create_job(
+                    "legacy-attribution",
+                    fuzz_seed=1,
+                    batch_index=0,
+                    entries=(entry,),
+                    baseline_regions=set(),
+                    target_regions={"pipe-region"},
+                    initial_evidence=evidence,
+                    duration_seconds=0.1,
+                )
+
+            metadata_path = job.path / "metadata.json"
+            metadata = json.loads(metadata_path.read_text())
+            metadata["schema_version"] = 2
+            metadata["generator_version"] = "2"
+            del metadata["target_set_id"]
+            metadata_path.write_text(json.dumps(metadata))
+            result_path = (
+                job.path / "replays/attempt-0001-batch/coverage.json"
+            )
+            result = json.loads(result_path.read_text())
+            result["schema_version"] = 2
+            del result["target_set_id"]
+            result_path.write_text(json.dumps(result))
+
+            loaded = attribution.AttributionStore(workspace).load_job(job.job_id)
+            self.assertEqual(
+                attribution_schema.job_target_set_id(loaded.metadata),
+                "pipe-v1",
+            )
+
+            result["schema_version"] = 3
+            result["target_set_id"] = "pipe-fd-v2"
+            result_path.write_text(json.dumps(result))
+            with self.assertRaisesRegex(Exception, "evidence schema mismatch"):
+                attribution.AttributionStore(workspace).load_job(job.job_id)
+            result["schema_version"] = 2
+            del result["target_set_id"]
+            result_path.write_text(json.dumps(result))
+
+            metadata["target_set_id"] = "pipe-fd-v2"
+            metadata_path.write_text(json.dumps(metadata))
+            with self.assertRaisesRegex(Exception, "metadata keys mismatch"):
+                attribution.AttributionStore(workspace).load_job(job.job_id)
+
     def test_job_preserves_host_oracle_executable_mode(self):
         document = scenario.parse_document(
             "version 1\nscenario only\npipe2 0 1\n"

@@ -18,14 +18,23 @@ import mutation
 from scenario import (
     Close,
     Dup,
+    Dup2,
+    Dup3,
     Fionread,
+    GetFdFlags,
     GetSize,
+    GetStatusFlags,
+    O_CLOEXEC,
+    O_NONBLOCK,
+    PIPE2_ALLOWED_FLAGS,
     Pipe2,
     Poll,
     Read,
     ReadNull,
     ScenarioDocument,
+    SetFdFlags,
     SetSize,
+    SetStatusFlags,
     Write,
     WriteNull,
     operation_name,
@@ -50,6 +59,12 @@ OPERATION_NAMES = (
     "set-size",
     "get-size",
     "fionread",
+    "get-status-flags",
+    "set-status-flags",
+    "get-fd-flags",
+    "set-fd-flags",
+    "dup2",
+    "dup3",
 )
 LENGTH_BUCKETS = (
     "0",
@@ -324,6 +339,7 @@ def _analyze_source(
                     POLL_MASK_BUCKETS,
                     distributions["poll_mask_buckets"],
                 ),
+                "flags": dict(sorted(distributions["flag_buckets"].items())),
             },
             "resource_categories": _complete_counts(
                 RESOURCE_CATEGORIES,
@@ -346,6 +362,7 @@ def _new_distributions():
         "length_buckets": Counter(),
         "pipe_size_buckets": Counter(),
         "poll_mask_buckets": Counter(),
+        "flag_buckets": Counter(),
         "resource_categories": Counter(),
         "endpoint_counts": defaultdict(Counter),
     }
@@ -373,6 +390,8 @@ def _record_parameters(operation, distributions):
         distributions["pipe_size_buckets"][_pipe_size_bucket(operation.size)] += 1
     elif isinstance(operation, Poll):
         distributions["poll_mask_buckets"][_poll_mask_bucket(operation.events)] += 1
+    elif isinstance(operation, (Pipe2, SetStatusFlags, SetFdFlags, Dup3)):
+        distributions["flag_buckets"][str(operation.flags)] += 1
 
 
 def _record_resource_category(operation, slots, distributions):
@@ -384,7 +403,11 @@ def _record_resource_category(operation, slots, distributions):
     if isinstance(operation, Pipe2):
         return
 
-    slot = operation.source_slot if isinstance(operation, Dup) else operation.slot
+    slot = (
+        operation.source_slot
+        if isinstance(operation, (Dup, Dup2, Dup3))
+        else operation.slot
+    )
     slot_state = slots[slot]
     if slot_state == FREE:
         categories["idle-slot"] += 1
@@ -405,11 +428,20 @@ def _record_resource_category(operation, slots, distributions):
 
 def _apply_resource_transition(operation, slots):
     if isinstance(operation, Pipe2):
-        slots[operation.read_slot] = READER
-        slots[operation.write_slot] = WRITER
-    elif isinstance(operation, Dup):
+        if operation.flags & ~PIPE2_ALLOWED_FLAGS == 0:
+            slots[operation.read_slot] = READER
+            slots[operation.write_slot] = WRITER
+    elif isinstance(operation, (Dup, Dup2, Dup3)):
         source_state = slots[operation.source_slot]
-        if source_state in (READER, WRITER):
+        succeeds = (
+            isinstance(operation, Dup)
+            or isinstance(operation, Dup2)
+            or (
+                operation.source_slot != operation.destination_slot
+                and operation.flags & ~O_CLOEXEC == 0
+            )
+        )
+        if source_state in (READER, WRITER) and succeeds:
             slots[operation.destination_slot] = source_state
     elif isinstance(operation, Close):
         if slots[operation.slot] in (READER, WRITER):

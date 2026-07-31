@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
 
 from common import CORPUS_DIR
+from coverage import TARGET_SET_ID
 from corpus import CorpusProvenance, CorpusStorageError, CorpusValidationError
 from generator import GENERATOR_VERSION
 from scenario import ScenarioDocument, parse_document, serialize_document
@@ -29,6 +30,7 @@ from attribution_schema import (
     batch_label,
     entry_label,
     is_digest,
+    job_target_set_id,
     read_json,
     representative_label,
     sha256_file,
@@ -124,7 +126,7 @@ def select_representatives(
 
 
 class AttributionStore:
-    """Owns resumable schema-v2 attribution jobs and their replay evidence."""
+    """Owns resumable attribution jobs and their replay evidence."""
 
     def __init__(
         self,
@@ -171,6 +173,7 @@ class AttributionStore:
         metadata = {
             "schema_version": ATTRIBUTION_SCHEMA_VERSION,
             "generator_version": self.generator_version,
+            "target_set_id": TARGET_SET_ID,
             "job_id": job_id,
             "state": "entry-replays",
             "run_recorded": False,
@@ -536,6 +539,14 @@ class AttributionStore:
             return destination
         elf_digest = sha256_file(evidence.starry_elf_path)
         self._ensure_elf(job_path, evidence.starry_elf_path, elf_digest)
+        metadata_path = job_path / METADATA_NAME
+        if metadata_path.exists():
+            job_metadata = read_json(metadata_path)
+            evidence_schema_version = job_metadata["schema_version"]
+            target_set_id = job_target_set_id(job_metadata)
+        else:
+            evidence_schema_version = ATTRIBUTION_SCHEMA_VERSION
+            target_set_id = TARGET_SET_ID
         temporary = Path(
             tempfile.mkdtemp(prefix=f".{label}.tmp-", dir=replays_dir)
         )
@@ -558,7 +569,7 @@ class AttributionStore:
                     }
                 )
             coverage = {
-                "schema_version": ATTRIBUTION_SCHEMA_VERSION,
+                "schema_version": evidence_schema_version,
                 "starry_elf_sha256": elf_digest,
                 "covered_regions": sorted(evidence.covered_regions),
                 "result_category": evidence.result_category,
@@ -566,6 +577,8 @@ class AttributionStore:
                 "trace_sha256": sha256_file(temporary / "linux.trace"),
                 "profraws": profraw_metadata,
             }
+            if evidence_schema_version == ATTRIBUTION_SCHEMA_VERSION:
+                coverage["target_set_id"] = target_set_id
             _write_json(temporary / "coverage.json", coverage)
             _sync_directory(profraw_dir)
             _sync_directory(temporary)

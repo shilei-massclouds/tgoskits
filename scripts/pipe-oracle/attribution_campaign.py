@@ -16,6 +16,7 @@ from attribution import (
     ReplayEvidence,
 )
 from corpus import CanonicalCorpus, CorpusStorageError, CorpusStore
+from attribution_schema import job_target_set_id
 from guest_result import GuestExecutionResult, normalize_guest_execution
 from scenario import combine_documents, serialize_document
 
@@ -27,7 +28,7 @@ class AttributionReplayRuntime:
         [Path, Path, Optional[Path]],
         Any,
     ]
-    extract_regions: Callable[[List[Path], Path], Set[str]]
+    extract_regions: Callable[[List[Path], Path, str], Set[str]]
     coverage_object: Callable[[Path], Path]
 
 
@@ -149,7 +150,11 @@ def _restart_job_if_elf_changed(
             )
             return
         attribution_store.persist_restart_evidence(job, evidence)
-        baseline = store.load_coverage_regions(evidence.starry_elf_path)
+        target_set_id = job_target_set_id(job.metadata)
+        baseline = store.load_coverage_regions(
+            evidence.starry_elf_path,
+            target_set_id,
+        )
         target = set(evidence.covered_regions) - baseline
         restarted_job.append(
             attribution_store.restart_for_elf(
@@ -169,6 +174,7 @@ def _restart_job_if_elf_changed(
         None,
         persist_restart,
         runtime,
+        job_target_set_id(job.metadata),
     )
     if not replay.passed:
         raise AttributionInstability(replay.reason or "ELF restart replay failed")
@@ -229,6 +235,7 @@ def _replay_unfinished_entries(
             _saved_job_elf(job),
             persist_entry,
             runtime,
+            job_target_set_id(job.metadata),
         )
         if not replay.passed:
             raise AttributionInstability(
@@ -285,6 +292,7 @@ def _replay_representatives(
         _saved_job_elf(job),
         persist_representative,
         runtime,
+        job_target_set_id(job.metadata),
     )
     if not replay.passed:
         raise AttributionInstability(replay.reason or "representative replay failed")
@@ -299,6 +307,7 @@ def _run_attribution_replay(
     pinned_starry_elf: Optional[Path],
     persist_evidence: Callable[[ReplayEvidence, float], None],
     runtime: AttributionReplayRuntime,
+    target_set_id: str,
 ) -> AttributionReplayResult:
     started = time.monotonic()
     documents = [entry.document for entry in entries]
@@ -349,6 +358,7 @@ def _run_attribution_replay(
                     covered_regions = runtime.extract_regions(
                         profraws,
                         active_starry_elf,
+                        target_set_id,
                     )
                 except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
                     category = "coverage-failure"
@@ -416,7 +426,11 @@ def _finalize_attribution_job(
     committed_regions = set(job.metadata["baseline_regions"]) | set(
         job.metadata["target_regions"]
     )
-    store.save_coverage_regions(saved_elf, committed_regions)
+    store.save_coverage_regions(
+        saved_elf,
+        committed_regions,
+        job_target_set_id(job.metadata),
+    )
 
 
 def _saved_job_elf(job: AttributionJob) -> Path:

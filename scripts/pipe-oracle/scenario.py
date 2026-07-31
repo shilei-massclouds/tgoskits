@@ -4,23 +4,48 @@ import hashlib
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Iterable, Tuple, Union
+from typing import Dict, Iterable, Optional, Tuple, Union
 
 
-CORPUS_VERSION = 1
+LEGACY_CORPUS_VERSION = 1
+CORPUS_VERSION = 2
 MAX_LOGICAL_SLOTS = 16
 MAX_IO_BYTES = 8192
 MAX_POLL_MASK = 32767
 MAX_PIPE_SIZE = 2147483647
+MAX_FLAG_VALUE = 2147483647
 MAX_OPS_PER_SCENARIO = 32
 MAX_SCENARIOS_PER_ENTRY = 4
 MAX_ENTRY_BYTES = 4096
+
+O_NONBLOCK = 2048
+O_CLOEXEC = 524288
+FD_CLOEXEC = 1
+PIPE2_ALLOWED_FLAGS = O_NONBLOCK | O_CLOEXEC
+DUP3_ALLOWED_FLAGS = O_CLOEXEC
+LEGACY_PIPE2_FLAGS = PIPE2_ALLOWED_FLAGS
+UNKNOWN_FLAG = 0x40000000
+PIPE2_FLAG_VALUES = (
+    0,
+    O_NONBLOCK,
+    O_CLOEXEC,
+    PIPE2_ALLOWED_FLAGS,
+    UNKNOWN_FLAG,
+)
+DUP3_FLAG_VALUES = (
+    0,
+    O_CLOEXEC,
+    O_NONBLOCK,
+    O_CLOEXEC | O_NONBLOCK,
+    UNKNOWN_FLAG,
+)
 
 
 @dataclass(frozen=True)
 class Pipe2:
     read_slot: int
     write_slot: int
+    flags: int = LEGACY_PIPE2_FLAGS
 
 
 @dataclass(frozen=True)
@@ -50,6 +75,41 @@ class WriteNull:
 class Dup:
     source_slot: int
     destination_slot: int
+
+
+@dataclass(frozen=True)
+class GetStatusFlags:
+    slot: int
+
+
+@dataclass(frozen=True)
+class SetStatusFlags:
+    slot: int
+    flags: int
+
+
+@dataclass(frozen=True)
+class GetFdFlags:
+    slot: int
+
+
+@dataclass(frozen=True)
+class SetFdFlags:
+    slot: int
+    flags: int
+
+
+@dataclass(frozen=True)
+class Dup2:
+    source_slot: int
+    destination_slot: int
+
+
+@dataclass(frozen=True)
+class Dup3:
+    source_slot: int
+    destination_slot: int
+    flags: int
 
 
 @dataclass(frozen=True)
@@ -86,6 +146,12 @@ Operation = Union[
     Write,
     WriteNull,
     Dup,
+    GetStatusFlags,
+    SetStatusFlags,
+    GetFdFlags,
+    SetFdFlags,
+    Dup2,
+    Dup3,
     Close,
     Poll,
     SetSize,
@@ -105,9 +171,15 @@ class Scenario:
 @dataclass(frozen=True)
 class ScenarioDocument:
     scenarios: Tuple[Scenario, ...]
+    version: int
 
-    def __init__(self, scenarios: Iterable[Scenario]):
+    def __init__(
+        self,
+        scenarios: Iterable[Scenario],
+        version: int = CORPUS_VERSION,
+    ):
         object.__setattr__(self, "scenarios", tuple(scenarios))
+        object.__setattr__(self, "version", version)
 
 
 class CodecErrorCategory(str, Enum):
@@ -122,6 +194,7 @@ class CodecErrorCategory(str, Enum):
     INVALID_NUMBER = "invalid-number"
     OUT_OF_RANGE = "out-of-range"
     RESOURCE_CONFLICT = "resource-conflict"
+    BLOCKING_IO = "blocking-io"
     INCOMPLETE_DOCUMENT = "incomplete-document"
 
 
@@ -165,8 +238,9 @@ def parse_document(encoded: Union[str, bytes]) -> ScenarioDocument:
     text = _decode_text(encoded)
     scenarios = []
     current_operations = None
-    slot_states = None
+    resource_state = None
     saw_version = False
+    version = None
     operation_count = 0
 
     for line_number, raw_line in enumerate(text.splitlines(), start=1):
@@ -184,7 +258,7 @@ def parse_document(encoded: Union[str, bytes]) -> ScenarioDocument:
             if len(fields) != 2:
                 _raise(line_number, CodecErrorCategory.INVALID_VERSION, line)
             version = _parse_integer(fields[1], line_number)
-            if version != CORPUS_VERSION:
+            if version not in (LEGACY_CORPUS_VERSION, CORPUS_VERSION):
                 _raise(line_number, CodecErrorCategory.INVALID_VERSION, line)
             saw_version = True
             continue
@@ -198,18 +272,18 @@ def parse_document(encoded: Union[str, bytes]) -> ScenarioDocument:
             if current_operations is not None:
                 scenarios.append(Scenario(current_operations))
             current_operations = []
-            slot_states = [None] * MAX_LOGICAL_SLOTS
+            resource_state = _ResourceState()
             continue
 
-        if current_operations is None or slot_states is None:
+        if current_operations is None or resource_state is None:
             _raise(
                 line_number,
                 CodecErrorCategory.OPERATION_BEFORE_SCENARIO,
                 line,
             )
 
-        operation = _parse_operation(fields, line_number)
-        _apply_codec_resource_transition(operation, slot_states, line_number)
+        operation = _parse_operation(fields, line_number, version)
+        resource_state.apply(operation, line_number)
         current_operations.append(operation)
         operation_count += 1
 
@@ -221,11 +295,11 @@ def parse_document(encoded: Union[str, bytes]) -> ScenarioDocument:
             CodecErrorCategory.INCOMPLETE_DOCUMENT,
             "document requires a version, scenario, and operation",
         )
-    return ScenarioDocument(scenarios)
+    return ScenarioDocument(scenarios, version)
 
 
 def serialize_document(document: ScenarioDocument) -> str:
-    """Return canonical version-1 text after validating harness parseability."""
+    """Return canonical versioned text after validating harness parseability."""
 
     text = serialize_unchecked_document(document)
     parsed = parse_document(text)
@@ -237,10 +311,13 @@ def serialize_document(document: ScenarioDocument) -> str:
 def serialize_unchecked_document(document: ScenarioDocument) -> str:
     """Serialize typed operations without validating ranges or resource conflicts."""
 
-    lines = [f"version {CORPUS_VERSION}"]
+    lines = [f"version {document.version}"]
     for index, scenario in enumerate(document.scenarios, start=1):
         lines.append(f"scenario generated-{index:04d}")
-        lines.extend(format_operation(operation) for operation in scenario.operations)
+        lines.extend(
+            format_operation(operation, document.version)
+            for operation in scenario.operations
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -275,9 +352,12 @@ def validate_entry_limits(document: ScenarioDocument) -> None:
 
 def combine_documents(documents: Iterable[ScenarioDocument]) -> ScenarioDocument:
     return ScenarioDocument(
-        scenario
-        for document in documents
-        for scenario in document.scenarios
+        (
+            scenario
+            for document in documents
+            for scenario in document.scenarios
+        ),
+        version=CORPUS_VERSION,
     )
 
 
@@ -285,9 +365,11 @@ def operation_name(operation: Operation) -> str:
     return format_operation(operation).split(maxsplit=1)[0]
 
 
-def format_operation(operation: Operation) -> str:
+def format_operation(operation: Operation, version: int = CORPUS_VERSION) -> str:
     if isinstance(operation, Pipe2):
-        return f"pipe2 {operation.read_slot} {operation.write_slot}"
+        if version == LEGACY_CORPUS_VERSION:
+            return f"pipe2 {operation.read_slot} {operation.write_slot}"
+        return f"pipe2 {operation.read_slot} {operation.write_slot} {operation.flags}"
     if isinstance(operation, Read):
         return f"read {operation.slot} {operation.length}"
     if isinstance(operation, ReadNull):
@@ -298,6 +380,21 @@ def format_operation(operation: Operation) -> str:
         return f"write-null {operation.slot}"
     if isinstance(operation, Dup):
         return f"dup {operation.source_slot} {operation.destination_slot}"
+    if isinstance(operation, GetStatusFlags):
+        return f"get-status-flags {operation.slot}"
+    if isinstance(operation, SetStatusFlags):
+        return f"set-status-flags {operation.slot} {operation.flags}"
+    if isinstance(operation, GetFdFlags):
+        return f"get-fd-flags {operation.slot}"
+    if isinstance(operation, SetFdFlags):
+        return f"set-fd-flags {operation.slot} {operation.flags}"
+    if isinstance(operation, Dup2):
+        return f"dup2 {operation.source_slot} {operation.destination_slot}"
+    if isinstance(operation, Dup3):
+        return (
+            f"dup3 {operation.source_slot} {operation.destination_slot} "
+            f"{operation.flags}"
+        )
     if isinstance(operation, Close):
         return f"close {operation.slot}"
     if isinstance(operation, Poll):
@@ -325,10 +422,10 @@ def _decode_text(encoded: Union[str, bytes]) -> str:
         ) from error
 
 
-def _parse_operation(fields, line_number: int) -> Operation:
+def _parse_operation(fields, line_number: int, version: int) -> Operation:
     keyword = fields[0]
     arities = {
-        "pipe2": 3,
+        "pipe2": 3 if version == LEGACY_CORPUS_VERSION else 4,
         "read": 3,
         "read-null": 2,
         "write": 4,
@@ -340,6 +437,17 @@ def _parse_operation(fields, line_number: int) -> Operation:
         "get-size": 2,
         "fionread": 2,
     }
+    if version == CORPUS_VERSION:
+        arities.update(
+            {
+                "get-status-flags": 2,
+                "set-status-flags": 3,
+                "get-fd-flags": 2,
+                "set-fd-flags": 3,
+                "dup2": 3,
+                "dup3": 4,
+            }
+        )
     if keyword not in arities:
         _raise(line_number, CodecErrorCategory.UNKNOWN_OPERATION, keyword)
     if len(fields) != arities[keyword]:
@@ -347,7 +455,21 @@ def _parse_operation(fields, line_number: int) -> Operation:
 
     values = [_parse_integer(field, line_number) for field in fields[1:]]
     if keyword == "pipe2":
-        return Pipe2(_slot(values[0], line_number), _slot(values[1], line_number))
+        flags = (
+            LEGACY_PIPE2_FLAGS
+            if version == LEGACY_CORPUS_VERSION
+            else _enum_flags(
+                values[2],
+                PIPE2_FLAG_VALUES,
+                line_number,
+                "pipe2 flags",
+            )
+        )
+        return Pipe2(
+            _slot(values[0], line_number),
+            _slot(values[1], line_number),
+            flags,
+        )
     if keyword == "read":
         return Read(
             _slot(values[0], line_number),
@@ -365,6 +487,33 @@ def _parse_operation(fields, line_number: int) -> Operation:
         return WriteNull(_slot(values[0], line_number))
     if keyword == "dup":
         return Dup(_slot(values[0], line_number), _slot(values[1], line_number))
+    if keyword == "get-status-flags":
+        return GetStatusFlags(_slot(values[0], line_number))
+    if keyword == "set-status-flags":
+        return SetStatusFlags(
+            _slot(values[0], line_number),
+            _flags(values[1], line_number, "status flags"),
+        )
+    if keyword == "get-fd-flags":
+        return GetFdFlags(_slot(values[0], line_number))
+    if keyword == "set-fd-flags":
+        return SetFdFlags(
+            _slot(values[0], line_number),
+            _flags(values[1], line_number, "fd flags"),
+        )
+    if keyword == "dup2":
+        return Dup2(_slot(values[0], line_number), _slot(values[1], line_number))
+    if keyword == "dup3":
+        return Dup3(
+            _slot(values[0], line_number),
+            _slot(values[1], line_number),
+            _enum_flags(
+                values[2],
+                DUP3_FLAG_VALUES,
+                line_number,
+                "dup3 flags",
+            ),
+        )
     if keyword == "close":
         return Close(_slot(values[0], line_number))
     if keyword == "poll":
@@ -397,6 +546,26 @@ def _slot(value: int, line_number: int) -> int:
     return _range(value, 0, MAX_LOGICAL_SLOTS - 1, line_number, "logical slot")
 
 
+def _flags(value: int, line_number: int, name: str) -> int:
+    return _range(value, 0, MAX_FLAG_VALUE, line_number, name)
+
+
+def _enum_flags(
+    value: int,
+    supported_values: Tuple[int, ...],
+    line_number: int,
+    name: str,
+) -> int:
+    _flags(value, line_number, name)
+    if value not in supported_values:
+        _raise(
+            line_number,
+            CodecErrorCategory.OUT_OF_RANGE,
+            f"unsupported {name} {value}",
+        )
+    return value
+
+
 def _range(value: int, minimum: int, maximum: int, line_number: int, name: str) -> int:
     if value < minimum or value > maximum:
         _raise(
@@ -407,46 +576,149 @@ def _range(value: int, minimum: int, maximum: int, line_number: int, name: str) 
     return value
 
 
-def _apply_codec_resource_transition(
-    operation: Operation,
-    slot_states,
-    line_number: int,
-) -> None:
-    if isinstance(operation, Pipe2):
+@dataclass(frozen=True)
+class _FdResource:
+    endpoint: str
+    description_id: int
+    close_on_exec: bool
+
+
+class _ResourceState:
+    """Track statically knowable fd and open-file-description state."""
+
+    def __init__(self):
+        self.slots: list[Optional[_FdResource]] = [None] * MAX_LOGICAL_SLOTS
+        self.nonblocking: Dict[int, bool] = {}
+        self.next_description_id = 0
+
+    def apply(self, operation: Operation, line_number: int) -> None:
+        if isinstance(operation, Pipe2):
+            self._apply_pipe2(operation, line_number)
+        elif isinstance(operation, Dup):
+            self._apply_dup(operation, line_number)
+        elif isinstance(operation, Dup2):
+            self._apply_dup2(operation)
+        elif isinstance(operation, Dup3):
+            self._apply_dup3(operation)
+        elif isinstance(operation, SetStatusFlags):
+            resource = self.slots[operation.slot]
+            if resource is not None:
+                self.nonblocking[resource.description_id] = bool(
+                    operation.flags & O_NONBLOCK
+                )
+        elif isinstance(operation, SetFdFlags):
+            resource = self.slots[operation.slot]
+            if resource is not None:
+                self.slots[operation.slot] = _FdResource(
+                    resource.endpoint,
+                    resource.description_id,
+                    bool(operation.flags & FD_CLOEXEC),
+                )
+        elif isinstance(operation, Close):
+            if self.slots[operation.slot] is not None:
+                self.slots[operation.slot] = None
+        elif isinstance(operation, (Read, Write)):
+            self._validate_nonblocking_io(operation, line_number)
+
+    def _apply_pipe2(self, operation: Pipe2, line_number: int) -> None:
+        if operation.flags & ~PIPE2_ALLOWED_FLAGS:
+            return
         if operation.read_slot == operation.write_slot:
             _raise(
                 line_number,
                 CodecErrorCategory.RESOURCE_CONFLICT,
                 "pipe2 endpoints use the same slot",
             )
-        if slot_states[operation.read_slot] is not None or slot_states[
-            operation.write_slot
-        ] is not None:
+        if (
+            self.slots[operation.read_slot] is not None
+            or self.slots[operation.write_slot] is not None
+        ):
             _raise(
                 line_number,
                 CodecErrorCategory.RESOURCE_CONFLICT,
                 "pipe2 destination slot is occupied",
             )
-        slot_states[operation.read_slot] = "reader"
-        slot_states[operation.write_slot] = "writer"
-    elif isinstance(operation, Dup):
+        close_on_exec = bool(operation.flags & O_CLOEXEC)
+        nonblocking = bool(operation.flags & O_NONBLOCK)
+        self.slots[operation.read_slot] = self._new_resource(
+            "reader", nonblocking, close_on_exec
+        )
+        self.slots[operation.write_slot] = self._new_resource(
+            "writer", nonblocking, close_on_exec
+        )
+
+    def _apply_dup(self, operation: Dup, line_number: int) -> None:
         if operation.source_slot == operation.destination_slot:
             _raise(
                 line_number,
                 CodecErrorCategory.RESOURCE_CONFLICT,
                 "dup source and destination use the same slot",
             )
-        if slot_states[operation.destination_slot] is not None:
+        if self.slots[operation.destination_slot] is not None:
             _raise(
                 line_number,
                 CodecErrorCategory.RESOURCE_CONFLICT,
                 "dup destination slot is occupied",
             )
-        source_type = slot_states[operation.source_slot]
-        if source_type is not None:
-            slot_states[operation.destination_slot] = source_type
-    elif isinstance(operation, Close):
-        slot_states[operation.slot] = None
+        source = self.slots[operation.source_slot]
+        if source is not None:
+            self.slots[operation.destination_slot] = _FdResource(
+                source.endpoint,
+                source.description_id,
+                False,
+            )
+
+    def _apply_dup2(self, operation: Dup2) -> None:
+        source = self.slots[operation.source_slot]
+        if source is None or operation.source_slot == operation.destination_slot:
+            return
+        self.slots[operation.destination_slot] = _FdResource(
+            source.endpoint,
+            source.description_id,
+            False,
+        )
+
+    def _apply_dup3(self, operation: Dup3) -> None:
+        source = self.slots[operation.source_slot]
+        if (
+            source is None
+            or operation.source_slot == operation.destination_slot
+            or operation.flags & ~DUP3_ALLOWED_FLAGS
+        ):
+            return
+        self.slots[operation.destination_slot] = _FdResource(
+            source.endpoint,
+            source.description_id,
+            bool(operation.flags & O_CLOEXEC),
+        )
+
+    def _validate_nonblocking_io(
+        self,
+        operation: Union[Read, Write],
+        line_number: int,
+    ) -> None:
+        if operation.length == 0:
+            return
+        resource = self.slots[operation.slot]
+        if resource is None:
+            return
+        if not self.nonblocking[resource.description_id]:
+            _raise(
+                line_number,
+                CodecErrorCategory.BLOCKING_IO,
+                "positive-length I/O requires statically enabled O_NONBLOCK",
+            )
+
+    def _new_resource(
+        self,
+        endpoint: str,
+        nonblocking: bool,
+        close_on_exec: bool,
+    ) -> _FdResource:
+        description_id = self.next_description_id
+        self.next_description_id += 1
+        self.nonblocking[description_id] = nonblocking
+        return _FdResource(endpoint, description_id, close_on_exec)
 
 
 def _raise(line_number: int, category: CodecErrorCategory, detail: str):

@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import ctypes
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -68,6 +69,22 @@ class PipeOracleRegressionTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("usage:", result.stdout)
+
+    def test_host_oracle_cache_is_checked_by_cmake_before_reuse(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            oracle = workspace / "target/pipe-oracle-host/pipe-linux-oracle"
+            oracle.parent.mkdir(parents=True)
+            oracle.write_bytes(b"stale oracle")
+            with mock.patch.object(fuzz.subprocess, "run") as run:
+                resolved = fuzz._find_or_build_host_oracle(workspace)
+
+        self.assertEqual(resolved, oracle)
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(
+            run.call_args_list[1].args[0][-2:],
+            ["--target", "pipe-linux-oracle"],
+        )
 
     def test_legacy_seed_text_and_digest_goldens_are_unchanged(self):
         goldens = {
@@ -185,6 +202,194 @@ class PipeOracleRegressionTests(unittest.TestCase):
         self.assertNotIn("0x", canonical)
         self.assertTrue(canonical.endswith("\n"))
 
+    def test_v2_fd_and_flag_operations_round_trip_and_run_on_host(self):
+        encoded = (
+            "version 2\n"
+            "scenario fd-flags\n"
+            "pipe2 0 1 526336\n"
+            "get-status-flags 0\n"
+            "set-status-flags 0 0\n"
+            "set-status-flags 1 2048\n"
+            "get-status-flags 0\n"
+            "get-fd-flags 0\n"
+            "set-fd-flags 0 0\n"
+            "dup2 0 2\n"
+            "get-fd-flags 2\n"
+            "dup3 1 3 524288\n"
+            "get-fd-flags 3\n"
+        )
+
+        document = scenario.parse_document(encoded)
+        canonical = scenario.serialize_document(document)
+
+        self.assertEqual(
+            canonical,
+            encoded.replace("scenario fd-flags", "scenario generated-0001"),
+        )
+        self.assertEqual(scenario.parse_document(canonical), document)
+        self._assert_host_record_compare(canonical)
+
+    def test_v2_rejects_blocking_io_but_keeps_safe_error_and_zero_length_paths(self):
+        unsafe = (
+            "version 2\nscenario blocking\npipe2 0 1 0\nread 0 1\n"
+        )
+        with self.assertRaises(scenario.ScenarioCodecError) as caught:
+            scenario.parse_document(unsafe)
+        self.assertEqual(
+            caught.exception.category,
+            scenario.CodecErrorCategory.BLOCKING_IO,
+        )
+
+        safe = (
+            "version 2\n"
+            "scenario safe\n"
+            "pipe2 0 1 0\n"
+            "read 0 0\n"
+            "read 2 8192\n"
+            "set-status-flags 0 2048\n"
+            "read 0 1\n"
+        )
+        document = scenario.parse_document(safe)
+        self.assertEqual(scenario.parse_document(scenario.serialize_document(document)), document)
+
+    def test_host_harness_rejects_positive_blocking_io_before_execution(self):
+        encoded = (
+            "version 2\n"
+            "scenario blocking-write\n"
+            "pipe2 0 1 0\n"
+            "write 1 1 65\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            ops = Path(temporary_directory) / "pipe.ops"
+            trace = Path(temporary_directory) / "linux.trace"
+            ops.write_text(encoded)
+            result = subprocess.run(
+                [str(self.oracle), "--record", str(ops), str(trace)],
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid operation", result.stderr)
+
+    def test_host_success_marker_starts_on_an_isolated_line(self):
+        encoded = (
+            "version 2\n"
+            "scenario unknown-flags\n"
+            "pipe2 0 1 1073741824\n"
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            ops = Path(temporary_directory) / "pipe.ops"
+            trace = Path(temporary_directory) / "linux.trace"
+            ops.write_text(encoded)
+            subprocess.run(
+                [str(self.oracle), "--record", str(ops), str(trace)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            compared = subprocess.run(
+                [str(self.oracle), "--compare", str(ops), str(trace)],
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(compared.returncode, 0, compared.stderr)
+        self.assertIn("\n\nSTARRY_PIPE_LINUX_ORACLE_PASSED:", compared.stdout)
+
+    def test_v2_resource_state_shares_status_flags_but_rolls_back_failed_updates(self):
+        shared_alias = (
+            "version 2\n"
+            "scenario shared\n"
+            "pipe2 0 1 0\n"
+            "dup 0 2\n"
+            "set-status-flags 2 2048\n"
+            "read 0 1\n"
+        )
+        scenario.parse_document(shared_alias)
+
+        failed_updates = (
+            (
+                "version 2\nscenario failed-fcntl\npipe2 0 1 0\n"
+                "set-status-flags 2 2048\nread 0 1\n"
+            ),
+            (
+                "version 2\nscenario failed-dup2\npipe2 0 1 2048\n"
+                "pipe2 2 3 0\ndup2 4 2\nread 2 1\n"
+            ),
+            (
+                "version 2\nscenario failed-dup3\npipe2 0 1 2048\n"
+                "pipe2 2 3 0\ndup3 0 2 2048\nread 2 1\n"
+            ),
+        )
+        for encoded in failed_updates:
+            with self.subTest(encoded=encoded.splitlines()[1]):
+                with self.assertRaises(scenario.ScenarioCodecError) as caught:
+                    scenario.parse_document(encoded)
+                self.assertEqual(
+                    caught.exception.category,
+                    scenario.CodecErrorCategory.BLOCKING_IO,
+                )
+
+    def test_v1_and_v2_reject_each_others_pipe2_shape_and_v1_rejects_fd_ops(self):
+        invalid_documents = (
+            "version 1\nscenario x\npipe2 0 1 526336\n",
+            "version 2\nscenario x\npipe2 0 1\n",
+            "version 1\nscenario x\nget-fd-flags 0\n",
+            "version 2\nscenario x\npipe2 0 1 16384\n",
+            "version 2\nscenario x\ndup3 0 1 3\n",
+        )
+        for encoded in invalid_documents:
+            with self.subTest(encoded=encoded):
+                with self.assertRaises(scenario.ScenarioCodecError):
+                    scenario.parse_document(encoded)
+
+    def test_host_normalizes_flags_and_dup_results_with_linux_errno(self):
+        encoded = (
+            "version 2\n"
+            "scenario observable\n"
+            "pipe2 0 1 526336\n"
+            "get-status-flags 0\n"
+            "dup 0 2\n"
+            "set-status-flags 2 0\n"
+            "get-status-flags 0\n"
+            "get-fd-flags 0\n"
+            "set-fd-flags 0 0\n"
+            "set-fd-flags 2 1\n"
+            "get-fd-flags 0\n"
+            "get-fd-flags 2\n"
+            "dup2 1 3\n"
+            "get-fd-flags 3\n"
+            "dup3 1 4 524288\n"
+            "get-fd-flags 4\n"
+            "dup2 4 4\n"
+            "get-fd-flags 4\n"
+            "dup3 4 4 0\n"
+            "dup3 1 5 2048\n"
+            "dup2 6 5\n"
+            "get-fd-flags 6\n"
+            "pipe2 7 8 1073741824\n"
+        )
+        records = self._record_host_records(encoded)
+
+        self.assertEqual(
+            [records[index].kind for index in (1, 3, 5, 6, 10, 12)],
+            [12, 13, 14, 15, 16, 17],
+        )
+        self.assertEqual([records[index].value for index in (1, 4)], [2048, 0])
+        self.assertEqual([records[index].value for index in (8, 9)], [0, 1])
+        self.assertEqual(records[10].result, 0)
+        self.assertEqual(records[11].value, 0)
+        self.assertEqual(records[12].result, 0)
+        self.assertEqual(records[13].value, 1)
+        self.assertEqual(records[14].result, 0)
+        self.assertEqual(records[15].value, 1)
+        self.assertEqual((records[16].result, records[16].error), (-1, 22))
+        self.assertEqual((records[17].result, records[17].error), (-1, 22))
+        self.assertEqual((records[18].result, records[18].error), (-1, 9))
+        self.assertEqual((records[19].result, records[19].error), (-1, 9))
+        self.assertEqual((records[20].result, records[20].error), (-1, 22))
+
     def test_scenario_names_do_not_change_semantic_ir_or_digest(self):
         first = scenario.parse_document(
             "version 1\nscenario first\npipe2 0 1\n"
@@ -209,7 +414,7 @@ class PipeOracleRegressionTests(unittest.TestCase):
                 2,
             ),
             (
-                "version 2\nscenario x\npipe2 0 1\n",
+                "version 3\nscenario x\npipe2 0 1\n",
                 scenario.CodecErrorCategory.INVALID_VERSION,
                 1,
             ),
@@ -300,6 +505,70 @@ class PipeOracleRegressionTests(unittest.TestCase):
         self.assertNotEqual(compared.returncode, 0)
         self.assertIn("difference_mask=0x00000008", compared.stderr)
 
+    def test_compare_fails_closed_on_truncated_trailing_and_unknown_traces(self):
+        corpus_text = "version 2\nscenario x\npipe2 0 1 526336\n"
+        mutations = {
+            "truncated": lambda encoded: encoded[:-1],
+            "trailing": lambda encoded: encoded + b"x",
+            "unknown-version": lambda encoded: (
+                encoded[:8] + (99).to_bytes(4, "little") + encoded[12:]
+            ),
+        }
+        for name, mutate_trace in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary_directory:
+                temporary = Path(temporary_directory)
+                ops = temporary / "pipe.ops"
+                trace = temporary / "linux.trace"
+                ops.write_text(corpus_text)
+                recorded = subprocess.run(
+                    [str(self.oracle), "--record", str(ops), str(trace)],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(recorded.returncode, 0, recorded.stderr)
+                trace.write_bytes(mutate_trace(trace.read_bytes()))
+
+                compared = subprocess.run(
+                    [str(self.oracle), "--compare", str(ops), str(trace)],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(compared.returncode, 0)
+                self.assertIn("STARRY_PIPE_LINUX_ORACLE_FAILED", compared.stderr)
+
+    def test_v1_corpus_keeps_legacy_digest_and_accepts_a_v1_trace_header(self):
+        corpus_text = "version 1\nscenario legacy\npipe2 0 1\nget-fd-flags 0\n"
+        with self.assertRaises(scenario.ScenarioCodecError):
+            scenario.parse_document(corpus_text)
+
+        corpus_text = "version 1\nscenario legacy\npipe2 0 1\nget-size 0\n"
+        document = scenario.parse_document(corpus_text)
+        expected_digest = scenario.canonical_digest(document)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary = Path(temporary_directory)
+            ops = temporary / "pipe.ops"
+            trace = temporary / "linux.trace"
+            ops.write_text(scenario.serialize_document(document))
+            recorded = subprocess.run(
+                [str(self.oracle), "--record", str(ops), str(trace)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(recorded.returncode, 0, recorded.stderr)
+            encoded = trace.read_bytes()
+            trace.write_bytes(encoded[:8] + (1).to_bytes(4, "little") + encoded[12:])
+            compared = subprocess.run(
+                [str(self.oracle), "--compare", str(ops), str(trace)],
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(
+            expected_digest,
+            hashlib.sha256(scenario.serialize_document(document).encode()).hexdigest(),
+        )
+        self.assertEqual(compared.returncode, 0, compared.stderr)
+
     def test_multi_entry_batch_is_one_canonical_corpus_accepted_by_the_oracle(self):
         documents = [
             generator.legacy_document_from_input(raw_input)
@@ -307,7 +576,7 @@ class PipeOracleRegressionTests(unittest.TestCase):
         ]
         corpus = scenario.serialize_document(scenario.combine_documents(documents))
 
-        self.assertEqual(corpus.count("version 1\n"), 1)
+        self.assertEqual(corpus.count("version 2\n"), 1)
         scenario_names = [
             line.split(maxsplit=1)[1]
             for line in corpus.splitlines()
@@ -372,7 +641,7 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
         compact = json.dumps(selected, separators=(",", ":"))
         self.assertEqual(
             hashlib.sha256(compact.encode()).hexdigest(),
-            "3baaa17f4f8f473914151a5f4a4e948fa18846816164a76b0e411c4431decd13",
+            "205e6e546ab50dd12ac8e4b757a033e41375c846e0285e55fbb27afa1ad0d328",
         )
 
     def test_every_structural_mutation_changes_digest_and_stays_within_limits(self):
@@ -496,7 +765,8 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
             store = corpus.CorpusStore(Path(temporary_directory))
             run_path = store.save_run("run-0001", metadata)
             saved = json.loads((run_path / "metadata.json").read_text())
-        self.assertEqual(saved["schema_version"], 3)
+        self.assertEqual(saved["schema_version"], 4)
+        self.assertEqual(saved["target_set_id"], "pipe-fd-v2")
         self.assertEqual(saved["generator_version"], generator.GENERATOR_VERSION)
         self.assertEqual(saved["result"], "passed")
 
@@ -646,6 +916,64 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
             self.assertGreater(campaign["parameter_buckets"]["pipe_size"][bucket], 0)
         for bucket in ("0", "1", "4096", "8192", "16384", "32767"):
             self.assertGreater(campaign["parameter_buckets"]["poll_mask"][bucket], 0)
+
+    def test_generator_deterministically_reaches_pipe_and_dup_flag_boundaries(self):
+        first_rng = generator.CampaignRng(42)
+        second_rng = generator.CampaignRng(42)
+        first = [generator.generate_document(first_rng) for _ in range(512)]
+        second = [generator.generate_document(second_rng) for _ in range(512)]
+
+        self.assertEqual(
+            [scenario.serialize_document(document) for document in first],
+            [scenario.serialize_document(document) for document in second],
+        )
+        operations = [
+            operation
+            for document in first
+            for item in document.scenarios
+            for operation in item.operations
+        ]
+        self.assertEqual(
+            {operation.flags for operation in operations if isinstance(operation, scenario.Pipe2)},
+            set(scenario.PIPE2_FLAG_VALUES),
+        )
+        self.assertEqual(
+            {operation.flags for operation in operations if isinstance(operation, scenario.Dup3)},
+            set(scenario.DUP3_FLAG_VALUES),
+        )
+        self.assertEqual(
+            {
+                scenario.operation_name(operation)
+                for operation in operations
+            },
+            set(analyze.OPERATION_NAMES),
+        )
+
+    def test_mutation_repair_upgrades_to_v2_and_synthesizes_only_nonblocking_setup(self):
+        unsafe_document = scenario.ScenarioDocument(
+            [
+                scenario.Scenario(
+                    [
+                        scenario.Pipe2(0, 1, 0),
+                        scenario.Read(0, 8),
+                    ]
+                )
+            ]
+        )
+
+        repaired = mutation.repair_dependencies(unsafe_document)
+        encoded = scenario.serialize_document(repaired)
+        operations = repaired.scenarios[0].operations
+
+        self.assertTrue(encoded.startswith("version 2\n"))
+        self.assertEqual(
+            operations,
+            (
+                scenario.Pipe2(0, 1, 0),
+                scenario.SetStatusFlags(0, scenario.O_NONBLOCK),
+                scenario.Read(0, 8),
+            ),
+        )
 
     def test_analysis_schema_two_is_deterministic_and_satisfies_constraints(self):
         first = analyze.analyze(seed=42, samples=128, mutations=256, top=3)
@@ -1008,12 +1336,34 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
                             "filename": "/checkout/os/StarryOS/kernel/src/file/other.rs",
                             "segments": [[10, 2, 8, True, True, False]],
                         },
+                        {
+                            "filename": "/checkout/os/StarryOS/kernel/src/syscall/fs/pipe.rs",
+                            "segments": [[20, 4, 2, True, True, False]],
+                        },
+                        {
+                            "filename": "/checkout/os/StarryOS/kernel/src/syscall/fs/fd_ops.rs",
+                            "segments": [[30, 6, 1, True, True, False]],
+                        },
                     ]
                 }
             ]
         }
         region_ids = coverage.covered_pipe_region_ids(export)
-        self.assertEqual(region_ids, {"os/StarryOS/kernel/src/file/pipe.rs:10:2"})
+        self.assertEqual(
+            region_ids,
+            {
+                "os/StarryOS/kernel/src/file/pipe.rs:10:2",
+                "os/StarryOS/kernel/src/syscall/fs/pipe.rs:20:4",
+                "os/StarryOS/kernel/src/syscall/fs/fd_ops.rs:30:6",
+            },
+        )
+        self.assertEqual(
+            coverage.covered_pipe_region_ids(
+                export,
+                coverage.LEGACY_TARGET_SET_ID,
+            ),
+            {"os/StarryOS/kernel/src/file/pipe.rs:10:2"},
+        )
         self.assertEqual(hash(frozenset(region_ids)), hash(frozenset(region_ids)))
 
     def test_coverage_uses_active_rust_toolchain_llvm_tools(self):
@@ -1064,6 +1414,56 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
             )
             self.assertEqual(compared.returncode, 0, compared.stderr)
             self.assertIn("STARRY_PIPE_LINUX_ORACLE_PASSED", compared.stdout)
+
+    def _record_host_records(self, corpus_text: str):
+        class TraceHeader(ctypes.Structure):
+            _fields_ = (
+                ("magic", ctypes.c_ubyte * 8),
+                ("version", ctypes.c_uint32),
+                ("record_count", ctypes.c_uint32),
+                ("corpus_digest", ctypes.c_uint64),
+                ("page_size", ctypes.c_uint32),
+                ("release", ctypes.c_char * 64),
+                ("machine", ctypes.c_char * 32),
+            )
+
+        class OperationResult(ctypes.Structure):
+            _fields_ = (
+                ("scenario_index", ctypes.c_uint32),
+                ("operation_index", ctypes.c_uint32),
+                ("kind", ctypes.c_uint32),
+                ("data_len", ctypes.c_uint32),
+                ("result", ctypes.c_int64),
+                ("value", ctypes.c_int64),
+                ("error", ctypes.c_int32),
+                ("data", ctypes.c_ubyte * scenario.MAX_IO_BYTES),
+            )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary = Path(temporary_directory)
+            ops = temporary / "pipe.ops"
+            trace = temporary / "linux.trace"
+            canonical = scenario.serialize_document(
+                scenario.parse_document(corpus_text)
+            )
+            ops.write_text(canonical)
+            recorded = subprocess.run(
+                [str(self.oracle), "--record", str(ops), str(trace)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(recorded.returncode, 0, recorded.stderr)
+            encoded = trace.read_bytes()
+
+        header = TraceHeader.from_buffer_copy(encoded)
+        self.assertEqual(header.version, 2)
+        offset = ctypes.sizeof(TraceHeader)
+        record_size = ctypes.sizeof(OperationResult)
+        self.assertEqual(len(encoded), offset + header.record_count * record_size)
+        return [
+            OperationResult.from_buffer_copy(encoded, offset + index * record_size)
+            for index in range(header.record_count)
+        ]
 
     def _rich_parent_document(self):
         return scenario.parse_document(

@@ -7,9 +7,15 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from scenario import (
     Close,
     Dup,
+    Dup2,
+    Dup3,
     Fionread,
+    GetFdFlags,
     GetSize,
+    GetStatusFlags,
     Operation,
+    O_CLOEXEC,
+    O_NONBLOCK,
     Pipe2,
     Poll,
     Read,
@@ -17,8 +23,10 @@ from scenario import (
     Scenario,
     ScenarioCodecError,
     ScenarioDocument,
+    SetFdFlags,
     ScenarioEntryLimitError,
     SetSize,
+    SetStatusFlags,
     Write,
     WriteNull,
     serialize_document,
@@ -262,7 +270,10 @@ def _tail_candidates(
     origins = list(reduction_input.origins[: scenario_index + 1])
     scenarios[-1] = Scenario(scenario.operations[: operation_index + 1])
     origins[-1] = origins[-1][: operation_index + 1]
-    return (("delete-tail-after-critical", _make_input(scenarios, origins)),)
+    return ((
+        "delete-tail-after-critical",
+        _make_input(scenarios, origins, reduction_input.document.version),
+    ),)
 
 
 def _scenario_block_candidates(
@@ -281,6 +292,7 @@ def _scenario_block_candidates(
             candidate = _make_input(
                 [reduction_input.document.scenarios[index] for index in kept_indices],
                 [reduction_input.origins[index] for index in kept_indices],
+                reduction_input.document.version,
             )
             if critical_origin is None or _contains_origin(candidate, critical_origin):
                 candidates.append(
@@ -349,7 +361,12 @@ def _dup_chain_candidates(
     candidates = []
     for scenario_index, scenario in enumerate(reduction_input.document.scenarios):
         for operation_index, operation in enumerate(scenario.operations):
-            if not isinstance(operation, Dup):
+            if not isinstance(operation, (Dup, Dup2, Dup3)):
+                continue
+            if isinstance(operation, Dup3) and (
+                operation.source_slot == operation.destination_slot
+                or operation.flags & ~O_CLOEXEC
+            ):
                 continue
             if reduction_input.origins[scenario_index][operation_index] == critical_origin:
                 continue
@@ -384,7 +401,14 @@ def _dense_slot_candidates(
         Scenario(_replace_operation_slots(operation, mapping) for operation in scenario.operations)
         for scenario in reduction_input.document.scenarios
     ]
-    return (("dense-slot-rename", _make_input(scenarios, reduction_input.origins)),)
+    return ((
+        "dense-slot-rename",
+        _make_input(
+            scenarios,
+            reduction_input.origins,
+            reduction_input.document.version,
+        ),
+    ),)
 
 
 def _parameter_candidates(
@@ -402,7 +426,11 @@ def _parameter_candidates(
                 candidates.append(
                     (
                         f"shrink-{field_name}:{scenario_index}:{operation_index}:{value}",
-                        _make_input(scenarios, reduction_input.origins),
+                        _make_input(
+                            scenarios,
+                            reduction_input.origins,
+                            reduction_input.document.version,
+                        ),
                     )
                 )
     return tuple(candidates)
@@ -417,7 +445,7 @@ def _remove_dup_and_redirect(
     scenario = reduction_input.document.scenarios[scenario_index]
     origins = reduction_input.origins[scenario_index]
     duplicate = scenario.operations[operation_index]
-    assert isinstance(duplicate, Dup)
+    assert isinstance(duplicate, (Dup, Dup2, Dup3))
     operations = list(scenario.operations[:operation_index])
     kept_origins = list(origins[:operation_index])
     redirecting = True
@@ -447,7 +475,11 @@ def _remove_dup_and_redirect(
     all_origins = list(reduction_input.origins)
     scenarios[scenario_index] = Scenario(operations)
     all_origins[scenario_index] = tuple(kept_origins)
-    return _make_input(scenarios, all_origins)
+    return _make_input(
+        scenarios,
+        all_origins,
+        reduction_input.document.version,
+    )
 
 
 def _operation_parameter_replacements(
@@ -472,6 +504,24 @@ def _operation_parameter_replacements(
             (0, 1, 4096, 65536, 1048576),
         ):
             replacements.append(("pipe-size", value, replace(operation, size=value)))
+    if isinstance(operation, Pipe2):
+        for value in _smaller_simple_values(
+            operation.flags,
+            (0, O_NONBLOCK, O_CLOEXEC, O_NONBLOCK | O_CLOEXEC),
+        ):
+            replacements.append(("pipe2-flags", value, replace(operation, flags=value)))
+    if isinstance(operation, SetStatusFlags):
+        for value in _smaller_simple_values(operation.flags, (0, O_NONBLOCK)):
+            replacements.append(("status-flags", value, replace(operation, flags=value)))
+    if isinstance(operation, SetFdFlags):
+        for value in _smaller_simple_values(operation.flags, (0, 1)):
+            replacements.append(("fd-flags", value, replace(operation, flags=value)))
+    if isinstance(operation, Dup3):
+        for value in _smaller_simple_values(
+            operation.flags,
+            (0, O_NONBLOCK, O_CLOEXEC, O_NONBLOCK | O_CLOEXEC),
+        ):
+            replacements.append(("dup3-flags", value, replace(operation, flags=value)))
     return tuple(replacements)
 
 
@@ -490,15 +540,20 @@ def _delete_operations(
     origins[scenario_index] = (
         origins[scenario_index][:start] + origins[scenario_index][start + width :]
     )
-    return _make_input(scenarios, origins)
+    return _make_input(
+        scenarios,
+        origins,
+        reduction_input.document.version,
+    )
 
 
 def _make_input(
     scenarios: Sequence[Scenario],
     origins: Sequence[Sequence[OperationOrigin]],
+    version: int,
 ) -> ReductionInput:
     return ReductionInput(
-        ScenarioDocument(scenarios),
+        ScenarioDocument(scenarios, version=version),
         tuple(tuple(item) for item in origins),
     )
 
@@ -509,13 +564,35 @@ def _replace_operation_slots(
 ) -> Operation:
     rename = lambda slot: mapping.get(slot, slot)
     if isinstance(operation, Pipe2):
-        return Pipe2(rename(operation.read_slot), rename(operation.write_slot))
-    if isinstance(operation, (Read, ReadNull, Write, WriteNull, Close, Poll, SetSize, GetSize, Fionread)):
+        return Pipe2(
+            rename(operation.read_slot),
+            rename(operation.write_slot),
+            operation.flags,
+        )
+    if isinstance(
+        operation,
+        (
+            Read,
+            ReadNull,
+            Write,
+            WriteNull,
+            Close,
+            Poll,
+            SetSize,
+            GetSize,
+            Fionread,
+            GetStatusFlags,
+            SetStatusFlags,
+            GetFdFlags,
+            SetFdFlags,
+        ),
+    ):
         return replace(operation, slot=rename(operation.slot))
-    if isinstance(operation, Dup):
-        return Dup(
-            rename(operation.source_slot),
-            rename(operation.destination_slot),
+    if isinstance(operation, (Dup, Dup2, Dup3)):
+        return replace(
+            operation,
+            source_slot=rename(operation.source_slot),
+            destination_slot=rename(operation.destination_slot),
         )
     raise TypeError(f"unsupported operation type: {type(operation).__name__}")
 
@@ -523,9 +600,26 @@ def _replace_operation_slots(
 def _operation_slots(operation: Operation) -> Tuple[int, ...]:
     if isinstance(operation, Pipe2):
         return operation.read_slot, operation.write_slot
-    if isinstance(operation, Dup):
+    if isinstance(operation, (Dup, Dup2, Dup3)):
         return operation.source_slot, operation.destination_slot
-    if isinstance(operation, (Read, ReadNull, Write, WriteNull, Close, Poll, SetSize, GetSize, Fionread)):
+    if isinstance(
+        operation,
+        (
+            Read,
+            ReadNull,
+            Write,
+            WriteNull,
+            Close,
+            Poll,
+            SetSize,
+            GetSize,
+            Fionread,
+            GetStatusFlags,
+            SetStatusFlags,
+            GetFdFlags,
+            SetFdFlags,
+        ),
+    ):
         return (operation.slot,)
     raise TypeError(f"unsupported operation type: {type(operation).__name__}")
 
@@ -539,6 +633,8 @@ def _operation_parameter_cost(operation: Operation) -> int:
         return operation.events
     if isinstance(operation, SetSize):
         return operation.size
+    if isinstance(operation, (Pipe2, SetStatusFlags, SetFdFlags, Dup3)):
+        return operation.flags
     return 0
 
 
@@ -546,7 +642,10 @@ def _uses_slot_as_destination(operation: Operation, slot: int) -> bool:
     return (
         isinstance(operation, Pipe2)
         and slot in (operation.read_slot, operation.write_slot)
-    ) or (isinstance(operation, Dup) and operation.destination_slot == slot)
+    ) or (
+        isinstance(operation, (Dup, Dup2, Dup3))
+        and operation.destination_slot == slot
+    )
 
 
 def _find_origin(

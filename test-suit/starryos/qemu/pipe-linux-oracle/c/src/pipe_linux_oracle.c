@@ -15,13 +15,17 @@
 #include <sys/utsname.h>
 #include <unistd.h>
 
-#define TRACE_VERSION 1U
-#define CORPUS_VERSION 1L
+#define LEGACY_TRACE_VERSION 1U
+#define TRACE_VERSION 2U
+#define LEGACY_CORPUS_VERSION 1L
+#define CORPUS_VERSION 2L
 #define MAX_SLOTS 16
+#define DUP_TARGET_FD_BASE 64
 #define MAX_IO_BYTES 8192
 #define MAX_LINE_BYTES 256
 #define TRACE_RELEASE_BYTES 64
 #define TRACE_MACHINE_BYTES 32
+#define UNKNOWN_FLAG 0x40000000L
 
 static const unsigned char trace_magic[8] = {'P', 'I', 'P', 'E', 'O', 'R', 'C', '1'};
 
@@ -37,6 +41,12 @@ enum operation_kind {
     OP_SET_SIZE,
     OP_GET_SIZE,
     OP_FIONREAD,
+    OP_GET_STATUS_FLAGS,
+    OP_SET_STATUS_FLAGS,
+    OP_GET_FD_FLAGS,
+    OP_SET_FD_FLAGS,
+    OP_DUP2,
+    OP_DUP3,
 };
 
 enum operation_difference {
@@ -81,6 +91,7 @@ struct run_context {
     FILE *trace;
     struct trace_header header;
     int slots[MAX_SLOTS];
+    long corpus_version;
     uint32_t scenario_index;
     uint32_t operation_index;
 };
@@ -159,10 +170,41 @@ static int parse_slot(const char *text, int *slot)
     return 0;
 }
 
+static int is_supported_pipe2_flags(long flags)
+{
+    return flags == 0 || flags == O_NONBLOCK || flags == O_CLOEXEC ||
+           flags == (O_NONBLOCK | O_CLOEXEC) || flags == UNKNOWN_FLAG;
+}
+
+static int is_supported_dup3_flags(long flags)
+{
+    return flags == 0 || flags == O_CLOEXEC || flags == O_NONBLOCK ||
+           flags == (O_CLOEXEC | O_NONBLOCK) || flags == UNKNOWN_FLAG;
+}
+
 static void finish_syscall_result(struct operation_result *result, long syscall_result)
 {
     result->result = syscall_result;
     result->error = syscall_result < 0 ? errno : 0;
+}
+
+static int destination_fd(const struct run_context *context, int slot)
+{
+    if (context->slots[slot] >= 0)
+        return context->slots[slot];
+    return DUP_TARGET_FD_BASE + slot;
+}
+
+static int positive_io_is_nonblocking(const struct run_context *context, int slot,
+                                      long length)
+{
+    long flags;
+
+    if (length == 0 || context->slots[slot] < 0)
+        return 1;
+    errno = 0;
+    flags = syscall(SYS_fcntl, context->slots[slot], F_GETFL, 0);
+    return flags < 0 || (flags & O_NONBLOCK) != 0;
 }
 
 static int execute_pipe2(struct run_context *context, char *save,
@@ -170,21 +212,38 @@ static int execute_pipe2(struct run_context *context, char *save,
 {
     char *read_slot_text = strtok_r(NULL, " \t", &save);
     char *write_slot_text = strtok_r(NULL, " \t", &save);
+    char *flags_text = context->corpus_version == CORPUS_VERSION
+                           ? strtok_r(NULL, " \t", &save)
+                           : NULL;
     int read_slot;
     int write_slot;
+    long flags = O_NONBLOCK | O_CLOEXEC;
     int pipe_fds[2] = {-1, -1};
     long syscall_result;
 
     if (parse_slot(read_slot_text, &read_slot) != 0 ||
-        parse_slot(write_slot_text, &write_slot) != 0 || read_slot == write_slot ||
-        strtok_r(NULL, " \t", &save) != NULL || context->slots[read_slot] >= 0 ||
-        context->slots[write_slot] >= 0)
+        parse_slot(write_slot_text, &write_slot) != 0 ||
+        (context->corpus_version == CORPUS_VERSION &&
+         parse_long_value(flags_text, 0, INT_MAX, &flags) != 0) ||
+        (context->corpus_version == CORPUS_VERSION &&
+         !is_supported_pipe2_flags(flags)) ||
+        strtok_r(NULL, " \t", &save) != NULL)
+        return -1;
+    if ((flags & ~(O_NONBLOCK | O_CLOEXEC)) == 0 &&
+        (read_slot == write_slot || context->slots[read_slot] >= 0 ||
+         context->slots[write_slot] >= 0))
         return -1;
 
     errno = 0;
-    syscall_result = syscall(SYS_pipe2, pipe_fds, O_NONBLOCK | O_CLOEXEC);
+    syscall_result = syscall(SYS_pipe2, pipe_fds, (int)flags);
     finish_syscall_result(result, syscall_result);
     if (syscall_result == 0) {
+        if (read_slot == write_slot || context->slots[read_slot] >= 0 ||
+            context->slots[write_slot] >= 0) {
+            (void)syscall(SYS_close, pipe_fds[0]);
+            (void)syscall(SYS_close, pipe_fds[1]);
+            return -1;
+        }
         context->slots[read_slot] = pipe_fds[0];
         context->slots[write_slot] = pipe_fds[1];
     }
@@ -204,7 +263,8 @@ static int execute_read(struct run_context *context, char *save,
 
     if (parse_slot(slot_text, &slot) != 0 ||
         parse_long_value(length_text, 0, MAX_IO_BYTES, &length) != 0 ||
-        strtok_r(NULL, " \t", &save) != NULL)
+        strtok_r(NULL, " \t", &save) != NULL ||
+        !positive_io_is_nonblocking(context, slot, length))
         return -1;
 
     memset(buffer, 0, sizeof(buffer));
@@ -252,7 +312,8 @@ static int execute_write(struct run_context *context, char *save,
     if (parse_slot(slot_text, &slot) != 0 ||
         parse_long_value(length_text, 0, MAX_IO_BYTES, &length) != 0 ||
         parse_long_value(byte_text, 0, UCHAR_MAX, &byte_value) != 0 ||
-        strtok_r(NULL, " \t", &save) != NULL)
+        strtok_r(NULL, " \t", &save) != NULL ||
+        !positive_io_is_nonblocking(context, slot, length))
         return -1;
 
     memset(buffer, (unsigned char)byte_value, (size_t)length);
@@ -283,6 +344,38 @@ static int execute_dup(struct run_context *context, char *save,
     if (syscall_result >= 0)
         context->slots[destination] = (int)syscall_result;
     result->kind = OP_DUP;
+    return 0;
+}
+
+static int execute_dup_to(struct run_context *context, char *save,
+                          struct operation_result *result, int use_dup3)
+{
+    char *source_text = strtok_r(NULL, " \t", &save);
+    char *destination_text = strtok_r(NULL, " \t", &save);
+    char *flags_text = use_dup3 ? strtok_r(NULL, " \t", &save) : NULL;
+    int source;
+    int destination;
+    int target_fd;
+    long flags = 0;
+    long syscall_result;
+
+    if (parse_slot(source_text, &source) != 0 ||
+        parse_slot(destination_text, &destination) != 0 ||
+        (use_dup3 && parse_long_value(flags_text, 0, INT_MAX, &flags) != 0) ||
+        (use_dup3 && !is_supported_dup3_flags(flags)) ||
+        strtok_r(NULL, " \t", &save) != NULL)
+        return -1;
+
+    target_fd = destination_fd(context, destination);
+    errno = 0;
+    syscall_result = use_dup3
+                         ? syscall(SYS_dup3, context->slots[source], target_fd,
+                                   (int)flags)
+                         : syscall(SYS_dup2, context->slots[source], target_fd);
+    finish_syscall_result(result, syscall_result < 0 ? syscall_result : 0);
+    if (syscall_result >= 0)
+        context->slots[destination] = (int)syscall_result;
+    result->kind = use_dup3 ? OP_DUP3 : OP_DUP2;
     return 0;
 }
 
@@ -353,6 +446,36 @@ static int execute_fcntl(struct run_context *context, char *save,
     return 0;
 }
 
+static int execute_flag_fcntl(struct run_context *context, char *save,
+                              struct operation_result *result, int command,
+                              uint32_t kind, int normalized_mask)
+{
+    char *slot_text = strtok_r(NULL, " \t", &save);
+    char *flags_text = (command == F_SETFL || command == F_SETFD)
+                           ? strtok_r(NULL, " \t", &save)
+                           : NULL;
+    int slot;
+    long flags = 0;
+    long syscall_result;
+
+    if (parse_slot(slot_text, &slot) != 0 ||
+        (flags_text != NULL &&
+         parse_long_value(flags_text, 0, INT_MAX, &flags) != 0) ||
+        strtok_r(NULL, " \t", &save) != NULL)
+        return -1;
+
+    errno = 0;
+    syscall_result = syscall(SYS_fcntl, context->slots[slot], command, flags);
+    if (command == F_GETFL || command == F_GETFD) {
+        finish_syscall_result(result, syscall_result < 0 ? syscall_result : 0);
+        result->value = syscall_result < 0 ? -1 : syscall_result & normalized_mask;
+    } else {
+        finish_syscall_result(result, syscall_result);
+    }
+    result->kind = kind;
+    return 0;
+}
+
 static int execute_fionread(struct run_context *context, char *save,
                             struct operation_result *result)
 {
@@ -400,6 +523,24 @@ static int execute_operation(struct run_context *context, char *line,
         return execute_fcntl(context, save, result, 0);
     if (strcmp(operation, "fionread") == 0)
         return execute_fionread(context, save, result);
+    if (context->corpus_version != CORPUS_VERSION)
+        return -1;
+    if (strcmp(operation, "get-status-flags") == 0)
+        return execute_flag_fcntl(context, save, result, F_GETFL,
+                                  OP_GET_STATUS_FLAGS, O_NONBLOCK);
+    if (strcmp(operation, "set-status-flags") == 0)
+        return execute_flag_fcntl(context, save, result, F_SETFL,
+                                  OP_SET_STATUS_FLAGS, 0);
+    if (strcmp(operation, "get-fd-flags") == 0)
+        return execute_flag_fcntl(context, save, result, F_GETFD,
+                                  OP_GET_FD_FLAGS, FD_CLOEXEC);
+    if (strcmp(operation, "set-fd-flags") == 0)
+        return execute_flag_fcntl(context, save, result, F_SETFD,
+                                  OP_SET_FD_FLAGS, 0);
+    if (strcmp(operation, "dup2") == 0)
+        return execute_dup_to(context, save, result, 0);
+    if (strcmp(operation, "dup3") == 0)
+        return execute_dup_to(context, save, result, 1);
     return -1;
 }
 
@@ -508,11 +649,13 @@ static int process_corpus(struct run_context *context, const char *corpus_path)
             long version;
 
             if (saw_version || saw_scenario ||
-                parse_long_value(trim(line + 8), CORPUS_VERSION, CORPUS_VERSION,
+                parse_long_value(trim(line + 8), LEGACY_CORPUS_VERSION,
+                                 CORPUS_VERSION,
                                  &version) != 0) {
                 status = fail_line(line_number, display_line, "invalid corpus version");
                 break;
             }
+            context->corpus_version = version;
             saw_version = 1;
             continue;
         }
@@ -654,7 +797,8 @@ static int compare_trace(const char *corpus_path, const char *trace_path,
         return fail("cannot open expected trace");
     if (fread(&context.header, sizeof(context.header), 1, context.trace) != 1 ||
         memcmp(context.header.magic, trace_magic, sizeof(trace_magic)) != 0 ||
-        context.header.version != TRACE_VERSION ||
+        (context.header.version != LEGACY_TRACE_VERSION &&
+         context.header.version != TRACE_VERSION) ||
         context.header.corpus_digest != corpus_digest) {
         fclose(context.trace);
         return fail("invalid expected trace header or corpus digest");
@@ -665,6 +809,9 @@ static int compare_trace(const char *corpus_path, const char *trace_path,
            context.header.release, context.header.machine, context.header.page_size,
            context.header.record_count);
     status = process_corpus(&context, corpus_path);
+    if (status == 0 && context.corpus_version == CORPUS_VERSION &&
+        context.header.version != TRACE_VERSION)
+        status = fail("version-2 corpus requires a version-2 trace");
     if (status == 0 && context.operation_index != context.header.record_count)
         status = fail("expected trace operation count does not match corpus");
     if (status == 0 && fread(&trailing_byte, 1, 1, context.trace) != 0U)
@@ -674,7 +821,7 @@ static int compare_trace(const char *corpus_path, const char *trace_path,
     if (fclose(context.trace) != 0 && status == 0)
         status = fail("cannot close expected trace");
     if (status == 0) {
-        printf("STARRY_PIPE_LINUX_ORACLE_PASSED: operations=%" PRIu32
+        printf("\nSTARRY_PIPE_LINUX_ORACLE_PASSED: operations=%" PRIu32
                " host_linux=%s/%s\n",
                context.operation_index, context.header.release, context.header.machine);
     }

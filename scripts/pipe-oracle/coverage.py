@@ -6,6 +6,19 @@ from pathlib import Path
 from typing import Dict, List, Set
 
 
+LEGACY_TARGET_SET_ID = "pipe-v1"
+TARGET_SET_ID = "pipe-fd-v2"
+
+TARGET_SOURCE_PATHS = {
+    LEGACY_TARGET_SET_ID: ("kernel/src/file/pipe.rs",),
+    TARGET_SET_ID: (
+        "kernel/src/file/pipe.rs",
+        "kernel/src/syscall/fs/pipe.rs",
+        "kernel/src/syscall/fs/fd_ops.rs",
+    ),
+}
+
+
 def llvm_tool(name: str) -> Path:
     override = os.environ.get(name.upper().replace("-", "_"))
     if override:
@@ -40,7 +53,11 @@ def merge_profraws(profraws: List[Path], output: Path):
     )
 
 
-def extract_pipe_regions(profdata: Path, elf: Path) -> Dict:
+def extract_pipe_regions(
+    profdata: Path,
+    elf: Path,
+    target_set_id: str = TARGET_SET_ID,
+) -> Dict:
     result = subprocess.run(
         [
             str(llvm_tool("llvm-cov")), "export", str(elf),
@@ -55,8 +72,8 @@ def extract_pipe_regions(profdata: Path, elf: Path) -> Dict:
     except json.JSONDecodeError:
         return {"error": "invalid JSON output", "regions": [], "pipe_regions": []}
 
-    pipe_regions = _pipe_region_ids(data, covered_only=False)
-    covered_pipe_regions = covered_pipe_region_ids(data)
+    pipe_regions = _pipe_region_ids(data, covered_only=False, target_set_id=target_set_id)
+    covered_pipe_regions = covered_pipe_region_ids(data, target_set_id)
     all_regions = _count_regions(data)
     return {
         "total_regions": all_regions,
@@ -74,16 +91,26 @@ def _count_regions(data: Dict) -> int:
     return total
 
 
-def covered_pipe_region_ids(data: Dict) -> Set[str]:
-    return _pipe_region_ids(data, covered_only=True)
+def covered_pipe_region_ids(
+    data: Dict,
+    target_set_id: str = TARGET_SET_ID,
+) -> Set[str]:
+    return _pipe_region_ids(data, covered_only=True, target_set_id=target_set_id)
 
 
-def _pipe_region_ids(data: Dict, covered_only: bool) -> Set[str]:
+def _pipe_region_ids(
+    data: Dict,
+    covered_only: bool,
+    target_set_id: str,
+) -> Set[str]:
+    target_sources = TARGET_SOURCE_PATHS.get(target_set_id)
+    if target_sources is None:
+        raise ValueError(f"unknown coverage target set: {target_set_id}")
     pipe_regions = set()
     for export in data.get("data", []):
         for file_entry in export.get("files", []):
             filename = file_entry.get("filename", "")
-            if not _is_pipe_source(filename):
+            if not _is_target_source(filename, target_sources):
                 continue
             source = _stable_source_name(filename)
             for segment in file_entry.get("segments", []):
@@ -99,24 +126,29 @@ def _is_region_segment(segment: List) -> bool:
     return len(segment) >= 5 and bool(segment[3]) and bool(segment[4])
 
 
-def _is_pipe_source(filename: str) -> bool:
+def _is_target_source(filename: str, target_sources) -> bool:
     normalized = filename.replace("\\", "/")
-    return normalized == "kernel/src/file/pipe.rs" or normalized.endswith(
-        "/kernel/src/file/pipe.rs"
+    return any(
+        normalized == source or normalized.endswith(f"/{source}")
+        for source in target_sources
     )
 
 
 def _stable_source_name(filename: str) -> str:
     normalized = filename.replace("\\", "/")
-    for marker in ("os/StarryOS/", "kernel/src/file/pipe.rs"):
+    for marker in ("os/StarryOS/", "kernel/src/"):
         marker_index = normalized.rfind(marker)
         if marker_index >= 0:
             return normalized[marker_index:]
     return Path(normalized).name
 
 
-def pipe_region_set(profdata: Path, elf: Path) -> Set[str]:
-    result = extract_pipe_regions(profdata, elf)
+def pipe_region_set(
+    profdata: Path,
+    elf: Path,
+    target_set_id: str = TARGET_SET_ID,
+) -> Set[str]:
+    result = extract_pipe_regions(profdata, elf, target_set_id)
     if "error" in result:
         raise RuntimeError(result["error"])
     return set(result.get("covered_pipe_regions", []))

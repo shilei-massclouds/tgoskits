@@ -415,12 +415,43 @@ job 在新 batch 和 RNG 消耗前恢复。恢复时 Starry ELF 改变则保存�
 
 ### 7.2 fd、flags 与向量 I/O
 
-中期增加：
+#### 阶段 3.2a：pipe fd 与 flags 差分场景
+
+**状态：已完成（2026-07-31）。**
+
+本子阶段将 `pipe.ops` 升至 version 2，在保持 version 1 canonical digest 和回放
+兼容的前提下增加：
 
 - `pipe2` 的 `0`、`O_NONBLOCK`、`O_CLOEXEC` 和非法 flags；
 - `F_GETFL`、`F_SETFL` 动态切换 `O_NONBLOCK`；
 - `F_GETFD` 和 `FD_CLOEXEC`；
-- `dup2`、`dup3` 和目标 fd 覆盖；
+- `dup2`、`dup3`、同 fd 和目标 fd 覆盖。
+
+IR 显式区分共享 open-file-description status flags 和逐 fd `FD_CLOEXEC`。正长度
+I/O 仅在 codec 能静态证明 `O_NONBLOCK` 已启用时接受；零长度、无效 fd 和纯 fd/flag
+错误路径保持同步执行。trace version 2 追加 operation kind，成功的 `dup2`/`dup3`
+返回值统一归一化为 `0`。coverage 使用 `pipe-fd-v2` target set，固定覆盖
+`file/pipe.rs`、`syscall/fs/pipe.rs` 和 `syscall/fs/fd_ops.rs`；旧持久 job 继续绑定
+`pipe-v1`，不会污染新 baseline。
+
+本子阶段不包括 `readv`/`writev`、multi-fd poll、`select`/`epoll`、exec 生命周期或
+自然阻塞语义。
+
+验收时 103 个 Python/host-harness 回归、`py_compile`、workspace rustfmt 和
+`git diff --check` 通过；x86_64 QEMU 对 checked-in version-2 corpus 的 115 个
+operation 全部通过并成功导出 coverage。小预算真实 campaign 完成两个精确归因与
+最小化 job：在两个固定 Starry ELF 上分别新增 693 和 674 个 `pipe-fd-v2` region，
+均以 1 次原始验证、4 次候选和 2 次最终证明完成；canonical entry 分别由 631 缩至
+476 bytes、由 1171 缩至 843 bytes。旧 schema job 保持 `pipe-v1`，磁盘中断后的
+schema-v3 job 从原子 checkpoint 恢复，未重复生成输入。未发现 StarryOS 语义差分，
+生产 Rust 逻辑无需修改。
+
+#### 阶段 3.2b：向量 I/O 与 multi-fd poll
+
+3.2a 已证明 fd target region 有稳定增量。3.2b 优先实现 `readv`/`writev`，因为它可
+继续复用单 fd、同步、静态 nonblocking 的执行模型；multi-fd poll 随后单独扩展
+resource/result 映射：
+
 - `readv`、`writev` 的空 iovec、跨 iovec 和部分完成；
 - 一次 `poll` 多个 fd、重复 fd 和负 fd。
 

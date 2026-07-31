@@ -29,18 +29,29 @@ job 最多运行 64 次候选 QEMU；原始输入验证和两次最终证明不�
 
 ```text
 结构化场景生成或变异
-  -> 生成 canonical version 1 pipe 操作语料
+  -> 生成 canonical version 2 pipe/fd 操作语料（version 1 继续兼容）
   -> 在 host Linux 上运行静态测试基准并录制 linux.trace
   -> 将同一个测试基准 ELF、pipe.ops 和 linux.trace 注入 StarryOS rootfs
   -> 在 x86_64 QEMU 中比较 StarryOS 与 Linux 的结果
   -> 提取本次 StarryOS profraw
-  -> 使用 instrumented StarryOS ELF 计算 pipe.rs 已覆盖 region
+  -> 使用 instrumented StarryOS ELF 计算 pipe-fd-v2 target set 已覆盖 region
   -> 原子保存产生新 region 的 batch 输入，供本次及后续 campaign 变异
 ```
 
-覆盖反馈仅统计执行次数大于零的
-`os/StarryOS/kernel/src/file/pipe.rs:<line>:<column>` region。差分比较覆盖
-返回值、归一化 errno、poll 事件、pipe 容量、排队字节数和 read 返回字节。
+`pipe-fd-v2` target set 仅统计执行次数大于零的以下 region：
+
+- `os/StarryOS/kernel/src/file/pipe.rs:<line>:<column>`
+- `os/StarryOS/kernel/src/syscall/fs/pipe.rs:<line>:<column>`
+- `os/StarryOS/kernel/src/syscall/fs/fd_ops.rs:<line>:<column>`
+
+差分比较覆盖返回值、精确 errno、poll 事件、pipe 容量、排队字节数、read 返回字节、
+归一化 `O_NONBLOCK` 和逐 fd `FD_CLOEXEC`。正长度 I/O 只有在静态确认对应
+open-file-description 已启用 `O_NONBLOCK` 时才会执行；潜在阻塞语料在 host/QEMU
+之前被 codec 拒绝。
+
+version 2 追加 `pipe2 ... FLAGS`、`get/set-status-flags`、`get/set-fd-flags`、
+`dup2` 和 `dup3`。flags 使用十进制固定边界字典。version 1 的两参数 `pipe2`
+仍隐式表示 `O_NONBLOCK | O_CLOEXEC`，历史 canonical digest 不变。
 
 ## 2. 准备环境
 
@@ -108,14 +119,15 @@ Corpus loaded: built-in=5 disk=12 deduplicated-total=17
 === Batch 3/50 ===
   Prepared 17 scenario groups from 8 canonical entries; filtered 0 malformed candidates
   New corpus entry: 6173fd72df01...
-  Coverage saved: 1 profraw(s), 7 new pipe regions
+  Coverage saved: 1 profraw(s), 7 new target regions
 ```
 
 - `Corpus loaded` 分别报告五个内置 seed、磁盘 entry 数和 canonical 去重后的总数。
-- `new pipe regions` 表示相对同一个 instrumented StarryOS ELF 已持久保存 baseline
-  新增的 region；ELF 内容变化后会自动使用独立 baseline。
+- `new target regions` 表示相对同一个 instrumented StarryOS ELF 和
+  `pipe-fd-v2` target set 已持久保存 baseline 新增的 region；ELF 内容或 target
+  set 变化后会自动使用独立 baseline。
 - `New corpus entry` 表示 canonical 输入已原子保存，可供本次及后续 campaign 变异。
-- `0 new pipe regions` 表示本 batch 没有扩展覆盖率。
+- `0 new target regions` 表示本 batch 没有扩展覆盖率。
 - `All batches completed.` 表示 campaign 没有发现差异或基础设施失败。
 
 持久状态位于 Git 忽略的目录：
@@ -127,7 +139,7 @@ coverage/pipe-oracle-fuzz/
     metadata.json
   runs/<run-id>/
     metadata.json
-  coverage-state/<starry-elf-sha256>.json
+  coverage-state/<starry-elf-sha256>-<target-set-id>.json
   attribution-jobs/<job-id>/...
   minimization-jobs/<job-id>/...
   failures/...
@@ -140,7 +152,13 @@ corpus 严格读取 schema v1/v2/v3。v1 是带 `batch-pending` 声明的历史�
 完成两次证明并激活后，原 entry 才会原子标记为 superseded；历史目录不删除，变异
 只加载 active entry。
 
-run schema v3 原子记录 batch、attribution 和 minimization 结果，包括原始/最小
+generator v3 严格读取 generator v2/v3 corpus；旧 entry 的 provenance 不会因加载
+而改写，新生成或变异的 child 使用 generator v3。coverage-state schema v2、
+attribution job schema v3、minimization job schema v2 和 run schema v4 都记录固定
+`target_set_id`。历史 coverage-state v1、attribution v2 和 minimization v1 恢复时
+只映射到 `pipe-v1`，不会污染 `pipe-fd-v2` baseline。
+
+run schema v4 原子记录 batch、attribution 和 minimization 结果，包括原始/最小
 digest、候选与证明 QEMU 数、完成方式和尺寸变化。启动顺序固定为：先恢复
 attribution，再生成或恢复 minimization，重新加载 active corpus，最后才初始化 RNG
 并生成新 batch。
@@ -200,8 +218,9 @@ failure schema v2 保存类型化 guest 结果和 mismatch fingerprint。fingerp
 ```
 
 reducer 按确定性顺序删除 mismatch 关键操作之后的尾部、scenario 块、operation
-连续片段和单个 operation，然后简化 dup/resource slot 与 length、byte、pipe size、
-poll mask。它不调用随机 mutation，也不会合成初始化操作；候选必须 canonical、资源
+连续片段和单个 operation，然后简化 `dup`/`dup2`/`dup3` resource 重定向与
+length、byte、pipe size、poll mask、pipe/status/fd flags。它不调用随机 mutation，
+也不会合成初始化操作；候选必须 canonical、资源
 关系合法且 complexity key 严格下降。无效或重复候选不消耗 QEMU 预算。
 
 coverage 候选必须保留该代表负责的全部 region；最终代表集连续重放两次，均须覆盖
@@ -243,7 +262,9 @@ replay 会验证 artifact digest，并将 failure 目录中的 exact ELF、`pipe
 ## 8. 当前限制
 
 - 仅支持 x86_64 StarryOS QEMU 和 host x86_64 静态测试基准。
-- 覆盖反馈目前只关注 StarryOS `pipe.rs`。
+- 覆盖反馈固定关注 `pipe-fd-v2` 的 pipe 实现、pipe syscall 与 fd operation 边界。
+- 当前阶段不包含 `readv`/`writev`、multi-fd poll、`select`/`epoll`、exec 生命周期或
+  阻塞语义。
 - productive batch 会进行精确 entry 归因和结构化最小化，但结果只是在固定变换顺序
   和预算下的当前最佳，不是全局最小。
 - campaign 串行使用固定的 StarryOS build 和 profraw 路径；同一 workspace 的
@@ -260,9 +281,10 @@ replay 会验证 artifact digest，并将 failure 目录中的 exact ELF、`pipe
 和长度；host 随后通过 QEMU monitor `memsave` 获得本次
 `starryos-x86_64-unknown-none.profraw`。fuzzer 使用 `llvm-profdata` 合并 profile，
 再用 `llvm-cov export` 和生成该 profile 的同一个 instrumented StarryOS ELF，
-得到执行次数大于零的 `pipe.rs` region 集合。
+得到执行次数大于零的 `pipe-fd-v2` region 集合。
 
-fuzzer 按 instrumented StarryOS ELF SHA-256 保存已经覆盖的 region 集合。每个
+fuzzer 按 instrumented StarryOS ELF SHA-256 和 target-set ID 保存已经覆盖的 region
+集合。每个
 batch 执行后，新集合与该 ELF 的已有集合做差；如果出现新 region，生成该 batch
 的 canonical 输入就进入持久 corpus。下一轮主要从去重后的 corpus 选择场景，
 进行结构化 operation/片段/参数变异，同时保留一部分随机生成输入。这样，能够

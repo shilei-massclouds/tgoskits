@@ -12,6 +12,7 @@ SCRIPT_DIR = WORKSPACE_ROOT / "scripts/pipe-oracle"
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import corpus  # noqa: E402
+import coverage as pipe_coverage  # noqa: E402
 import generator  # noqa: E402
 import scenario  # noqa: E402
 
@@ -525,8 +526,109 @@ class PersistentCorpusRegressionTests(unittest.TestCase):
             self.assertNotEqual(first_digest, second_digest)
             self.assertEqual(
                 {path.stem for path in store.coverage_state_dir.glob("*.json")},
-                {first_digest, second_digest},
+                {
+                    f"{first_digest}-pipe-fd-v2",
+                    f"{second_digest}-pipe-fd-v2",
+                },
             )
+
+    def test_coverage_state_is_isolated_by_target_set_and_loads_legacy_v1(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            elf = workspace / "starryos"
+            elf.write_bytes(b"instrumented elf")
+            store = corpus.CorpusStore(workspace)
+
+            store.save_coverage_regions(
+                elf,
+                {"os/StarryOS/kernel/src/syscall/fs/fd_ops.rs:1:1"},
+                pipe_coverage.TARGET_SET_ID,
+            )
+            store.save_coverage_regions(
+                elf,
+                {"os/StarryOS/kernel/src/file/pipe.rs:2:1"},
+                pipe_coverage.LEGACY_TARGET_SET_ID,
+            )
+
+            self.assertEqual(
+                store.load_coverage_regions(elf, pipe_coverage.TARGET_SET_ID),
+                {"os/StarryOS/kernel/src/syscall/fs/fd_ops.rs:1:1"},
+            )
+            self.assertEqual(
+                store.load_coverage_regions(elf, pipe_coverage.LEGACY_TARGET_SET_ID),
+                {"os/StarryOS/kernel/src/file/pipe.rs:2:1"},
+            )
+
+            legacy_elf = workspace / "legacy-starryos"
+            legacy_elf.write_bytes(b"legacy instrumented elf")
+            legacy_digest = store.elf_digest(legacy_elf)
+            legacy_path = store.coverage_state_dir / f"{legacy_digest}.json"
+            legacy_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "starry_elf_sha256": legacy_digest,
+                        "covered_regions": ["legacy-pipe-region"],
+                        "last_updated": store.verification_environment(),
+                    }
+                )
+            )
+            self.assertEqual(
+                store.load_coverage_regions(
+                    legacy_elf,
+                    pipe_coverage.LEGACY_TARGET_SET_ID,
+                ),
+                {"legacy-pipe-region"},
+            )
+            self.assertEqual(
+                store.load_coverage_regions(legacy_elf),
+                set(),
+            )
+
+    def test_coverage_state_symlink_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            elf = workspace / "starryos"
+            elf.write_bytes(b"elf")
+            store = corpus.CorpusStore(workspace)
+            store.prepare()
+            digest = store.elf_digest(elf)
+            external = workspace / "external.json"
+            external.write_text("{}")
+            state = store.coverage_state_dir / f"{digest}-pipe-fd-v2.json"
+            state.symlink_to(external)
+
+            with self.assertRaisesRegex(Exception, "not a regular file"):
+                store.load_coverage_regions(elf)
+
+    def test_current_corpus_loader_accepts_generator_v2_and_v3_but_rejects_v1(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            store = corpus.CorpusStore(workspace)
+            document = generator.generate_document(generator.CampaignRng(17))
+            store.save_entry(
+                document,
+                corpus.CorpusProvenance.generated(),
+                {"pipe-region"},
+            )
+            digest = scenario.canonical_digest(document)
+            metadata_path = store.corpus_dir / digest / "metadata.json"
+            metadata = json.loads(metadata_path.read_text())
+            original_origin = metadata["origin"]
+
+            metadata["generator_version"] = "2"
+            metadata_path.write_text(json.dumps(metadata))
+            loaded = corpus.CorpusStore(workspace).load_corpus()
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(
+                json.loads(metadata_path.read_text())["origin"],
+                original_origin,
+            )
+
+            metadata["generator_version"] = "1"
+            metadata_path.write_text(json.dumps(metadata))
+            with self.assertRaisesRegex(Exception, "incompatible generator version"):
+                corpus.CorpusStore(workspace).load_corpus()
 
     def test_campaign_lock_rejects_a_second_owner(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
