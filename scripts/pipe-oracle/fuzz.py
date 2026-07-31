@@ -159,12 +159,16 @@ def _run_batch(
 
         if not passed:
             failure_id = f"batch{batch_idx}_mismatch_{ops_digest[:12]}"
+            failure_path = failures_dir / failure_id
             _save_batch_failure(
-                failures_dir / failure_id, input_map, ops_text,
+                failure_path, input_map, ops_text,
                 artifact_elf, trace_path, guest_log, profraws,
                 batch_idx, "mismatch",
             )
-            print(f"  MISMATCH saved to {failure_id}", flush=True)
+            print(
+                f"  MISMATCH saved to {failure_path.relative_to(workspace)}",
+                flush=True,
+            )
             return True
 
         try:
@@ -176,8 +180,9 @@ def _run_batch(
         except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
             guest_log += f"\nCoverage analysis failed: {error}\n"
             failure_id = f"batch{batch_idx}_coverage_{ops_digest[:12]}"
+            failure_path = failures_dir / failure_id
             _save_batch_failure(
-                failures_dir / failure_id,
+                failure_path,
                 input_map,
                 ops_text,
                 artifact_elf,
@@ -187,7 +192,10 @@ def _run_batch(
                 batch_idx,
                 "coverage",
             )
-            print(f"  COVERAGE FAILURE saved to {failure_id}", flush=True)
+            print(
+                f"  COVERAGE FAILURE saved to {failure_path.relative_to(workspace)}",
+                flush=True,
+            )
             return True
 
         if new_regions:

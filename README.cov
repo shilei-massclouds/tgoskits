@@ -1,0 +1,196 @@
+# 覆盖率导引差分测试
+
+本文说明如何针对 StarryOS pipe 实现基于覆盖率导引的
+Linux 差分测试，以及如何重放失败。
+
+所有命令都应在 TGOSKits 仓库根目录执行。
+
+## 0. 快速开始
+
+运行一次 campaign：
+
+```bash
+./scripts/pipe-oracle/fuzz.py --batches 5 --batch-size 4
+```
+
+失败时会打印并保存 `coverage/pipe-oracle-fuzz/failures/<failure-id>`，使用以下
+命令重现：
+
+```bash
+./scripts/pipe-oracle/replay.py coverage/pipe-oracle-fuzz/failures/<failure-id>
+```
+
+## 1. 测试模型
+
+每个 fuzz batch 执行以下流程：
+
+```text
+二进制输入变异
+  -> 生成 version 1 pipe 操作语料
+  -> 在 host Linux 上运行静态测试基准并录制 linux.trace
+  -> 将同一个测试基准 ELF、pipe.ops 和 linux.trace 注入 StarryOS rootfs
+  -> 在 x86_64 QEMU 中比较 StarryOS 与 Linux 的结果
+  -> 提取本次 StarryOS profraw
+  -> 使用 instrumented StarryOS ELF 计算 pipe.rs 已覆盖 region
+  -> 将产生新 region 的 batch 输入加入后续变异 corpus
+```
+
+覆盖反馈仅统计执行次数大于零的
+`os/StarryOS/kernel/src/file/pipe.rs:<line>:<column>` region。差分比较覆盖
+返回值、归一化 errno、poll 事件、pipe 容量、排队字节数和 read 返回字节。
+
+## 2. 准备环境
+
+需要当前仓库的 Rust 工具链、CMake、静态 C 编译环境、
+`qemu-system-x86_64`，以及 Rust 工具链中的 `llvm-profdata` 和 `llvm-cov`。
+脚本会自动从 active Rust toolchain 定位 LLVM 工具；也可以通过绝对路径覆盖：
+
+```bash
+export LLVM_PROFDATA=/absolute/path/to/llvm-profdata
+export LLVM_COV=/absolute/path/to/llvm-cov
+```
+
+QEMU 必须能够在 `/tmp` 创建 monitor Unix socket。一次 campaign 会串行运行
+QEMU，不要在同一个 checkout 中并行启动多个 pipe-oracle campaign。建议预留
+数 GiB 磁盘空间。
+
+确认入口可执行：
+
+```bash
+./scripts/pipe-oracle/fuzz.py --help
+./scripts/pipe-oracle/replay.py --help
+```
+
+## 3. 运行测试
+
+先运行一个短 campaign：
+
+```bash
+./scripts/pipe-oracle/fuzz.py \
+  --seed 20260731 \
+  --batches 5 \
+  --batch-size 4
+```
+
+确认环境稳定后，可以增加反馈迭代次数：
+
+```bash
+./scripts/pipe-oracle/fuzz.py \
+  --seed 20260731 \
+  --batches 50 \
+  --batch-size 8
+```
+
+参数含义：
+
+- `--seed`：变异随机种子，用于重复同一 campaign。
+- `--batches`：覆盖反馈迭代次数；每个 batch 启动一次 QEMU。
+- `--batch-size`：一个 batch 中合并执行的候选输入数量。
+- `--workspace`：仓库根目录；通常无需设置。
+
+`--batch-size 1` 的覆盖归因最精确。`4` 到 `8` 适合作为日常吞吐与
+归因精度的折中。更大的 batch 可以在一次 QEMU 中测试更多输入，但只知道
+整个 batch 是否产生了新覆盖，不能定位到某个输入。
+
+## 4. 理解输出
+
+正常反馈示例：
+
+```text
+=== Batch 3/50 ===
+  Generated 17 scenario groups from 8 inputs
+  New corpus entry: 6173fd72df01...
+  Coverage saved: 1 profraw(s), 7 new pipe regions
+```
+
+- `new pipe regions` 表示相对本次进程中先前 batch 新增的 region。
+- `New corpus entry` 表示输入已进入内存 corpus，可供后续 batch 继续变异。
+- `0 new pipe regions` 表示本 batch 没有扩展覆盖率。
+- `All batches completed.` 表示 campaign 没有发现差异或基础设施失败。
+
+成功输入 corpus 当前只保存在这一次 `fuzz.py` 进程内。中断或重新启动后，
+会从内置种子重新开始；因此长 campaign 应在同一个进程中完成。
+
+## 5. 失败信息
+
+发现 differential mismatch、panic、timeout 或 coverage 分析失败时，fuzzer
+立即停止并打印可以直接传给 replay 的仓库相对路径：
+
+```text
+MISMATCH saved to coverage/pipe-oracle-fuzz/failures/batch7_mismatch_0123456789ab
+Batch 8 failed, stopping.
+```
+
+coverage 工具链失败时输出：
+
+```text
+COVERAGE FAILURE saved to coverage/pipe-oracle-fuzz/failures/batch7_coverage_0123456789ab
+```
+
+failure 目录包含：
+
+```text
+pipe.ops             本批次的完整操作语料
+linux.trace          原始 host Linux 结果
+pipe-linux-oracle    本次使用的静态 x86_64 ELF
+guest.log            QEMU、StarryOS 和 runner 输出
+profraws/            已成功提取的 coverage profile
+input.bin 或 inputs/ 生成该批次的二进制输入
+metadata.json        Git、host、digest 和结果元数据
+```
+
+failure schema 和原始证据不会在 replay 时被覆盖。
+
+## 6. 重现失败测试
+
+将 fuzzer 打印的路径直接复制到命令中：
+
+```bash
+./scripts/pipe-oracle/replay.py \
+  coverage/pipe-oracle-fuzz/failures/batch7_mismatch_0123456789ab
+```
+
+replay 会验证 artifact digest，并将 failure 目录中的 exact ELF、`pipe.ops` 和
+`linux.trace` 再次注入 QEMU。每次结果保存在 failure 目录下的
+`replay-runs/run-NNNN/`，不会覆盖原始 `guest.log` 或 profile。
+
+对于已知 mismatch，重放命令非零退出通常表示原差异被再次触发；应结合新生成
+的 `replay-runs/run-NNNN/guest.log` 判断。
+
+如果只想在当前 host Linux 上重新录制 trace，并与原始 host 信息比较：
+
+```bash
+./scripts/pipe-oracle/replay.py \
+  --refresh-host \
+  coverage/pipe-oracle-fuzz/failures/batch7_mismatch_0123456789ab
+```
+
+新 trace 保存在 `refresh-runs/run-NNNN/`，原始 `linux.trace` 保持不变。
+
+## 7. 当前限制
+
+- 仅支持 x86_64 StarryOS QEMU 和 host x86_64 静态测试基准。
+- 覆盖反馈目前只关注 StarryOS `pipe.rs`。
+- batch 覆盖是集合反馈；一个 batch 产生新覆盖时，该 batch 的全部候选输入都会
+  加入 corpus。
+- 成功 corpus 尚未跨进程持久化；failure artifact 会持久保存。
+- campaign 串行使用固定的 StarryOS build 和 profraw 路径，不能并行运行。
+
+更详细的 artifact 注入、deferred-fail 和 coverage 提取设计见
+`book/design/starry-pipe-linux-oracle.md`。
+
+## 8. 原理摘要
+
+测试覆盖率来自启用 `AXTEST_COVERAGE=y` 后由 Rust coverage instrumentation
+插桩的 StarryOS 内核，不来自 host Linux 或 C 测试基准。guest 完成差分测试后写
+`/proc/starry-test-coverage`，内核将 coverage counters 序列化到内存并报告地址
+和长度；host 随后通过 QEMU monitor `memsave` 获得本次
+`starryos-x86_64-unknown-none.profraw`。fuzzer 使用 `llvm-profdata` 合并 profile，
+再用 `llvm-cov export` 和生成该 profile 的同一个 instrumented StarryOS ELF，
+得到执行次数大于零的 `pipe.rs` region 集合。
+
+fuzzer 保存本次进程已经覆盖的 region 集合。每个 batch 执行后，新集合与已有
+集合做差；如果出现新 region，生成该 batch 的输入就进入 corpus。下一轮主要从
+corpus 选择输入并进行字节替换、交换、插入或删除，再确定性转换成合法 pipe
+测试序列，同时保留一部分随机输入。这样，能够打开新内核路径的测试序列会获得
+更多后续变异机会，测试会逐步向尚未覆盖的 pipe 路径扩展。

@@ -3,6 +3,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from unittest import mock
 
@@ -210,6 +212,45 @@ class PipeOracleRegressionTests(unittest.TestCase):
                 fuzz._run_guest_compare(WORKSPACE_ROOT, artifact_dir)
 
         run.assert_called_once_with(WORKSPACE_ROOT, artifact_dir)
+
+    def test_fuzz_failure_reports_replayable_artifact_path(self):
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = Path(temp)
+            oracle = workspace / "pipe-linux-oracle"
+            oracle.write_bytes(b"oracle")
+            failures_dir = workspace / "coverage/pipe-oracle-fuzz/failures"
+
+            def record_host(_elf, _ops, trace):
+                trace.write_bytes(b"trace")
+                return True
+
+            output = StringIO()
+            with (
+                mock.patch.object(
+                    fuzz, "_find_or_build_host_oracle", return_value=oracle
+                ),
+                mock.patch.object(fuzz, "_record_host", side_effect=record_host),
+                mock.patch.object(
+                    fuzz,
+                    "_run_guest_compare",
+                    return_value=("guest log", [], False),
+                ),
+                mock.patch.object(fuzz, "_save_batch_failure") as save_failure,
+                redirect_stdout(output),
+            ):
+                failed = fuzz._run_batch(
+                    workspace,
+                    2,
+                    [b"failing input"],
+                    set(),
+                    set(),
+                    failures_dir,
+                )
+
+        self.assertTrue(failed)
+        failure_path = save_failure.call_args.args[0]
+        expected_path = failure_path.relative_to(workspace)
+        self.assertIn(f"MISMATCH saved to {expected_path}", output.getvalue())
 
     def test_replay_qemu_receives_failure_artifact_directory(self):
         with tempfile.TemporaryDirectory() as temp:
