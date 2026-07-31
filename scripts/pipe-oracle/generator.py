@@ -1,5 +1,6 @@
+import hashlib
 import struct
-from typing import List
+from typing import List, Tuple
 
 GENERATOR_VERSION = "1"
 
@@ -33,6 +34,12 @@ def expand_input(data: bytes) -> List[List[str]]:
         scenario = _generate_scenario_ops(rng, n_ops)
         scenarios.append(scenario)
     return scenarios
+
+
+def canonicalize_input(data: bytes) -> Tuple[str, str]:
+    ops_text = ops_to_text(expand_input(data))
+    digest = hashlib.sha256(ops_text.encode("utf-8")).hexdigest()
+    return ops_text, digest
 
 
 def _fixed_seed_scenarios(seed: int) -> List[List[str]]:

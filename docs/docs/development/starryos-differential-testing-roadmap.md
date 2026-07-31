@@ -129,7 +129,7 @@ batch 耗时、新增 region 和真实 corpus entry 的来源、后代及 covera
 | 步骤 | 状态 | 完成日期 | 验证证据 |
 |---|---|---|---|
 | 1. 定义规范场景摘要和统计口径 | 已完成 | 2026-07-31 | 明确以实际 `pipe.ops` 文本及其 SHA-256 为 canonical，并定义变异、去重、参数和资源桶口径。 |
-| 2. 实现 canonical 文本及 digest 辅助函数 | 未开始 | — | — |
+| 2. 实现 canonical 文本及 digest 辅助函数 | 已完成 | 2026-07-31 | `canonicalize_input` 复用 `expand_input`/`ops_to_text`，直接验证文本和 UTF-8 SHA-256 与现有序列化结果一致。 |
 | 3. 实现离线分析器及稳定 JSON 输出 | 未开始 | — | — |
 | 4. 完成测试、运行基线验证并记录结果 | 未开始 | — | — |
 
