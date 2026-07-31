@@ -4,60 +4,46 @@
 import argparse
 import hashlib
 import os
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from common import CORPUS_DIR, FAILURES_DIR, build_metadata, save_metadata
+from common import build_metadata, save_metadata
+from corpus import (
+    CanonicalCorpus,
+    CorpusStorageError,
+    CorpusStore,
+)
 from generator import (
     GENERATOR_VERSION,
     CampaignRng,
     generate_document,
-    legacy_document_from_input,
 )
 from mutation import (
-    MUTATION_KINDS,
     CandidateClassification,
     MutationCandidate,
     candidate_from_document,
     mutate_document,
 )
 from runner import coverage_object, run_guest_compare
-from scenario import (
-    ScenarioDocument,
-    combine_documents,
-    parse_document,
-    serialize_document,
-)
+from scenario import combine_documents, parse_document, serialize_document
 
 
 DEFAULT_SEED = 42
 DEFAULT_BATCHES = 4
 DEFAULT_BATCH_SIZE = 32
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent.parent
-
-LEGACY_INITIAL_SEEDS = (
-    bytes(range(256)),
-    bytes(reversed(range(256))),
-    b"\x00" * 32,
-    b"\xff" * 32,
-    b"pipe" * 64,
-)
-
-
-@dataclass(frozen=True)
-class CorpusEntry:
-    digest: str
-    encoded: bytes
-    document: ScenarioDocument
 
 
 @dataclass(frozen=True)
@@ -67,32 +53,16 @@ class HostRecordResult:
     log: str
 
 
-class CanonicalCorpus:
-    """An in-memory digest map whose observable iteration order is canonical."""
+@dataclass(frozen=True)
+class BatchResult:
+    failed: bool
+    category: str
+    new_regions: Tuple[str, ...] = ()
+    admitted_digests: Tuple[str, ...] = ()
+    starry_elf_sha256: Optional[str] = None
 
-    def __init__(self):
-        self._entries: Dict[str, CorpusEntry] = {}
-
-    @classmethod
-    def initial(cls):
-        corpus = cls()
-        for raw_seed in LEGACY_INITIAL_SEEDS:
-            corpus.add(legacy_document_from_input(raw_seed))
-        return corpus
-
-    def add(self, document: ScenarioDocument) -> bool:
-        encoded = serialize_document(document).encode("utf-8")
-        digest = hashlib.sha256(encoded).hexdigest()
-        if digest in self._entries:
-            return False
-        self._entries[digest] = CorpusEntry(digest, encoded, document)
-        return True
-
-    def ordered_entries(self) -> List[CorpusEntry]:
-        return [self._entries[digest] for digest in sorted(self._entries)]
-
-    def __len__(self):
-        return len(self._entries)
+    def __bool__(self) -> bool:
+        return self.failed
 
 
 class CampaignStats:
@@ -120,31 +90,63 @@ def main():
     args = parser.parse_args()
 
     workspace = args.workspace.resolve()
-    corpus_dir = workspace / CORPUS_DIR
-    corpus_dir.mkdir(parents=True, exist_ok=True)
-    failures_dir = workspace / FAILURES_DIR
-    failures_dir.mkdir(parents=True, exist_ok=True)
+    store = CorpusStore(workspace)
+    try:
+        with store.campaign_lock():
+            return _run_campaign(args, workspace, store)
+    except CorpusStorageError as error:
+        print(f"ERROR: {error}", flush=True)
+        return 1
 
+
+def _run_campaign(args, workspace: Path, store: CorpusStore) -> int:
     corpus = CanonicalCorpus.initial()
-    covered_regions: Set[str] = set()
+    built_in_count = len(corpus)
+    disk_corpus = store.load_corpus()
+    disk_count = len(disk_corpus)
+    for entry in disk_corpus.ordered_entries():
+        corpus.add(entry.document)
+    print(
+        "Corpus loaded: "
+        f"built-in={built_in_count} disk={disk_count} deduplicated-total={len(corpus)}",
+        flush=True,
+    )
+
     rng = CampaignRng(args.seed)
     stats = CampaignStats()
+    campaign_id = _campaign_id()
+    command = shlex.join(sys.argv)
 
     for batch_index in range(args.batches):
         print(f"=== Batch {batch_index + 1}/{args.batches} ===", flush=True)
         batch_candidates = _select_batch(rng, corpus, args.batch_size, stats)
-        batch_failed = _run_batch(
+        started = time.monotonic()
+        batch_result = _run_batch(
             workspace,
             batch_index,
             batch_candidates,
-            covered_regions,
+            None,
             corpus,
-            failures_dir,
+            store.failures_dir,
             stats,
+            store,
         )
-        if batch_failed:
+        duration = time.monotonic() - started
+        run_metadata = _build_run_metadata(
+            args.seed,
+            command,
+            batch_index,
+            duration,
+            batch_candidates,
+            batch_result,
+        )
+        store.save_run(
+            f"{campaign_id}-batch-{batch_index + 1:04d}",
+            run_metadata,
+        )
+        if batch_result.failed:
             print(f"Batch {batch_index + 1} failed, stopping.", flush=True)
-            sys.exit(1)
+            return 1
     print(
         "All batches completed: "
         f"executable={stats.classifications['executable']} "
@@ -152,6 +154,61 @@ def main():
         f"host_parser_rejections={stats.host_parser_rejections}.",
         flush=True,
     )
+    return 0
+
+
+def _campaign_id() -> str:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    return f"{timestamp}-pid-{os.getpid()}"
+
+
+def _build_run_metadata(
+    seed: int,
+    command: str,
+    batch_index: int,
+    duration: float,
+    candidates: List[MutationCandidate],
+    result: BatchResult,
+) -> Dict:
+    executable = [
+        candidate
+        for candidate in candidates
+        if candidate.classification == CandidateClassification.EXECUTABLE
+        and candidate.document is not None
+    ]
+    sources = Counter(candidate.provenance.source for candidate in candidates)
+    relationships = []
+    for candidate in candidates:
+        provenance = candidate.provenance
+        relationships.append(
+            {
+                "digest": candidate.digest,
+                "classification": candidate.classification.value,
+                "source": provenance.source,
+                "parent_digest": provenance.parent_digest,
+                "donor_digest": provenance.donor_digest,
+                "mutation_type": provenance.mutation_type,
+                "error_category": candidate.error_category,
+            }
+        )
+    return {
+        "fuzz_seed": seed,
+        "command": command,
+        "batch_index": batch_index,
+        "batch_duration_seconds": round(duration, 6),
+        "candidate_counts": {
+            "candidates": len(candidates),
+            "executable": len(executable),
+            "malformed": len(candidates) - len(executable),
+            "unique_inputs": len({candidate.digest for candidate in executable}),
+        },
+        "candidate_sources": dict(sorted(sources.items())),
+        "candidate_relationships": relationships,
+        "new_regions": list(result.new_regions),
+        "admitted_digests": list(result.admitted_digests),
+        "starry_elf_sha256": result.starry_elf_sha256,
+        "result": result.category,
+    }
 
 
 def _select_batch(
@@ -193,11 +250,12 @@ def _run_batch(
     workspace: Path,
     batch_index: int,
     candidates: List[MutationCandidate],
-    covered_regions: Set[str],
+    covered_regions: Optional[Set[str]],
     corpus: CanonicalCorpus,
     failures_dir: Path,
     stats: Optional[CampaignStats] = None,
-) -> bool:
+    store: Optional[CorpusStore] = None,
+) -> BatchResult:
     executable = [
         candidate
         for candidate in candidates
@@ -210,11 +268,15 @@ def _run_batch(
             f"  Filtered {malformed_count} malformed candidates; no host/QEMU run.",
             flush=True,
         )
-        return False
+        return BatchResult(False, "no-executable-input")
 
-    input_map = {
-        candidate.digest: candidate.encoded
+    candidate_map = {
+        candidate.digest: candidate
         for candidate in sorted(executable, key=lambda item: item.digest)
+    }
+    input_map = {
+        digest: candidate_map[digest].encoded
+        for digest in sorted(candidate_map)
     }
     documents = [
         parse_document(input_map[digest])
@@ -238,7 +300,7 @@ def _run_batch(
         elf_path = _find_or_build_host_oracle(workspace)
         if elf_path is None:
             print("ERROR: cannot build pipe-linux-oracle ELF", flush=True)
-            return True
+            return BatchResult(True, "host-oracle-build-failure")
 
         trace_path = temporary / "linux.trace"
         host_record = _record_host(elf_path, ops_path, trace_path)
@@ -251,9 +313,9 @@ def _run_batch(
                     "and skipped before QEMU.",
                     flush=True,
                 )
-                return False
+                return BatchResult(False, "host-parser-rejection")
             print(f"ERROR: host record failed\n{host_record.log}", flush=True)
-            return True
+            return BatchResult(True, "host-record-failure")
 
         artifact_elf = temporary / "pipe-linux-oracle"
         shutil.copy2(elf_path, artifact_elf)
@@ -277,17 +339,49 @@ def _run_batch(
                 f"  MISMATCH saved to {failure_path.relative_to(workspace)}",
                 flush=True,
             )
-            return True
+            return BatchResult(True, "mismatch")
 
         try:
             if not profraws:
                 raise RuntimeError(
                     "QEMU passed without producing the expected Starry profraw"
                 )
+            starry_elf = coverage_object(workspace)
+            active_covered_regions = (
+                store.load_coverage_regions(starry_elf)
+                if store is not None
+                else covered_regions if covered_regions is not None else set()
+            )
             new_regions = _extract_new_regions(
                 profraws,
-                coverage_object(workspace),
-                covered_regions,
+                starry_elf,
+                active_covered_regions,
+            )
+
+            admitted_digests = tuple(sorted(candidate_map)) if new_regions else ()
+            if new_regions:
+                for digest in admitted_digests:
+                    candidate = candidate_map[digest]
+                    document = candidate.document
+                    if document is None:
+                        raise AssertionError("executable candidate lost its document")
+                    added_in_memory = corpus.add(document)
+                    added_on_disk = (
+                        store.save_entry(
+                            document,
+                            candidate.provenance,
+                            new_regions,
+                        )
+                        if store is not None
+                        else False
+                    )
+                    if added_in_memory or added_on_disk:
+                        print(f"  New corpus entry: {digest[:12]}...", flush=True)
+
+            starry_elf_digest = (
+                store.save_coverage_regions(starry_elf, active_covered_regions)
+                if store is not None
+                else None
             )
         except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
             guest_log += f"\nCoverage analysis failed: {error}\n"
@@ -308,15 +402,7 @@ def _run_batch(
                 f"  COVERAGE FAILURE saved to {failure_path.relative_to(workspace)}",
                 flush=True,
             )
-            return True
-
-        if new_regions:
-            for document in documents:
-                digest = hashlib.sha256(
-                    serialize_document(document).encode("utf-8")
-                ).hexdigest()
-                if corpus.add(document):
-                    print(f"  New corpus entry: {digest[:12]}...", flush=True)
+            return BatchResult(True, "coverage-failure")
 
         print(
             f"  Coverage saved: {len(profraws)} profraw(s), "
@@ -324,7 +410,13 @@ def _run_batch(
             flush=True,
         )
 
-    return False
+    return BatchResult(
+        False,
+        "passed",
+        tuple(sorted(new_regions)),
+        admitted_digests,
+        starry_elf_digest,
+    )
 
 
 def _find_or_build_host_oracle(workspace: Path) -> Optional[Path]:
@@ -491,4 +583,4 @@ _Rng = CampaignRng
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

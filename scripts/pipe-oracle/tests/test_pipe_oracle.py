@@ -8,6 +8,7 @@ import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -19,6 +20,7 @@ ARTIFACT_ENV = "STARRY_PIPE_ORACLE_ARTIFACT_DIR"
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import analyze  # noqa: E402
+import corpus  # noqa: E402
 import coverage  # noqa: E402
 import fuzz  # noqa: E402
 import generator  # noqa: E402
@@ -304,14 +306,14 @@ class PipeOracleRegressionTests(unittest.TestCase):
         self.assertEqual(RejectionProbe().range(10, 20), 15)
 
     def test_initial_corpus_migrates_five_legacy_seeds_and_is_digest_sorted(self):
-        corpus = fuzz.CanonicalCorpus.initial()
-        entries = corpus.ordered_entries()
+        initial_corpus = corpus.CanonicalCorpus.initial()
+        entries = initial_corpus.ordered_entries()
         expected = {
             scenario.serialize_document(generator.legacy_document_from_input(raw)).encode()
-            for raw in fuzz.LEGACY_INITIAL_SEEDS
+            for raw in corpus.LEGACY_INITIAL_SEEDS
         }
 
-        self.assertEqual(len(corpus), 5)
+        self.assertEqual(len(initial_corpus), 5)
         self.assertEqual({entry.encoded for entry in entries}, expected)
         self.assertEqual(
             [entry.digest for entry in entries],
@@ -322,9 +324,9 @@ class PipeOracleRegressionTests(unittest.TestCase):
         script = """
 import json, sys
 sys.path.insert(0, 'scripts/pipe-oracle')
-import fuzz, generator
+import corpus, fuzz, generator
 rng = generator.CampaignRng(42)
-batch = fuzz._select_batch(rng, fuzz.CanonicalCorpus.initial(), 24)
+batch = fuzz._select_batch(rng, corpus.CanonicalCorpus.initial(), 24)
 print(json.dumps([(item.kind, item.classification.value, item.digest) for item in batch]))
 """
         outputs = []
@@ -338,6 +340,12 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
             self.assertEqual(result.returncode, 0, result.stderr)
             outputs.append(result.stdout)
         self.assertEqual(outputs[0], outputs[1])
+        selected = json.loads(outputs[0])
+        compact = json.dumps(selected, separators=(",", ":"))
+        self.assertEqual(
+            hashlib.sha256(compact.encode()).hexdigest(),
+            "3baaa17f4f8f473914151a5f4a4e948fa18846816164a76b0e411c4431decd13",
+        )
 
     def test_every_structural_mutation_changes_digest_and_stays_within_limits(self):
         parent = self._rich_parent_document()
@@ -376,6 +384,178 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
                             len(item.operations),
                             scenario.MAX_OPS_PER_SCENARIO,
                         )
+                self.assertEqual(candidate.provenance.source, "mutation")
+                self.assertEqual(candidate.provenance.parent_digest, parent_digest)
+                self.assertEqual(
+                    candidate.provenance.donor_digest,
+                    scenario.canonical_digest(donor),
+                )
+                self.assertEqual(candidate.provenance.mutation_type, kind)
+
+    def test_campaign_startup_loads_disk_corpus_and_reports_counts(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            store = corpus.CorpusStore(workspace)
+            document = generator.generate_document(generator.CampaignRng(12345))
+            store.save_entry(
+                document,
+                corpus.CorpusProvenance.generated(),
+                {"pipe.rs:1:1"},
+            )
+            args = SimpleNamespace(seed=42, batches=0, batch_size=8)
+            output = StringIO()
+
+            with redirect_stdout(output):
+                status = fuzz._run_campaign(args, workspace, store)
+
+        self.assertEqual(status, 0)
+        self.assertIn(
+            "Corpus loaded: built-in=5 disk=1 deduplicated-total=6",
+            output.getvalue(),
+        )
+
+    def test_run_metadata_records_counts_sources_relationships_and_result(self):
+        parent = self._rich_parent_document()
+        donor = scenario.parse_document(
+            "version 1\nscenario donor\npipe2 8 9\nwrite 9 1 97\n"
+        )
+        generated = mutation.candidate_from_document(
+            generator.generate_document(generator.CampaignRng(88)),
+            "generate",
+        )
+        mutated = mutation.mutate_document(
+            generator.CampaignRng(99),
+            parent,
+            donor,
+            requested_kind="donor-splice",
+        )
+        result = fuzz.BatchResult(
+            False,
+            "passed",
+            ("pipe.rs:1:2",),
+            tuple(sorted((generated.digest, mutated.digest))),
+            "a" * 64,
+        )
+
+        metadata = fuzz._build_run_metadata(
+            42,
+            "./scripts/pipe-oracle/fuzz.py --seed 42",
+            3,
+            1.25,
+            [generated, mutated],
+            result,
+        )
+
+        self.assertEqual(
+            metadata["candidate_counts"],
+            {
+                "candidates": 2,
+                "executable": 2,
+                "malformed": 0,
+                "unique_inputs": 2,
+            },
+        )
+        self.assertEqual(metadata["candidate_sources"], {"generated": 1, "mutation": 1})
+        self.assertEqual(metadata["batch_duration_seconds"], 1.25)
+        self.assertEqual(metadata["new_regions"], ["pipe.rs:1:2"])
+        self.assertEqual(metadata["starry_elf_sha256"], "a" * 64)
+        mutation_relation = metadata["candidate_relationships"][1]
+        self.assertEqual(mutation_relation["parent_digest"], scenario.canonical_digest(parent))
+        self.assertEqual(mutation_relation["donor_digest"], scenario.canonical_digest(donor))
+        self.assertEqual(mutation_relation["mutation_type"], "donor-splice")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = corpus.CorpusStore(Path(temporary_directory))
+            run_path = store.save_run("run-0001", metadata)
+            saved = json.loads((run_path / "metadata.json").read_text())
+        self.assertEqual(saved["schema_version"], 1)
+        self.assertEqual(saved["generator_version"], generator.GENERATOR_VERSION)
+        self.assertEqual(saved["result"], "passed")
+
+    def test_batch_persists_entry_and_restores_elf_coverage_after_restart(self):
+        candidate = mutation.candidate_from_document(
+            scenario.parse_document(
+                "version 1\nscenario x\npipe2 0 1\nwrite 1 1 97\n"
+            ),
+            "generate",
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            oracle = workspace / "pipe-linux-oracle"
+            oracle.write_bytes(b"oracle")
+            starry_elf = fuzz.coverage_object(workspace)
+            starry_elf.parent.mkdir(parents=True)
+            starry_elf.write_bytes(b"instrumented StarryOS ELF")
+            profraw = workspace / "starry.profraw"
+            profraw.write_bytes(b"profile")
+            store = corpus.CorpusStore(workspace)
+
+            def record_host(_elf, _ops, trace):
+                trace.write_bytes(b"trace")
+                return fuzz.HostRecordResult(True, False, "recorded")
+
+            def first_extract(_profraws, _elf, covered_regions):
+                self.assertEqual(covered_regions, set())
+                covered_regions.add("pipe.rs:7:3")
+                return {"pipe.rs:7:3"}
+
+            with (
+                mock.patch.object(fuzz, "_find_or_build_host_oracle", return_value=oracle),
+                mock.patch.object(fuzz, "_record_host", side_effect=record_host),
+                mock.patch.object(
+                    fuzz,
+                    "_run_guest_compare",
+                    return_value=("guest", [profraw], True),
+                ),
+                mock.patch.object(fuzz, "_extract_new_regions", side_effect=first_extract),
+            ):
+                first = fuzz._run_batch(
+                    workspace,
+                    0,
+                    [candidate],
+                    None,
+                    corpus.CanonicalCorpus.initial(),
+                    store.failures_dir,
+                    store=store,
+                )
+
+            restarted_store = corpus.CorpusStore(workspace)
+            restarted_corpus = corpus.CanonicalCorpus.initial()
+            disk_corpus = restarted_store.load_corpus()
+            for entry in disk_corpus.ordered_entries():
+                restarted_corpus.add(entry.document)
+
+            def second_extract(_profraws, _elf, covered_regions):
+                self.assertEqual(covered_regions, {"pipe.rs:7:3"})
+                return set()
+
+            with (
+                mock.patch.object(fuzz, "_find_or_build_host_oracle", return_value=oracle),
+                mock.patch.object(fuzz, "_record_host", side_effect=record_host),
+                mock.patch.object(
+                    fuzz,
+                    "_run_guest_compare",
+                    return_value=("guest", [profraw], True),
+                ),
+                mock.patch.object(fuzz, "_extract_new_regions", side_effect=second_extract),
+            ):
+                second = fuzz._run_batch(
+                    workspace,
+                    1,
+                    [candidate],
+                    None,
+                    restarted_corpus,
+                    restarted_store.failures_dir,
+                    store=restarted_store,
+                )
+
+        self.assertFalse(first.failed)
+        self.assertEqual(first.admitted_digests, (candidate.digest,))
+        self.assertEqual(len(disk_corpus), 1)
+        self.assertEqual(len(restarted_corpus), 6)
+        self.assertFalse(second.failed)
+        self.assertEqual(second.new_regions, ())
+        self.assertEqual(second.admitted_digests, ())
 
     def test_parameter_mutation_prefers_boundaries_and_can_be_malformed(self):
         rng = generator.CampaignRng(7)
@@ -513,6 +693,11 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
             mutation.CandidateClassification.MALFORMED,
             None,
             "codec:out-of-range",
+            corpus.CorpusProvenance.mutated(
+                "0" * 64,
+                None,
+                "mutate-parameter",
+            ),
         )
         with tempfile.TemporaryDirectory() as temporary_directory:
             workspace = Path(temporary_directory)
@@ -525,7 +710,7 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
                     0,
                     [malformed],
                     set(),
-                    fuzz.CanonicalCorpus(),
+                    corpus.CanonicalCorpus(),
                     workspace / "failures",
                 )
         self.assertFalse(failed)
@@ -566,7 +751,7 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
                     0,
                     [candidate],
                     set(),
-                    fuzz.CanonicalCorpus(),
+                    corpus.CanonicalCorpus(),
                     workspace / "failures",
                     stats,
                 )
@@ -643,7 +828,7 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
                     2,
                     [candidate],
                     set(),
-                    fuzz.CanonicalCorpus(),
+                    corpus.CanonicalCorpus(),
                     failures_directory,
                 )
 

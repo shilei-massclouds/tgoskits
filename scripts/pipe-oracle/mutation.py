@@ -6,6 +6,7 @@ from enum import Enum
 from typing import Optional, Tuple
 
 import generator
+from corpus import CorpusProvenance
 from scenario import (
     Close,
     Dup,
@@ -94,6 +95,7 @@ class MutationCandidate:
     classification: CandidateClassification
     document: Optional[ScenarioDocument]
     error_category: Optional[str]
+    provenance: CorpusProvenance
 
     @property
     def digest(self) -> str:
@@ -105,7 +107,7 @@ class MutationUnavailable(RuntimeError):
 
 
 def candidate_from_document(document: ScenarioDocument, kind: str) -> MutationCandidate:
-    return _classify_candidate(document, kind)
+    return _classify_candidate(document, kind, CorpusProvenance.generated())
 
 
 def mutate_document(
@@ -117,24 +119,40 @@ def mutate_document(
     """Return a changed structured candidate or report a forced-kind limitation."""
 
     parent_encoded = serialize_document(parent).encode("utf-8")
+    parent_digest = hashlib.sha256(parent_encoded).hexdigest()
+    donor_digest = (
+        hashlib.sha256(serialize_document(donor).encode("utf-8")).hexdigest()
+        if donor is not None
+        else None
+    )
     attempts = 64 if requested_kind is None else 32
     for _ in range(attempts):
         kind = requested_kind or MUTATION_KINDS[rng.range(0, len(MUTATION_KINDS))]
         mutated = _apply_mutation_kind(rng, parent, donor, kind)
         if mutated is None:
             continue
-        candidate = _classify_candidate(mutated, kind)
+        candidate = _classify_candidate(
+            mutated,
+            kind,
+            CorpusProvenance.mutated(parent_digest, donor_digest, kind),
+        )
         if candidate.encoded == parent_encoded:
             continue
         if (
             candidate.classification == CandidateClassification.EXECUTABLE
-            and candidate.digest == hashlib.sha256(parent_encoded).hexdigest()
+            and candidate.digest == parent_digest
         ):
             continue
         return candidate
     if requested_kind is not None:
         raise MutationUnavailable(f"{requested_kind} cannot change this parent")
-    return _fallback_insert_candidate(rng, parent, parent_encoded)
+    return _fallback_insert_candidate(
+        rng,
+        parent,
+        parent_encoded,
+        parent_digest,
+        donor_digest,
+    )
 
 
 def repair_dependencies(document: ScenarioDocument) -> ScenarioDocument:
@@ -479,7 +497,7 @@ def _random_fragment(rng, length: int) -> Tuple[int, int]:
     return start, end
 
 
-def _classify_candidate(document, kind):
+def _classify_candidate(document, kind, provenance):
     encoded = serialize_unchecked_document(document).encode("utf-8")
     try:
         parsed = parse_document(encoded)
@@ -491,6 +509,7 @@ def _classify_candidate(document, kind):
             CandidateClassification.MALFORMED,
             None,
             f"codec:{error.category.value}",
+            provenance,
         )
     except ScenarioEntryLimitError as error:
         return MutationCandidate(
@@ -499,6 +518,7 @@ def _classify_candidate(document, kind):
             CandidateClassification.MALFORMED,
             None,
             f"limit:{error.category.value}",
+            provenance,
         )
     canonical = serialize_document(parsed).encode("utf-8")
     return MutationCandidate(
@@ -507,14 +527,26 @@ def _classify_candidate(document, kind):
         CandidateClassification.EXECUTABLE,
         parsed,
         None,
+        provenance,
     )
 
 
-def _fallback_insert_candidate(rng, parent, parent_encoded):
+def _fallback_insert_candidate(
+    rng,
+    parent,
+    parent_encoded,
+    parent_digest,
+    donor_digest,
+):
     for _ in range(64):
         candidate = _classify_candidate(
             repair_dependencies(_insert_operation(rng, parent)),
             "insert-operation",
+            CorpusProvenance.mutated(
+                parent_digest,
+                donor_digest,
+                "insert-operation",
+            ),
         )
         if candidate.encoded != parent_encoded:
             return candidate

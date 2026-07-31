@@ -255,7 +255,22 @@ StarryOS 返回 `EINVAL` 的真实差异，保存为
 
 **定位：近期至中期，投入中，两个或三个 PR。**
 
+**阶段状态：进行中。**
+
 ### 6.1 持久化和去重
+
+**子阶段状态：已完成。**
+
+| 步骤 | 状态 | 完成日期 | 验证证据或继续位置 |
+|---|---|---|---|
+| 1. 确定持久目录、schema、兼容和原子保存策略 | 已完成 | 2026-07-31 | 采用 canonical SHA-256 entry 目录、schema v1、generator 版本拒绝、ELF digest 隔离 coverage state、临时目录原子 rename、metadata 原子 replace 和 workspace campaign 锁。 |
+| 2. 添加重启恢复回归并确认旧实现失败 | 已完成 | 2026-07-31 | 新增独立 `test_corpus.py`；旧实现因不存在磁盘 corpus 模块而以 `ModuleNotFoundError: No module named 'corpus'` 确定性失败。 |
+| 3. 实现独立 corpus 持久层和严格加载 | 已完成 | 2026-07-31 | `corpus.py` 已实现 canonical 去重、entry metadata、原子保存、损坏/不兼容 fail closed、ELF coverage state 和进程锁；11 个独立 corpus 测试通过。 |
+| 4. 接入 campaign provenance、run metadata 和持久 coverage 基线 | 已完成 | 2026-07-31 | `MutationCandidate` 已贯穿 generated/mutation、parent、donor 和 mutation 类型；`fuzz.py` 启动合并磁盘 corpus，原子记录 run metadata，并按 Starry ELF digest 恢复/保存 coverage baseline。40 个 Python 测试通过，固定 seed 的 batch digest golden 保持不变。 |
+| 5. 补全测试、文档和两次真实 campaign 验收 | 已完成 | 2026-07-31 | README 和设计文档已同步；40 个 Python 测试、`py_compile` 和 `git diff --check` 通过。第一次 seed 42 campaign 完成 host record、StarryOS QEMU compare 和 coverage 提取，持久化 8 个 canonical entry 及 382 个新增 pipe region；第二次重启报告 `built-in=5 disk=8 deduplicated-total=13`，完成 compare/coverage 并继续准入 2 个新 entry。两次构建得到不同 Starry ELF digest，各自保存独立的 382-region baseline；严格重载确认磁盘共有 10 个唯一 digest，且无半写目录。 |
+
+阶段 2.2 的精确 coverage 归因和阶段 2.3 的场景最小化仍未开始，不属于当前
+2.1 提交。
 
 按 canonical 操作序列而不是 raw input 保存成功 corpus。每个 entry 记录：
 
@@ -273,6 +288,8 @@ campaign 启动时加载兼容版本的 corpus。版本不兼容时必须显式�
 
 ### 6.2 精确 coverage 归因
 
+**子阶段状态：未开始。**
+
 常规路径继续使用 batch 降低 QEMU 次数。只有 batch 获得新 region 时，才对子集
 进行重放：
 
@@ -288,6 +305,8 @@ campaign 启动时加载兼容版本的 corpus。版本不兼容时必须显式�
 的具体贡献，作为后续评估单位 QEMU 时间收益的基础。
 
 ### 6.3 场景最小化
+
+**子阶段状态：未开始。**
 
 对 mismatch 和获得新 region 的场景分别使用对应谓词最小化：
 

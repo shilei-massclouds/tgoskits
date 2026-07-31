@@ -2,9 +2,9 @@
 
 ## Status
 
-Implemented on 2026-07-30 and extended with structured scenario generation on
-2026-07-31. This document records the design and implementation of the
-script-driven pipe differential oracle.
+Implemented on 2026-07-30, extended with structured scenario generation and a
+persistent canonical coverage corpus on 2026-07-31. This document records the
+design and implementation of the script-driven pipe differential oracle.
 
 Base: `dev-cov2` at `fb399d055`.
 
@@ -83,6 +83,8 @@ The implementation is complete when all of the following hold:
   coverage-batch orchestrator are removed;
 - `scripts/pipe-oracle/fuzz.py` drives coverage-guided mutation using `--seed`,
   `--batches`, `--batch-size`;
+- compatible canonical corpus entries and ELF-scoped coverage baselines survive
+  campaign restart without admitting duplicate scenarios;
 - `scripts/pipe-oracle/replay.py` replays saved failure artifacts;
 - failure artifacts include `input.bin`, `pipe.ops`, `linux.trace`,
   `pipe-linux-oracle` ELF, `guest.log`, profraw files, and `metadata.json`;
@@ -206,6 +208,9 @@ does not exist and the production kernel carries no coverage-related code.
 
 - `common.py`: SHA-256 hashing, atomic directory save, `build_metadata()` that
   captures git commit, dirty state, host uname, page size, and file digests.
+- `corpus.py`: Canonical digest map, schema-v1 persistent entry validation,
+  atomic entry/run/coverage-state saves, ELF-scoped region baselines, and the
+  workspace campaign lock.
 - `scenario.py`: Immutable scenario/operation IR plus the version-1 `pipe.ops`
   parser, canonical serializer, digest, typed codec errors, and campaign limits.
 - `generator.py`: Version-2 deterministic operation generation using a
@@ -225,12 +230,12 @@ does not exist and the production kernel carries no coverage-related code.
 - `coverage.py`: `llvm-profdata merge -sparse` and `llvm-cov export` against
   `target/x86_64-unknown-none/release/starryos`; covered pipe regions use stable
   `source:line:column` string IDs.
-- `fuzz.py`: Batch fuzzing with seed, batch count, batch size. The in-memory
-  corpus is a canonical-digest-sorted map of UTF-8 `pipe.ops` entries; each
-  selection remains 30% new generation and 70% structured mutation. Malformed
-  candidates are counted and filtered before host/QEMU execution. Each
-  executable batch runs one QEMU; mismatch/panic/timeout/coverage failure stops
-  immediately and saves a complete failure artifact to
+- `fuzz.py`: Batch fuzzing with seed, batch count, batch size. Startup merges
+  five built-in seeds with compatible disk entries into a canonical-digest-
+  sorted map; each selection remains 30% new generation and 70% structured
+  mutation. Malformed candidates are counted and filtered before host/QEMU
+  execution. Each executable batch runs one QEMU; mismatch/panic/timeout/
+  coverage failure stops immediately and saves a complete failure artifact to
   `coverage/pipe-oracle-fuzz/failures/`.
 - `replay.py`: Replays a saved failure. Validates schema, digests, ELF type.
   Runs the same guest QEMU with the saved artifacts. `--refresh-host`
@@ -245,6 +250,61 @@ Constraints:
   batch serialization, and mutations across processes.
 - Codec failures carry a stable category and line number. Malformed mutation
   candidates never enter host or StarryOS execution batches.
+
+### Persistent corpus ownership and schema
+
+The ignored campaign state has this layout:
+
+```
+coverage/pipe-oracle-fuzz/
+  corpus/<canonical-sha256>/{pipe.ops,metadata.json}
+  runs/<run-id>/metadata.json
+  coverage-state/<starry-elf-sha256>.json
+  failures/...
+  .campaign.lock
+```
+
+`CorpusStore` owns these paths. `CanonicalCorpus` owns only the deduplicated
+in-memory selection map. On startup the store strictly loads finalized entry
+directories, then the orchestrator merges them with the five built-in seeds and
+prints the built-in, disk, and deduplicated counts. A nonblocking process-level
+`flock` is held for the complete campaign so two fuzzers cannot concurrently
+update the same corpus, coverage baseline, or fixed profraw path.
+
+Corpus metadata schema v1 records the canonical and `pipe.ops` digests,
+generator version, generated/mutation origin, parent and selected donor digest,
+mutation type, first batch's new regions, first-observed and last-verified Git
+and host environment, stability state, and batch compare/replay state. New
+regions are explicitly attributed as `batch-pending`: stage 2.1 admits all
+unique executable entries from a productive batch and makes no claim that an
+individual entry covered a region by itself. Exact attribution and minimization
+remain separate later stages.
+
+Loading fails closed on an unknown schema or generator version, a directory or
+file digest mismatch, noncanonical UTF-8 encoding, codec/resource-limit error,
+invalid metadata, symlink, or unexpected finalized file. There is no implicit
+migration. Mutation provenance adds no RNG calls and does not participate in
+the canonical digest, preserving generator and mutation output for a fixed
+seed.
+
+A new entry is written to a hidden uniquely named temporary directory, fsynced,
+and atomically renamed to its digest directory. Revalidation updates
+`last_verified` and its count through a temporary metadata file plus atomic
+replace. Run directories use the same temporary-directory/rename protocol.
+Only finalized 64-hex digest directories are loaded, so a process killed during
+its initial write cannot expose a half entry.
+
+Coverage state schema v1 is keyed by the SHA-256 of the instrumented StarryOS
+ELF. A batch loads only that ELF's region set, admits productive inputs, and
+then atomically saves the enlarged baseline. Saving entries before the baseline
+ensures an interrupted baseline update can retry admission, rather than losing
+the productive batch permanently. A different ELF starts with an independent
+empty baseline.
+
+Each atomic run record stores the seed, exact command, measured batch duration,
+candidate/executable/malformed/unique counts, sources and ancestry, new regions,
+admitted digests, Starry ELF digest, and result. Run records are observational;
+corpus entry directories remain the authoritative identity used for selection.
 
 ### Artifact injection contract
 
@@ -317,12 +377,14 @@ generated trace (owned by one test run)
               object: target/x86_64-unknown-none/release/starryos
 ```
 
-The checked-in regression corpus is repository-owned. The fuzz campaign owns an
-in-memory, canonical-digest-sorted corpus for the current process; cross-process
-persistence remains a later phase. Trace, profraw, guest log, and prepared
-rootfs are run-owned build artifacts. Failure artifacts are saved under
-`coverage/pipe-oracle-fuzz/failures/` for replay. Version-1 failure replay keeps
-using the saved `pipe.ops`; it does not reinterpret an old raw `input.bin`.
+The checked-in regression corpus is repository-owned. The fuzz campaign owns a
+canonical-digest-sorted selection map merged from built-in and persistent
+entries; the ignored `CorpusStore` owns cross-process corpus identity, run
+records, and ELF-scoped coverage baselines. Trace, profraw, guest log, and
+prepared rootfs are run-owned build artifacts. Failure artifacts are saved
+under `coverage/pipe-oracle-fuzz/failures/` for replay. Version-1 failure replay
+keeps using the saved `pipe.ops`; it does not reinterpret an old raw
+`input.bin`.
 
 ## Linux version and environment policy
 
@@ -358,11 +420,14 @@ The default `cargo xtask starry test qemu --arch x86_64` test path is
 unchanged from `origin/dev`. `pipe-linux-oracle` is only run when explicitly
 selected with `-c qemu/pipe-linux-oracle`.
 
-Rollback: remove the `pipe-linux-oracle` case directory and the `default_run`
-field from axbuild. Production pipe fixes and existing axtest coverage remain
-valid independently.
+Persistent-state rollback does not require a code change: with no campaign
+running, remove or archive `corpus/`, `runs/`, and `coverage-state/` to return to
+the five built-in seeds while preserving `failures/`. Full feature rollback can
+remove the `pipe-linux-oracle` case directory and the `default_run` field from
+axbuild. Production pipe fixes and existing axtest coverage remain valid
+independently.
 
-Future work may add persistent corpus identity and precise coverage attribution,
+Future work may add precise coverage attribution and minimization,
 blocking/concurrent scenarios, cross-architecture differential coverage, or
 automatic CI regression detection. Those changes require their own design
 evidence and must continue to keep the default test path clean.
