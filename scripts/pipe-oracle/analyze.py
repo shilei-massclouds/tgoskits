@@ -1,18 +1,36 @@
 #!/usr/bin/env python3
+"""Offline effectiveness analysis for structured pipe generation and mutation."""
+
 import argparse
 import hashlib
 import json
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Callable, Dict, List, MutableMapping, Tuple
+from typing import Dict, MutableMapping, Tuple
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(SCRIPT_DIR))
 
-import fuzz
 import generator
+import mutation
+from scenario import (
+    Close,
+    Dup,
+    Fionread,
+    GetSize,
+    Pipe2,
+    Poll,
+    Read,
+    ReadNull,
+    ScenarioDocument,
+    SetSize,
+    Write,
+    WriteNull,
+    operation_name,
+    serialize_document,
+)
 
 
 DEFAULT_SEED = 42
@@ -23,7 +41,9 @@ DEFAULT_TOP = 10
 OPERATION_NAMES = (
     "pipe2",
     "read",
+    "read-null",
     "write",
+    "write-null",
     "dup",
     "close",
     "poll",
@@ -34,23 +54,60 @@ OPERATION_NAMES = (
 LENGTH_BUCKETS = (
     "0",
     "1",
-    "2-4095",
+    "2",
+    "3-4094",
+    "4095",
     "4096",
-    "4097-8191",
+    "4097",
+    "4098-8190",
+    "8191",
     "8192",
-    "other",
 )
 PIPE_SIZE_BUCKETS = (
+    "0",
     "1",
-    "2-4095",
+    "2",
+    "3-4094",
+    "4095",
     "4096",
-    "4097-65535",
-    "65536",
-    "65537-1048575",
-    "1048576",
+    "4097",
+    "4098-8190",
+    "8191",
+    "8192",
+    "8193",
+    "8194-2147483646",
+    "2147483647",
+)
+POLL_MASK_BUCKETS = (
+    "0",
+    "1",
+    "4",
+    "5",
+    "4095",
+    "4096",
+    "4097",
+    "8191",
+    "8192",
+    "8193",
+    "16384",
+    "32767",
     "other",
 )
-POLL_MASK_BUCKETS = ("0", "1", "4", "5", "other")
+RESOURCE_CATEGORIES = (
+    "read-null",
+    "write-null",
+    "idle-slot",
+    "closed-slot",
+    "wrong-endpoint",
+    "duplicate-close",
+    "query-read-end",
+    "query-write-end",
+)
+
+FREE = 0
+READER = 1
+WRITER = 2
+CLOSED = 3
 
 
 def main(argv=None):
@@ -67,18 +124,17 @@ def analyze(seed: int, samples: int, mutations: int, top: int) -> Dict:
     source_specs = (
         (
             "campaign_rng",
-            "fuzz._Rng (64-bit LCG)",
-            fuzz._Rng,
+            "SHA-256 counter stream v2 with rejection sampling",
+            generator.CampaignRng,
         ),
         (
-            "independent_rng",
-            "SHA-256 counter stream",
-            _IndependentRng,
+            "legacy_lcg",
+            "version-1 64-bit LCG analysis contrast",
+            generator.LegacyLcgRng,
         ),
     )
-    sources = {}
-    for source_name, algorithm, rng_factory in source_specs:
-        sources[source_name] = _analyze_source(
+    sources = {
+        source_name: _analyze_source(
             algorithm,
             rng_factory,
             seed,
@@ -86,9 +142,10 @@ def analyze(seed: int, samples: int, mutations: int, top: int) -> Dict:
             mutations,
             top,
         )
-
+        for source_name, algorithm, rng_factory in source_specs
+    }
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "config": {
             "seed": seed,
             "samples_per_source": samples,
@@ -104,7 +161,7 @@ def analyze(seed: int, samples: int, mutations: int, top: int) -> Dict:
 def format_text(report: Dict) -> str:
     config = report["config"]
     lines = [
-        "Pipe oracle generator and mutation analysis",
+        "Pipe oracle structured generator and mutation analysis",
         (
             f"seed={config['seed']} "
             f"samples/source={config['samples_per_source']} "
@@ -114,7 +171,7 @@ def format_text(report: Dict) -> str:
     ]
     for source_name, source in report["sources"].items():
         generation = source["generation"]
-        mutation = source["mutation"]
+        mutations = source["mutation"]
         lines.extend(
             [
                 "",
@@ -128,25 +185,26 @@ def format_text(report: Dict) -> str:
                 ),
                 (
                     "mutation: "
-                    f"attempts={mutation['attempts']} "
-                    f"raw_changed={mutation['raw_changed']} "
-                    f"raw_change_rate={_percent(mutation['raw_change_rate'])} "
-                    f"scenario_changed={mutation['scenario_changed']} "
-                    f"scenario_change_rate={_percent(mutation['scenario_change_rate'])} "
-                    "raw_changed_scenario_unchanged="
-                    f"{mutation['raw_changed_scenario_unchanged']}"
+                    f"attempts={mutations['attempts']} "
+                    f"executable={mutations['classifications']['executable']} "
+                    f"malformed={mutations['classifications']['malformed']} "
+                    "executable_encoded_changed_canonical_unchanged="
+                    f"{mutations['executable_encoded_changed_canonical_unchanged']}"
                 ),
                 "mutation kinds:",
             ]
         )
-        for kind, counts in mutation["by_kind"].items():
+        for kind, counts in mutations["by_kind"].items():
             lines.append(
                 f"  {kind}: attempts={counts['attempts']} "
-                f"raw_changed={counts['raw_changed']} "
-                f"scenario_changed={counts['scenario_changed']}"
+                f"executable={counts['executable']} "
+                f"malformed={counts['malformed']} "
+                f"canonical_changed={counts['canonical_changed']}"
             )
         lines.extend(
             [
+                "malformed categories:",
+                f"  {_format_counts(mutations['malformed_categories'])}",
                 "operation counts:",
                 f"  {_format_counts(generation['operation_counts'])}",
                 "length buckets (read/write):",
@@ -155,14 +213,11 @@ def format_text(report: Dict) -> str:
                 f"  {_format_counts(generation['parameter_buckets']['pipe_size'])}",
                 "poll mask buckets:",
                 f"  {_format_counts(generation['parameter_buckets']['poll_mask'])}",
-                "reader/writer counts before each operation:",
+                "resource categories:",
+                f"  {_format_counts(generation['resource_categories'])}",
+                "top canonical scenarios:",
             ]
         )
-        for operation, buckets in generation[
-            "endpoint_counts_before_operation"
-        ].items():
-            lines.append(f"  {operation}: {_format_counts(buckets)}")
-        lines.append("top canonical scenarios:")
         for scenario in generation["top_scenarios"]:
             lines.append(
                 f"  {scenario['digest']} count={scenario['count']} "
@@ -182,7 +237,9 @@ def _parse_args(argv):
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--samples", type=_positive_int, default=DEFAULT_SAMPLES)
     parser.add_argument(
-        "--mutations", type=_non_negative_int, default=DEFAULT_MUTATIONS
+        "--mutations",
+        type=_non_negative_int,
+        default=DEFAULT_MUTATIONS,
     )
     parser.add_argument("--top", type=_non_negative_int, default=DEFAULT_TOP)
     parser.add_argument("--format", choices=("text", "json"), default="text")
@@ -204,37 +261,36 @@ def _non_negative_int(value: str) -> int:
 
 
 def _analyze_source(
-    algorithm: str,
-    rng_factory: Callable[[int], object],
-    seed: int,
-    sample_count: int,
-    mutation_count: int,
-    top: int,
-) -> Dict:
+    algorithm,
+    rng_factory,
+    seed,
+    sample_count,
+    mutation_count,
+    top,
+):
     rng = rng_factory(seed)
-    raw_inputs = [_generate_raw_input(rng) for _ in range(sample_count)]
-    canonical_digests = {}
+    documents = [generator.generate_document(rng) for _ in range(sample_count)]
     canonical_counts = Counter()
     canonical_texts = {}
     distributions = _new_distributions()
 
-    for raw_input in raw_inputs:
-        canonical_text, digest = generator.canonicalize_input(raw_input)
-        canonical_digests[raw_input] = digest
+    for document in documents:
+        canonical_text = serialize_document(document)
+        digest = hashlib.sha256(canonical_text.encode("utf-8")).hexdigest()
         canonical_counts[digest] += 1
         canonical_texts.setdefault(digest, canonical_text)
-        _record_operations(canonical_text, distributions)
+        _record_document(document, distributions)
 
     mutation_counts = _new_mutation_counts()
     for _ in range(mutation_count):
-        parent = raw_inputs[rng.range(0, len(raw_inputs))]
-        child, kind = fuzz._mutate_with_kind(rng, parent)
-        parent_digest = canonical_digests[parent]
-        child_digest = canonical_digests.get(child)
-        if child_digest is None:
-            _canonical_text, child_digest = generator.canonicalize_input(child)
-            canonical_digests[child] = child_digest
-        _record_mutation(mutation_counts, kind, parent, child, parent_digest, child_digest)
+        parent_index = rng.range(0, len(documents))
+        donor_index = rng.range(0, len(documents))
+        if len(documents) > 1 and donor_index == parent_index:
+            donor_index = (donor_index + 1) % len(documents)
+        parent = documents[parent_index]
+        donor = documents[donor_index]
+        candidate = mutation.mutate_document(rng, parent, donor)
+        _record_mutation(mutation_counts, parent, candidate)
 
     unique_count = len(canonical_counts)
     duplicate_count = sample_count - unique_count
@@ -246,22 +302,33 @@ def _analyze_source(
             "duplicate_samples": duplicate_count,
             "duplicate_rate": _rate(duplicate_count, sample_count),
             "top_scenarios": _top_scenarios(
-                canonical_counts, canonical_texts, sample_count, top
+                canonical_counts,
+                canonical_texts,
+                sample_count,
+                top,
             ),
             "operation_counts": _complete_counts(
-                OPERATION_NAMES, distributions["operation_counts"]
+                OPERATION_NAMES,
+                distributions["operation_counts"],
             ),
             "parameter_buckets": {
                 "length": _complete_counts(
-                    LENGTH_BUCKETS, distributions["length_buckets"]
+                    LENGTH_BUCKETS,
+                    distributions["length_buckets"],
                 ),
                 "pipe_size": _complete_counts(
-                    PIPE_SIZE_BUCKETS, distributions["pipe_size_buckets"]
+                    PIPE_SIZE_BUCKETS,
+                    distributions["pipe_size_buckets"],
                 ),
                 "poll_mask": _complete_counts(
-                    POLL_MASK_BUCKETS, distributions["poll_mask_buckets"]
+                    POLL_MASK_BUCKETS,
+                    distributions["poll_mask_buckets"],
                 ),
             },
+            "resource_categories": _complete_counts(
+                RESOURCE_CATEGORIES,
+                distributions["resource_categories"],
+            ),
             "endpoint_counts_before_operation": {
                 operation: dict(
                     sorted(distributions["endpoint_counts"][operation].items())
@@ -273,156 +340,188 @@ def _analyze_source(
     }
 
 
-def _generate_raw_input(rng) -> bytes:
-    length = rng.range(1, 129)
-    return bytes(rng.next() % 256 for _ in range(length))
-
-
-def _new_distributions() -> Dict:
+def _new_distributions():
     return {
         "operation_counts": Counter(),
         "length_buckets": Counter(),
         "pipe_size_buckets": Counter(),
         "poll_mask_buckets": Counter(),
+        "resource_categories": Counter(),
         "endpoint_counts": defaultdict(Counter),
     }
 
 
-def _record_operations(canonical_text: str, distributions: MutableMapping) -> None:
-    slots = [0] * generator.MAX_LOGICAL_SLOTS
-    for line in canonical_text.splitlines():
-        fields = line.split()
-        if not fields or fields[0] == "version":
-            continue
-        if fields[0] == "scenario":
-            slots = [0] * generator.MAX_LOGICAL_SLOTS
-            continue
-
-        operation = fields[0]
-        distributions["operation_counts"][operation] += 1
-        readers = slots.count(1)
-        writers = slots.count(2)
-        state_bucket = f"readers={readers},writers={writers}"
-        distributions["endpoint_counts"][operation][state_bucket] += 1
-
-        if operation in ("read", "write"):
-            distributions["length_buckets"][_length_bucket(int(fields[2]))] += 1
-        elif operation == "set-size":
-            distributions["pipe_size_buckets"][_pipe_size_bucket(int(fields[2]))] += 1
-        elif operation == "poll":
-            distributions["poll_mask_buckets"][_poll_mask_bucket(int(fields[2]))] += 1
-
-        _apply_resource_transition(operation, fields, slots)
+def _record_document(document: ScenarioDocument, distributions: MutableMapping):
+    for scenario in document.scenarios:
+        slots = [FREE] * generator.MAX_LOGICAL_SLOTS
+        for operation in scenario.operations:
+            name = operation_name(operation)
+            distributions["operation_counts"][name] += 1
+            readers = slots.count(READER)
+            writers = slots.count(WRITER)
+            state_bucket = f"readers={readers},writers={writers}"
+            distributions["endpoint_counts"][name][state_bucket] += 1
+            _record_parameters(operation, distributions)
+            _record_resource_category(operation, slots, distributions)
+            _apply_resource_transition(operation, slots)
 
 
-def _apply_resource_transition(operation: str, fields: List[str], slots: List[int]) -> None:
-    if operation == "pipe2":
-        slots[int(fields[1])] = 1
-        slots[int(fields[2])] = 2
-    elif operation == "dup":
-        slots[int(fields[2])] = slots[int(fields[1])]
-    elif operation == "close":
-        slots[int(fields[1])] = 0
+def _record_parameters(operation, distributions):
+    if isinstance(operation, (Read, Write)):
+        distributions["length_buckets"][_length_bucket(operation.length)] += 1
+    elif isinstance(operation, SetSize):
+        distributions["pipe_size_buckets"][_pipe_size_bucket(operation.size)] += 1
+    elif isinstance(operation, Poll):
+        distributions["poll_mask_buckets"][_poll_mask_bucket(operation.events)] += 1
 
 
-def _length_bucket(length: int) -> str:
-    if length in (0, 1, 4096, 8192):
-        return str(length)
-    if 2 <= length <= 4095:
-        return "2-4095"
-    if 4097 <= length <= 8191:
-        return "4097-8191"
+def _record_resource_category(operation, slots, distributions):
+    categories = distributions["resource_categories"]
+    if isinstance(operation, ReadNull):
+        categories["read-null"] += 1
+    if isinstance(operation, WriteNull):
+        categories["write-null"] += 1
+    if isinstance(operation, Pipe2):
+        return
+
+    slot = operation.source_slot if isinstance(operation, Dup) else operation.slot
+    slot_state = slots[slot]
+    if slot_state == FREE:
+        categories["idle-slot"] += 1
+    elif slot_state == CLOSED:
+        categories["closed-slot"] += 1
+    if isinstance(operation, Close) and slot_state == CLOSED:
+        categories["duplicate-close"] += 1
+    if isinstance(operation, (Read, ReadNull)) and slot_state == WRITER:
+        categories["wrong-endpoint"] += 1
+    if isinstance(operation, (Write, WriteNull)) and slot_state == READER:
+        categories["wrong-endpoint"] += 1
+    if isinstance(operation, (SetSize, GetSize, Fionread)):
+        if slot_state == READER:
+            categories["query-read-end"] += 1
+        elif slot_state == WRITER:
+            categories["query-write-end"] += 1
+
+
+def _apply_resource_transition(operation, slots):
+    if isinstance(operation, Pipe2):
+        slots[operation.read_slot] = READER
+        slots[operation.write_slot] = WRITER
+    elif isinstance(operation, Dup):
+        source_state = slots[operation.source_slot]
+        if source_state in (READER, WRITER):
+            slots[operation.destination_slot] = source_state
+    elif isinstance(operation, Close):
+        if slots[operation.slot] in (READER, WRITER):
+            slots[operation.slot] = CLOSED
+
+
+def _length_bucket(value):
+    if value in (0, 1, 2, 4095, 4096, 4097, 8191, 8192):
+        return str(value)
+    if 3 <= value <= 4094:
+        return "3-4094"
+    return "4098-8190"
+
+
+def _pipe_size_bucket(value):
+    if value in (0, 1, 2, 4095, 4096, 4097, 8191, 8192, 8193, 2147483647):
+        return str(value)
+    if 3 <= value <= 4094:
+        return "3-4094"
+    if 4098 <= value <= 8190:
+        return "4098-8190"
+    return "8194-2147483646"
+
+
+def _poll_mask_bucket(value):
+    if value in (0, 1, 4, 5, 4095, 4096, 4097, 8191, 8192, 8193, 16384, 32767):
+        return str(value)
     return "other"
 
 
-def _pipe_size_bucket(pipe_size: int) -> str:
-    if pipe_size in (1, 4096, 65536, 1048576):
-        return str(pipe_size)
-    if 2 <= pipe_size <= 4095:
-        return "2-4095"
-    if 4097 <= pipe_size <= 65535:
-        return "4097-65535"
-    if 65537 <= pipe_size <= 1048575:
-        return "65537-1048575"
-    return "other"
-
-
-def _poll_mask_bucket(mask: int) -> str:
-    if mask in (0, 1, 4, 5):
-        return str(mask)
-    return "other"
-
-
-def _new_mutation_counts() -> Dict:
+def _new_mutation_counts():
     return {
         "attempts": 0,
-        "raw_changed": 0,
-        "scenario_changed": 0,
-        "raw_changed_scenario_unchanged": 0,
+        "encoded_changed": 0,
+        "canonical_changed": 0,
+        "executable_encoded_changed_canonical_unchanged": 0,
+        "classifications": Counter(),
+        "malformed_categories": Counter(),
         "by_kind": {
             kind: {
                 "attempts": 0,
-                "raw_changed": 0,
-                "scenario_changed": 0,
+                "encoded_changed": 0,
+                "canonical_changed": 0,
+                "executable": 0,
+                "malformed": 0,
             }
-            for kind in fuzz.MUTATION_KINDS
+            for kind in mutation.MUTATION_KINDS
         },
     }
 
 
-def _record_mutation(
-    counts: MutableMapping,
-    kind: str,
-    parent: bytes,
-    child: bytes,
-    parent_digest: str,
-    child_digest: str,
-) -> None:
-    raw_changed = parent != child
-    scenario_changed = parent_digest != child_digest
-    counts["attempts"] += 1
-    counts["raw_changed"] += int(raw_changed)
-    counts["scenario_changed"] += int(scenario_changed)
-    counts["raw_changed_scenario_unchanged"] += int(
-        raw_changed and not scenario_changed
+def _record_mutation(counts, parent, candidate):
+    parent_encoded = serialize_document(parent).encode("utf-8")
+    encoded_changed = parent_encoded != candidate.encoded
+    executable = (
+        candidate.classification == mutation.CandidateClassification.EXECUTABLE
     )
-    kind_counts = counts["by_kind"][kind]
+    canonical_changed = executable and hashlib.sha256(parent_encoded).hexdigest() != (
+        candidate.digest
+    )
+    counts["attempts"] += 1
+    counts["encoded_changed"] += int(encoded_changed)
+    counts["canonical_changed"] += int(canonical_changed)
+    counts["executable_encoded_changed_canonical_unchanged"] += int(
+        executable and encoded_changed and not canonical_changed
+    )
+    counts["classifications"][candidate.classification.value] += 1
+    if candidate.error_category:
+        counts["malformed_categories"][candidate.error_category] += 1
+
+    kind_counts = counts["by_kind"][candidate.kind]
     kind_counts["attempts"] += 1
-    kind_counts["raw_changed"] += int(raw_changed)
-    kind_counts["scenario_changed"] += int(scenario_changed)
+    kind_counts["encoded_changed"] += int(encoded_changed)
+    kind_counts["canonical_changed"] += int(canonical_changed)
+    kind_counts[candidate.classification.value] += 1
 
 
-def _finalize_mutations(counts: Dict) -> Dict:
+def _finalize_mutations(counts):
     attempts = counts["attempts"]
     by_kind = {}
     for kind, kind_counts in counts["by_kind"].items():
         kind_attempts = kind_counts["attempts"]
         by_kind[kind] = {
             **kind_counts,
-            "raw_change_rate": _rate(kind_counts["raw_changed"], kind_attempts),
-            "scenario_change_rate": _rate(
-                kind_counts["scenario_changed"], kind_attempts
+            "encoded_change_rate": _rate(
+                kind_counts["encoded_changed"],
+                kind_attempts,
+            ),
+            "canonical_change_rate": _rate(
+                kind_counts["canonical_changed"],
+                kind_attempts,
             ),
         }
     return {
         "attempts": attempts,
-        "raw_changed": counts["raw_changed"],
-        "raw_change_rate": _rate(counts["raw_changed"], attempts),
-        "scenario_changed": counts["scenario_changed"],
-        "scenario_change_rate": _rate(counts["scenario_changed"], attempts),
-        "raw_changed_scenario_unchanged": counts[
-            "raw_changed_scenario_unchanged"
+        "encoded_changed": counts["encoded_changed"],
+        "encoded_change_rate": _rate(counts["encoded_changed"], attempts),
+        "canonical_changed": counts["canonical_changed"],
+        "canonical_change_rate": _rate(counts["canonical_changed"], attempts),
+        "executable_encoded_changed_canonical_unchanged": counts[
+            "executable_encoded_changed_canonical_unchanged"
         ],
+        "classifications": {
+            classification.value: counts["classifications"][classification.value]
+            for classification in mutation.CandidateClassification
+        },
+        "malformed_categories": dict(sorted(counts["malformed_categories"].items())),
         "by_kind": by_kind,
     }
 
 
-def _top_scenarios(
-    counts: Counter,
-    texts: Dict[str, str],
-    sample_count: int,
-    top: int,
-) -> List[Dict]:
+def _top_scenarios(counts, texts, sample_count, top):
     ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
     return [
         {
@@ -435,62 +534,44 @@ def _top_scenarios(
     ]
 
 
-def _complete_counts(keys: Tuple[str, ...], counts: Counter) -> Dict[str, int]:
+def _complete_counts(keys: Tuple[str, ...], counts: Counter):
     return {key: counts[key] for key in keys}
 
 
-def _rate(numerator: int, denominator: int) -> float:
+def _rate(numerator, denominator):
     if denominator == 0:
         return 0.0
     return round(numerator / denominator, 6)
 
 
-def _percent(rate: float) -> str:
+def _percent(rate):
     return f"{rate * 100:.2f}%"
 
 
-def _format_counts(counts: Dict[str, int]) -> str:
+def _format_counts(counts):
     return ", ".join(f"{key}={value}" for key, value in counts.items())
 
 
-def _validate_report(report: Dict) -> None:
+def _validate_report(report):
     for source in report["sources"].values():
         generation = source["generation"]
-        mutation = source["mutation"]
+        mutations = source["mutation"]
         assert generation["samples"] == (
             generation["unique_canonical_scenarios"]
             + generation["duplicate_samples"]
         )
-        for field in ("attempts", "raw_changed", "scenario_changed"):
-            assert mutation[field] == sum(
+        for field in ("attempts", "encoded_changed", "canonical_changed"):
+            assert mutations[field] == sum(
                 kind_counts[field]
-                for kind_counts in mutation["by_kind"].values()
+                for kind_counts in mutations["by_kind"].values()
             )
-        assert mutation["scenario_changed"] <= mutation["raw_changed"]
-        assert mutation["raw_changed_scenario_unchanged"] == (
-            mutation["raw_changed"] - mutation["scenario_changed"]
-        )
+        assert mutations["attempts"] == sum(mutations["classifications"].values())
+        assert mutations["encoded_changed"] == mutations["attempts"]
+        assert mutations["executable_encoded_changed_canonical_unchanged"] == 0
         assert sum(generation["operation_counts"].values()) == sum(
             sum(buckets.values())
             for buckets in generation["endpoint_counts_before_operation"].values()
         )
-
-
-class _IndependentRng:
-    def __init__(self, seed: int):
-        self.seed = seed & 0xFFFFFFFFFFFFFFFF
-        self.counter = 0
-
-    def next(self) -> int:
-        payload = self.seed.to_bytes(8, "little") + self.counter.to_bytes(8, "little")
-        self.counter += 1
-        digest = hashlib.sha256(b"pipe-oracle-analysis\x00" + payload).digest()
-        return int.from_bytes(digest[:8], "little")
-
-    def range(self, lo: int, hi: int) -> int:
-        if lo >= hi:
-            return lo
-        return lo + (self.next() % (hi - lo))
 
 
 if __name__ == "__main__":

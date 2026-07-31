@@ -157,7 +157,17 @@ batch 耗时、新增 region 和真实 corpus entry 的来源、后代及 covera
 
 **定位：近期，投入小到中，预期收益最高，拆成两个或三个 PR。**
 
-### 5.1 引入内部场景 IR
+**阶段状态：已完成。**
+
+### 5.1 实施进度
+
+| 步骤 | 状态 | 完成日期 | 验证证据 |
+|---|---|---|---|
+| 1. 行为保持型 IR 与 codec | 已完成 | 2026-07-31 | 11 种 operation、typed codec error、manual corpus round trip 和 legacy full-text/digest golden 通过；新 IR-backed legacy generator 配合阶段 0 analyzer/旧 raw mutator的默认 JSON SHA-256 仍为 `7fc3f25595c3bc8a8fe1cc7bb836895b4dd140d9416abfd216c18637ea75fc89`。 |
+| 2. 结构化 corpus、正式 RNG 与 mutation | 已完成 | 2026-07-31 | 五个 legacy seed 等价迁移；canonical digest 有序 corpus 和独立进程 batch/mutation 确定性通过；8 类 mutation、dependency repair、entry limit、donor splice、schema 2 analyzer 通过，executable canonical no-op 为零。 |
+| 3. 边界字典与错误资源场景 | 已完成 | 2026-07-31 | 0/1、4 KiB/8 KiB 邻域、最大值和未知 mask bit 可达；空闲/关闭 slot、错误端点、重复 close、双端查询和 null I/O 可达；malformed 在 host/QEMU 前过滤，错误资源 corpus 的 host record/compare 自洽。26 个单元测试和 `git diff --check` 通过；短 campaign 进入 QEMU compare 并保存一个真实 poll mask differential artifact。 |
+
+### 5.2 引入内部场景 IR
 
 将 generator 内部表示改为显式的 `Scenario`、`Operation` 和 logical resource。
 `pipe.ops` 继续作为可审查、可重放的执行格式；内部 IR 暂不作为公共 API。
@@ -170,11 +180,12 @@ IR 至少表达：
 - scenario 边界与版本；
 - canonical serialization 和 digest。
 
-场景解码应消费完整输入，而不是只使用前 8 字节生成新的伪随机流。也可以直接以
-结构化 corpus 为主、bytes 作为稳定编码，但必须保证变异位置与操作或参数存在
-可解释关系。
+阶段 1 选择 canonical UTF-8 `pipe.ops` 作为唯一 corpus 编码，不再引入另一种二进制
+格式。任意 raw bytes 到 version-1 LCG 的解码只用于迁移五个初始 seed 和 legacy
+golden；正式 campaign 使用版本化 SHA-256 counter stream，并通过拒绝采样选择范围。
+同一 generator 版本、seed 和 corpus 必须在独立进程中产生相同的选择和 mutation。
 
-### 5.2 增加结构化 mutation
+### 5.3 增加结构化 mutation
 
 第一批 mutation 包括：
 
@@ -189,7 +200,11 @@ IR 至少表达：
 修复逻辑只保证场景可以被 harness 表达，不应把所有非法操作修复成成功路径。
 错误 fd、错误端点和非法参数必须是显式可生成的场景类别。
 
-### 5.3 增加边界值字典
+mutation 结果分为 `executable` 和 `malformed`。前者进入 host/StarryOS batch，后者
+记录稳定 codec/limit 类别后在 host 执行前过滤；host parser rejection 也不计为
+differential failure。可执行 mutation 必须改变 canonical digest，不允许静默 no-op。
+
+### 5.4 增加边界值字典
 
 数值 mutation 优先从领域字典选择，同时保留一部分任意值：
 
@@ -204,7 +219,29 @@ capacity - 1, capacity, capacity + 1
 依赖运行环境的值应在执行时解析或记录，不要把宿主机偶然状态静默固化为跨平台
 语义。
 
-### 验收标准
+### 5.5 阶段 1 新基线
+
+默认配置（seed 42、每个来源 10,000 个生成样本和 20,000 次 mutation）的 schema 2
+JSON 连续两次逐字节一致，SHA-256 均为
+`7dbb413e07077da9fb4bc7c0cc976bcdfd258e3e1b2415e717734f7721503dc1`。
+
+| 来源 | 唯一场景 | 重复样本 | executable mutation | malformed mutation | canonical change rate | executable no-op |
+|---|---:|---:|---:|---:|---:|---:|
+| `campaign_rng` | 9,991 | 9 | 19,629 | 371 | 98.145% | 0 |
+| `legacy_lcg` | 9,996 | 4 | 20,000 | 0 | 100% | 0 |
+
+`campaign_rng` 的 371 个 malformed 包含 280 个 out-of-range 和 91 个 resource
+conflict。11 种 operation，以及 null I/O、空闲/关闭 slot、错误端点、重复 close
+和读写两端查询类别均有非零样本。
+
+计划指定的 `--seed 42 --batches 1 --batch-size 8` 短 campaign 生成 8 个
+executable entry（23 个 scenario、0 个 malformed），host record 成功，并进入
+StarryOS QEMU compare。compare 在 `poll 9 3260` 处发现 Linux 返回 `POLLHUP`、
+StarryOS 返回 `EINVAL` 的真实差异，保存为
+`batch0_mismatch_35f3571308ae`。阶段 1 不修改 StarryOS syscall 语义，也不将该
+差异改判为 malformed；该 artifact 作为后续语义修复的输入保留。
+
+### 5.6 验收结果
 
 - 相同 seed、corpus 和 generator 版本产生字节一致的操作序列；
 - codec round trip 保持 canonical 场景不变；
@@ -463,16 +500,17 @@ wakeup、EOF、`EPIPE` 的合法状态转换。
 
 ## 12. 推荐的近期 PR 切分
 
-前六个 PR 应保持小而可独立验证：
+前七个 PR 应保持小而可独立验证：
 
 1. `test(pipe-oracle): report generator and corpus effectiveness`
 2. `refactor(pipe-oracle): introduce structured scenario IR`
-3. `feat(pipe-oracle): add structured mutations and boundary dictionaries`
-4. `feat(pipe-oracle): persist and deduplicate coverage corpus`
-5. `feat(pipe-oracle): attribute and minimize coverage inputs`
-6. `test(pipe-oracle): expand deterministic fd and boundary scenarios`
+3. `feat(pipe-oracle): add canonical corpus and structured mutations`
+4. `test(pipe-oracle): add boundary and invalid-resource scenarios`
+5. `feat(pipe-oracle): persist and deduplicate coverage corpus`
+6. `feat(pipe-oracle): attribute and minimize coverage inputs`
+7. `test(pipe-oracle): expand deterministic fd and boundary scenarios`
 
-阶段 4 的 syzkaller importer 应在这六项完成后开始。否则导入更多程序仍会受到
+阶段 4 的 syzkaller importer 应在这七项完成后开始。否则导入更多程序仍会受到
 弱 mutation、粗粒度归因和不可持久化 corpus 的限制。
 
 ## 13. 验证分层

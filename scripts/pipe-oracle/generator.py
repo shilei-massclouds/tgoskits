@@ -1,51 +1,366 @@
+"""Deterministic legacy migration and version-2 structured generation."""
+
 import hashlib
 import struct
-from typing import List, Tuple
+from typing import List
 
-GENERATOR_VERSION = "1"
+from scenario import (
+    Close,
+    Dup,
+    Fionread,
+    GetSize,
+    MAX_ENTRY_BYTES,
+    MAX_IO_BYTES,
+    MAX_LOGICAL_SLOTS,
+    MAX_OPS_PER_SCENARIO,
+    MAX_PIPE_SIZE,
+    MAX_POLL_MASK,
+    Pipe2,
+    Poll,
+    Read,
+    ReadNull,
+    Scenario,
+    ScenarioDocument,
+    SetSize,
+    Write,
+    WriteNull,
+    canonical_digest,
+    serialize_document,
+    validate_entry_limits,
+)
 
-MAX_INPUT_BYTES = 4096
-MAX_OPS_PER_SCENARIO = 32
-MAX_LOGICAL_SLOTS = 16
 
-# Operation kinds
-OP_PIPE2 = 0
-OP_READ = 1
-OP_WRITE = 2
-OP_DUP = 3
-OP_CLOSE = 4
-OP_POLL = 5
-OP_SET_SIZE = 6
-OP_GET_SIZE = 7
-OP_FIONREAD = 8
+GENERATOR_VERSION = "2"
+LEGACY_GENERATOR_VERSION = "1"
+
+MAX_INPUT_BYTES = MAX_ENTRY_BYTES
+
+FREE = 0
+READER = 1
+WRITER = 2
+CLOSED = 3
+
+_CAMPAIGN_RNG_DOMAIN = b"starry-pipe-oracle-campaign-rng-v2\x00"
+_UINT64_RANGE = 1 << 64
+
+_GENERATION_LENGTH_BOUNDARIES = (0, 1, 2, 4095, 4096, 4097, 8191, 8192)
+_GENERATION_PIPE_SIZE_BOUNDARIES = (
+    0,
+    1,
+    2,
+    4095,
+    4096,
+    4097,
+    8191,
+    8192,
+    8193,
+    MAX_PIPE_SIZE,
+)
+_GENERATION_POLL_BOUNDARIES = (
+    0,
+    1,
+    4,
+    5,
+    4095,
+    4096,
+    4097,
+    8191,
+    8192,
+    8193,
+    0x4000,
+    MAX_POLL_MASK,
+)
 
 
-def expand_input(data: bytes) -> List[List[str]]:
-    if len(data) == 0:
-        return _fixed_seed_scenarios(0)
+class CampaignRng:
+    """Versioned SHA-256 counter stream with unbiased bounded selection."""
+
+    def __init__(self, seed: int):
+        self.seed = seed & 0xFFFFFFFFFFFFFFFF
+        self.counter = 0
+
+    def next(self) -> int:
+        payload = self.seed.to_bytes(8, "little") + self.counter.to_bytes(8, "little")
+        self.counter += 1
+        digest = hashlib.sha256(_CAMPAIGN_RNG_DOMAIN + payload).digest()
+        return int.from_bytes(digest[:8], "little")
+
+    def range(self, lower: int, upper: int) -> int:
+        if lower >= upper:
+            return lower
+        width = upper - lower
+        rejection_limit = _UINT64_RANGE - (_UINT64_RANGE % width)
+        while True:
+            value = self.next()
+            if value < rejection_limit:
+                return lower + value % width
+
+
+class LegacyLcgRng:
+    """Version-1 LCG retained only for seed migration and offline comparison."""
+
+    def __init__(self, seed: int):
+        self.state = seed & 0xFFFFFFFFFFFFFFFF
+
+    def next(self) -> int:
+        self.state = (
+            self.state * 6364136223846793005 + 1442695040888963407
+        ) & 0xFFFFFFFFFFFFFFFF
+        return self.state
+
+    def range(self, lower: int, upper: int) -> int:
+        if lower >= upper:
+            return lower
+        return lower + self.next() % (upper - lower)
+
+
+def generate_document(rng) -> ScenarioDocument:
+    """Generate one bounded version-2 corpus entry directly as scenario IR."""
+
+    scenario_count = rng.range(1, 5)
+    scenarios = []
+    for _ in range(scenario_count):
+        operation_count = rng.range(1, MAX_OPS_PER_SCENARIO + 1)
+        scenarios.append(_generate_structured_scenario(rng, operation_count))
+    document = ScenarioDocument(scenarios)
+    validate_entry_limits(document)
+    return document
+
+
+def legacy_document_from_input(data: bytes) -> ScenarioDocument:
+    """Decode version-1 raw bytes byte-for-byte for migration and golden tests."""
+
+    if not data:
+        rng = LegacyLcgRng(0)
+        operation_count = max(1, rng.range(1, 6))
+        return ScenarioDocument([_generate_legacy_scenario(rng, operation_count)])
     if len(data) > MAX_INPUT_BYTES:
         data = data[:MAX_INPUT_BYTES]
-    seed = _bytes_to_seed(data)
-    rng = _Rng(seed)
-    n_scenarios = max(1, rng.range(1, 5))
-    scenarios: List[List[str]] = []
-    for _ in range(n_scenarios):
-        n_ops = max(1, rng.range(1, MAX_OPS_PER_SCENARIO + 1))
-        scenario = _generate_scenario_ops(rng, n_ops)
-        scenarios.append(scenario)
-    return scenarios
+    rng = LegacyLcgRng(_bytes_to_seed(data))
+    scenario_count = max(1, rng.range(1, 5))
+    scenarios = []
+    for _ in range(scenario_count):
+        operation_count = max(1, rng.range(1, MAX_OPS_PER_SCENARIO + 1))
+        scenarios.append(_generate_legacy_scenario(rng, operation_count))
+    return ScenarioDocument(scenarios)
 
 
-def canonicalize_input(data: bytes) -> Tuple[str, str]:
-    ops_text = ops_to_text(expand_input(data))
-    digest = hashlib.sha256(ops_text.encode("utf-8")).hexdigest()
-    return ops_text, digest
+def expand_input(data: bytes) -> ScenarioDocument:
+    """Compatibility name for the version-1 raw-input migration decoder."""
+
+    return legacy_document_from_input(data)
 
 
-def _fixed_seed_scenarios(seed: int) -> List[List[str]]:
-    rng = _Rng(seed)
-    scenario = _generate_scenario_ops(rng, max(1, rng.range(1, 6)))
-    return [scenario]
+def canonicalize_input(data: bytes):
+    document = legacy_document_from_input(data)
+    return serialize_document(document), canonical_digest(document)
+
+
+def ops_to_text(document: ScenarioDocument) -> str:
+    return serialize_document(document)
+
+
+def _generate_structured_scenario(rng, operation_count: int) -> Scenario:
+    operations = []
+    slots = [FREE] * MAX_LOGICAL_SLOTS
+    for _ in range(operation_count):
+        families = _structured_operation_families(slots)
+        family = families[rng.range(0, len(families))]
+        operations.append(_emit_structured_operation(rng, family, slots))
+    return Scenario(operations)
+
+
+def _structured_operation_families(slots: List[int]):
+    open_slots = _slots_with_states(slots, READER, WRITER)
+    available_slots = _slots_with_states(slots, FREE, CLOSED)
+    if not open_slots:
+        return ("pipe2",)
+
+    families = [
+        "read",
+        "read-null",
+        "write",
+        "write-null",
+        "close",
+        "poll",
+        "set-size",
+        "get-size",
+        "fionread",
+        "resource-error",
+    ]
+    if len(available_slots) >= 2:
+        families.append("pipe2")
+    if available_slots:
+        families.append("dup")
+    return tuple(families)
+
+
+def _emit_structured_operation(rng, family: str, slots: List[int]):
+    readers = _slots_with_states(slots, READER)
+    writers = _slots_with_states(slots, WRITER)
+    open_slots = readers + writers
+    available_slots = _slots_with_states(slots, FREE, CLOSED)
+
+    if family == "pipe2":
+        read_slot = _take_random(rng, available_slots)
+        write_slot = _take_random(rng, available_slots)
+        slots[read_slot] = READER
+        slots[write_slot] = WRITER
+        return Pipe2(read_slot, write_slot)
+    if family == "read":
+        return Read(_choose(rng, readers or open_slots), _generation_length(rng))
+    if family == "read-null":
+        return ReadNull(_choose(rng, readers or open_slots))
+    if family == "write":
+        return Write(
+            _choose(rng, writers or open_slots),
+            _generation_length(rng),
+            rng.range(0, 256),
+        )
+    if family == "write-null":
+        return WriteNull(_choose(rng, writers or open_slots))
+    if family == "dup":
+        source = _choose(rng, open_slots)
+        destination = _choose(rng, available_slots)
+        slots[destination] = slots[source]
+        return Dup(source, destination)
+    if family == "close":
+        slot = _choose(rng, open_slots)
+        slots[slot] = CLOSED
+        return Close(slot)
+    if family == "poll":
+        return Poll(_choose(rng, open_slots), _generation_poll_mask(rng))
+    if family == "set-size":
+        return SetSize(_choose(rng, open_slots), _generation_pipe_size(rng))
+    if family == "get-size":
+        return GetSize(_choose(rng, open_slots))
+    if family == "fionread":
+        return Fionread(_choose(rng, open_slots))
+    return _emit_resource_error(rng, slots)
+
+
+def _emit_resource_error(rng, slots: List[int]):
+    readers = _slots_with_states(slots, READER)
+    writers = _slots_with_states(slots, WRITER)
+    free_slots = _slots_with_states(slots, FREE)
+    closed_slots = _slots_with_states(slots, CLOSED)
+    choices = []
+    if free_slots:
+        choices.append(("free", free_slots))
+    if closed_slots:
+        choices.extend((("closed", closed_slots), ("duplicate-close", closed_slots)))
+    if readers:
+        choices.append(("wrong-write", readers))
+    if writers:
+        choices.append(("wrong-read", writers))
+    category, candidates = choices[rng.range(0, len(choices))]
+    slot = _choose(rng, candidates)
+    if category == "duplicate-close":
+        return Close(slot)
+    if category == "wrong-write":
+        if rng.range(0, 2) == 0:
+            return Write(slot, _generation_length(rng), rng.range(0, 256))
+        return WriteNull(slot)
+    if category == "wrong-read":
+        if rng.range(0, 2) == 0:
+            return Read(slot, _generation_length(rng))
+        return ReadNull(slot)
+
+    operation_kind = rng.range(0, 7)
+    if operation_kind == 0:
+        return Read(slot, _generation_length(rng))
+    if operation_kind == 1:
+        return Write(slot, _generation_length(rng), rng.range(0, 256))
+    if operation_kind == 2:
+        return Close(slot)
+    if operation_kind == 3:
+        return Poll(slot, _generation_poll_mask(rng))
+    if operation_kind == 4:
+        return GetSize(slot)
+    if operation_kind == 5:
+        return Fionread(slot)
+    return ReadNull(slot) if rng.range(0, 2) == 0 else WriteNull(slot)
+
+
+def _generation_length(rng) -> int:
+    if rng.range(0, 2) == 0:
+        return _choose(rng, _GENERATION_LENGTH_BOUNDARIES)
+    return rng.range(0, MAX_IO_BYTES + 1)
+
+
+def _generation_pipe_size(rng) -> int:
+    if rng.range(0, 2) == 0:
+        return _choose(rng, _GENERATION_PIPE_SIZE_BOUNDARIES)
+    return rng.range(0, MAX_PIPE_SIZE + 1)
+
+
+def _generation_poll_mask(rng) -> int:
+    if rng.range(0, 2) == 0:
+        return _choose(rng, _GENERATION_POLL_BOUNDARIES)
+    return rng.range(0, MAX_POLL_MASK + 1)
+
+
+def _generate_legacy_scenario(rng: LegacyLcgRng, operation_count: int) -> Scenario:
+    operations = []
+    slots = [FREE] * MAX_LOGICAL_SLOTS
+    for _ in range(operation_count):
+        available_operations = _legacy_available_operations(slots)
+        operation_kind = available_operations[rng.range(0, len(available_operations))]
+        operations.append(_emit_legacy_operation(rng, operation_kind, slots))
+    return Scenario(operations)
+
+
+def _legacy_available_operations(slots: List[int]):
+    has_reader = READER in slots
+    has_writer = WRITER in slots
+    has_any = has_reader or has_writer
+    free_slots = slots.count(FREE)
+    operations = []
+    if free_slots >= 2:
+        operations.append("pipe2")
+    if has_reader:
+        operations.extend(("read", "close", "poll", "fionread"))
+    if has_writer:
+        operations.extend(("write", "close", "poll", "set-size", "get-size"))
+    if has_any and free_slots >= 1:
+        operations.append("dup")
+    return operations
+
+
+def _emit_legacy_operation(rng: LegacyLcgRng, operation_kind: str, slots: List[int]):
+    if operation_kind == "pipe2":
+        free_slots = _slots_with_states(slots, FREE)
+        read_slot = _take_random(rng, free_slots)
+        write_slot = _choose(rng, free_slots)
+        slots[read_slot] = READER
+        slots[write_slot] = WRITER
+        return Pipe2(read_slot, write_slot)
+    if operation_kind == "read":
+        return Read(_choose(rng, _slots_with_states(slots, READER)), rng.range(0, 8193))
+    if operation_kind == "write":
+        return Write(
+            _choose(rng, _slots_with_states(slots, WRITER)),
+            rng.range(0, 8193),
+            rng.range(0, 256),
+        )
+    if operation_kind == "dup":
+        source = _choose(rng, _slots_with_states(slots, READER, WRITER))
+        destination = _choose(rng, _slots_with_states(slots, FREE))
+        slots[destination] = slots[source]
+        return Dup(source, destination)
+    if operation_kind == "close":
+        slot = _choose(rng, _slots_with_states(slots, READER, WRITER))
+        slots[slot] = FREE
+        return Close(slot)
+    if operation_kind == "poll":
+        slot = _choose(rng, _slots_with_states(slots, READER, WRITER))
+        return Poll(slot, 1 if slots[slot] == READER else 4)
+    if operation_kind == "set-size":
+        slot = _choose(rng, _slots_with_states(slots, WRITER))
+        return SetSize(slot, rng.range(1, 1048577))
+    if operation_kind == "get-size":
+        return GetSize(_choose(rng, _slots_with_states(slots, WRITER)))
+    return Fionread(_choose(rng, _slots_with_states(slots, READER)))
 
 
 def _bytes_to_seed(data: bytes) -> int:
@@ -55,136 +370,16 @@ def _bytes_to_seed(data: bytes) -> int:
     return struct.unpack("<Q", padded)[0]
 
 
-class _Rng:
-    def __init__(self, seed: int):
-        self.state = seed & 0xFFFFFFFFFFFFFFFF
-
-    def next(self) -> int:
-        self.state = (self.state * 6364136223846793005 + 1442695040888963407) & 0xFFFFFFFFFFFFFFFF
-        return self.state
-
-    def range(self, lo: int, hi: int) -> int:
-        if lo >= hi:
-            return lo
-        return lo + (self.next() % (hi - lo))
+def _slots_with_states(slots: List[int], *states: int):
+    return [index for index, state in enumerate(slots) if state in states]
 
 
-def _generate_scenario_ops(rng: _Rng, n_ops: int) -> List[str]:
-    ops: List[str] = []
-    logical_slots = [0] * MAX_LOGICAL_SLOTS  # 0 = free, 1 = reader, 2 = writer
-
-    for _ in range(n_ops):
-        valid_ops = _available_ops(logical_slots)
-        op = valid_ops[rng.range(0, len(valid_ops))]
-        line = _emit_op(rng, op, logical_slots)
-        if line:
-            ops.append(line)
-    return ops
+def _choose(rng, values):
+    return values[rng.range(0, len(values))]
 
 
-def _available_ops(slots: List[int]) -> List[int]:
-    has_reader = 1 in slots
-    has_writer = 2 in slots
-    has_any = any(t != 0 for t in slots)
-    free_slots = slots.count(0)
-    ops = []
-    if free_slots >= 2:
-        ops.append(OP_PIPE2)
-    if has_reader:
-        ops += [OP_READ, OP_CLOSE, OP_POLL, OP_FIONREAD]
-    if has_writer:
-        ops += [OP_WRITE, OP_CLOSE, OP_POLL, OP_SET_SIZE, OP_GET_SIZE]
-    if has_any and free_slots >= 1:
-        ops += [OP_DUP]
-    return ops
+def _take_random(rng, values: List[int]) -> int:
+    return values.pop(rng.range(0, len(values)))
 
 
-def _emit_op(
-    rng: _Rng,
-    op: int,
-    slots: List[int],
-) -> str:
-    if op == OP_PIPE2:
-        free_slots = [index for index, slot_type in enumerate(slots) if slot_type == 0]
-        read_index = rng.range(0, len(free_slots))
-        read_slot = free_slots.pop(read_index)
-        write_slot = free_slots[rng.range(0, len(free_slots))]
-        slots[read_slot] = 1
-        slots[write_slot] = 2
-        return f"pipe2 {read_slot} {write_slot}"
-
-    if op == OP_READ:
-        readers = [i for i, t in enumerate(slots) if t == 1]
-        if not readers:
-            return ""
-        fd = readers[rng.range(0, len(readers))]
-        size = rng.range(0, 8193)
-        return f"read {fd} {size}"
-
-    if op == OP_WRITE:
-        writers = [i for i, t in enumerate(slots) if t == 2]
-        if not writers:
-            return ""
-        fd = writers[rng.range(0, len(writers))]
-        size = rng.range(0, 8193)
-        byte = rng.range(0, 256)
-        return f"write {fd} {size} {byte}"
-
-    if op == OP_DUP:
-        targets = [i for i, t in enumerate(slots) if t != 0]
-        free_slots = [i for i, t in enumerate(slots) if t == 0]
-        if not targets or not free_slots:
-            return ""
-        src = targets[rng.range(0, len(targets))]
-        new_fd = free_slots[rng.range(0, len(free_slots))]
-        slots[new_fd] = slots[src]
-        return f"dup {src} {new_fd}"
-
-    if op == OP_CLOSE:
-        targets = [i for i, t in enumerate(slots) if t != 0]
-        if not targets:
-            return ""
-        fd = targets[rng.range(0, len(targets))]
-        slots[fd] = 0
-        return f"close {fd}"
-
-    if op == OP_POLL:
-        targets = [i for i, t in enumerate(slots) if t != 0]
-        if not targets:
-            return ""
-        fd = targets[rng.range(0, len(targets))]
-        events = 1 if slots[fd] == 1 else 4
-        return f"poll {fd} {events}"
-
-    if op == OP_SET_SIZE:
-        writers = [i for i, t in enumerate(slots) if t == 2]
-        if not writers:
-            return ""
-        fd = writers[rng.range(0, len(writers))]
-        size = rng.range(1, 1048577)
-        return f"set-size {fd} {size}"
-
-    if op == OP_GET_SIZE:
-        writers = [i for i, t in enumerate(slots) if t == 2]
-        if not writers:
-            return ""
-        fd = writers[rng.range(0, len(writers))]
-        return f"get-size {fd}"
-
-    if op == OP_FIONREAD:
-        readers = [i for i, t in enumerate(slots) if t == 1]
-        if not readers:
-            return ""
-        fd = readers[rng.range(0, len(readers))]
-        return f"fionread {fd}"
-
-    return ""
-
-
-def ops_to_text(scenarios: List[List[str]]) -> str:
-    lines = ["version 1"]
-    for i, scenario in enumerate(scenarios):
-        lines.append(f"scenario generated-{i + 1:04d}")
-        for op in scenario:
-            lines.append(op)
-    return "\n".join(lines) + "\n"
+_Rng = LegacyLcgRng

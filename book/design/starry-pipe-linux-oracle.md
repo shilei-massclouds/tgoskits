@@ -2,8 +2,9 @@
 
 ## Status
 
-Implemented and locally validated on 2026-07-30. This document records the
-design and implementation of the script-driven pipe differential oracle.
+Implemented on 2026-07-30 and extended with structured scenario generation on
+2026-07-31. This document records the design and implementation of the
+script-driven pipe differential oracle.
 
 Base: `dev-cov2` at `fb399d055`.
 
@@ -205,9 +206,17 @@ does not exist and the production kernel carries no coverage-related code.
 
 - `common.py`: SHA-256 hashing, atomic directory save, `build_metadata()` that
   captures git commit, dirty state, host uname, page size, and file digests.
-- `generator.py`: Deterministic operation generation from a seed. Maintains
-  only logical fd slot state (free/reader/writer); never predicts return values,
-  errno, poll readiness, or any semantic result.
+- `scenario.py`: Immutable scenario/operation IR plus the version-1 `pipe.ops`
+  parser, canonical serializer, digest, typed codec errors, and campaign limits.
+- `generator.py`: Version-2 deterministic operation generation using a
+  versioned SHA-256 counter stream and rejection sampling. It maintains only
+  logical fd resource state and never predicts return values, errno, poll
+  readiness, or any semantic result. The version-1 LCG remains only for the five
+  initial-seed migrations and offline comparison.
+- `mutation.py`: Structured insertion, deletion, replacement, adjacent swap,
+  fragment duplication/deletion, donor splice, and parameter mutation. It
+  repairs dependencies needed for executable candidates and explicitly labels
+  codec/limit failures as malformed.
 - `artifact.py`: Failure artifact validation (ELF header, digest match) and
   atomic save.
 - `runner.py`: validates one absolute artifact directory, passes it to the QEMU
@@ -216,18 +225,26 @@ does not exist and the production kernel carries no coverage-related code.
 - `coverage.py`: `llvm-profdata merge -sparse` and `llvm-cov export` against
   `target/x86_64-unknown-none/release/starryos`; covered pipe regions use stable
   `source:line:column` string IDs.
-- `fuzz.py`: Batch fuzzing with seed, batch count, batch size. Each batch
-  runs one QEMU. Mismatch/panic/timeout/coverage failure stops immediately
-  and saves a complete failure artifact to `coverage/pipe-oracle-fuzz/failures/`.
+- `fuzz.py`: Batch fuzzing with seed, batch count, batch size. The in-memory
+  corpus is a canonical-digest-sorted map of UTF-8 `pipe.ops` entries; each
+  selection remains 30% new generation and 70% structured mutation. Malformed
+  candidates are counted and filtered before host/QEMU execution. Each
+  executable batch runs one QEMU; mismatch/panic/timeout/coverage failure stops
+  immediately and saves a complete failure artifact to
+  `coverage/pipe-oracle-fuzz/failures/`.
 - `replay.py`: Replays a saved failure. Validates schema, digests, ELF type.
   Runs the same guest QEMU with the saved artifacts. `--refresh-host`
   re-records the host trace without overwriting original evidence.
 
 Constraints:
-- `input.bin` ≤ 4096 bytes.
-- Single scenario ≤ 32 operations.
-- Fixed seed produces byte-identical `pipe.ops`.
-- Parsing malformed bytes deterministically truncates/maps, does not panic.
+- A version-2 corpus entry is canonical UTF-8 `pipe.ops` and is at most 4096
+  bytes; `input.bin` and `inputs/*.bin` store those exact bytes.
+- One entry contains at most four scenarios and one scenario contains at most
+  32 operations.
+- A fixed seed and generator version produce byte-identical corpus selection,
+  batch serialization, and mutations across processes.
+- Codec failures carry a stable category and line number. Malformed mutation
+  candidates never enter host or StarryOS execution batches.
 
 ### Artifact injection contract
 
@@ -251,7 +268,7 @@ the validated failure directory directly.
 
 ```
 coverage/pipe-oracle-fuzz/failures/<case-id>/
-  input.bin              (or inputs/ for multi-input batches)
+  input.bin              (or inputs/ for multi-input batches; canonical pipe.ops)
   pipe.ops
   linux.trace
   pipe-linux-oracle      (static ELF)
@@ -269,7 +286,7 @@ Saves use a temp-directory + atomic rename to prevent half-written artifacts.
 ### Data flow and ownership
 
 ```
-checked-in pipe.ops  +  fuzz.py generated input.bin
+checked-in pipe.ops  +  canonical structured corpus entries
          |
          v
 static x86_64 harness --record -- host Linux syscalls
@@ -300,9 +317,12 @@ generated trace (owned by one test run)
               object: target/x86_64-unknown-none/release/starryos
 ```
 
-The corpus is repository-owned. Trace, profraw, guest log, and prepared rootfs
-are run-owned build artifacts. Failure artifacts are saved under
-`coverage/pipe-oracle-fuzz/failures/` for replay.
+The checked-in regression corpus is repository-owned. The fuzz campaign owns an
+in-memory, canonical-digest-sorted corpus for the current process; cross-process
+persistence remains a later phase. Trace, profraw, guest log, and prepared
+rootfs are run-owned build artifacts. Failure artifacts are saved under
+`coverage/pipe-oracle-fuzz/failures/` for replay. Version-1 failure replay keeps
+using the saved `pipe.ops`; it does not reinterpret an old raw `input.bin`.
 
 ## Linux version and environment policy
 
@@ -342,7 +362,7 @@ Rollback: remove the `pipe-linux-oracle` case directory and the `default_run`
 field from axbuild. Production pipe fixes and existing axtest coverage remain
 valid independently.
 
-Future work may add blocking/concurrent scenarios, cross-architecture
-differential coverage, or automatic CI regression detection. Those changes
-require their own design evidence and must continue to keep the default test
-path clean.
+Future work may add persistent corpus identity and precise coverage attribution,
+blocking/concurrent scenarios, cross-architecture differential coverage, or
+automatic CI regression detection. Those changes require their own design
+evidence and must continue to keep the default test path clean.
