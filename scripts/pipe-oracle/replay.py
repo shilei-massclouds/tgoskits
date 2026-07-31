@@ -4,13 +4,14 @@ import json
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Tuple
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from pipe_oracle.artifact import validate_failure, load_metadata, build_metadata, save_metadata
-from pipe_oracle.common import CORPUS_DIR
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+from artifact import validate_failure
+from common import build_metadata, save_metadata
+from runner import run_guest_compare
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -59,23 +60,11 @@ def _replay_guest(failure_dir: Path, meta: Dict):
     run_path = run_dir / run_id
     run_path.mkdir()
 
-    result = subprocess.run(
-        [
-            "cargo", "xtask", "starry", "test", "qemu",
-            "--arch", "x86_64",
-            "-c", "qemu/pipe-linux-oracle",
-        ],
-        cwd=str(WORKSPACE_ROOT),
-        capture_output=True, text=True, timeout=600,
-    )
-
-    guest_log = result.stdout + "\n" + result.stderr
+    guest_log, profraws, passed = _run_guest_compare(WORKSPACE_ROOT, failure_dir)
     (run_path / "guest.log").write_text(guest_log)
-    profraws = list(Path(WORKSPACE_ROOT / "coverage").glob("*.profraw"))
     for p in profraws:
         shutil.copy2(p, run_path / p.name)
 
-    passed = result.returncode == 0
     replay_meta = build_metadata(
         seed=meta.get("fuzz_seed"),
         batch_index=meta.get("batch_index", -1),
@@ -96,6 +85,12 @@ def _replay_guest(failure_dir: Path, meta: Dict):
     else:
         print(f"  REPLAY FAILED: saved to {run_path}")
         sys.exit(1)
+
+
+def _run_guest_compare(
+    workspace: Path, artifact_dir: Path
+) -> Tuple[str, List[Path], bool]:
+    return run_guest_compare(workspace, artifact_dir)
 
 
 def _refresh_host(failure_dir: Path, meta: Dict):

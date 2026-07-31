@@ -647,8 +647,6 @@ static int compare_trace(const char *corpus_path, const char *trace_path,
         printf("STARRY_PIPE_LINUX_ORACLE_PASSED: operations=%" PRIu32
                " host_linux=%s/%s\n",
                context.operation_index, context.header.release, context.header.machine);
-    } else {
-        printf("AXTEST_COVERAGE_DEFERRED_FAIL\n");
     }
     return status;
 }

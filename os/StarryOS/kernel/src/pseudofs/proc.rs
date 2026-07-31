@@ -1704,6 +1704,17 @@ fn mq_sysctl_file(
     )
 }
 
+#[cfg(axtest_coverage)]
+fn print_axtest_coverage(arguments: core::fmt::Arguments<'_>) {
+    ax_print!("{arguments}");
+}
+
+#[cfg(axtest_coverage)]
+fn dump_starry_test_coverage() {
+    axtest::set_printer(print_axtest_coverage);
+    axtest::dump_coverage();
+}
+
 fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     let mut root = DirMapping::new();
     root.add(
@@ -1806,7 +1817,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             RwFile::new(move |req| match req {
                 SimpleFileOperation::Read => Ok(Some(Vec::new())),
                 SimpleFileOperation::Write(_data) => {
-                    axtest::dump_coverage();
+                    dump_starry_test_coverage();
                     Ok(None)
                 }
             }),

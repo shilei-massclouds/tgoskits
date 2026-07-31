@@ -59,6 +59,7 @@ smp = ["ax-std/smp"]
 stack-guard-page = ["ax-runtime/stack-guard-page"]
 stack-protector = ["ax-runtime/stack-protector"]
 axtest = []
+axtest-coverage = ["dep:axtest", "axtest/coverage"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(axtest)', 'cfg(axtest_coverage)', 'cfg(feature, values("ax-std"))'] }
@@ -179,6 +180,7 @@ ktracepoint = "0.6"
 ksym = "0.6"
 kbpf-basic = "0.6"
 rbpf = { version = "0.4", default-features = false }
+axtest = { workspace = true, optional = true }
 
 [dev-dependencies]
 axtest.workspace = true

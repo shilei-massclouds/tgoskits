@@ -63,8 +63,10 @@ The implementation is complete when all of the following hold:
 - one statically linked x86_64 ELF is used for both executions;
 - the checked-in corpus contains operations only, never checked-in expected
   results;
-- every test invocation executes the corpus on the running host Linux and
-  generates a fresh expected trace;
+- a direct manual case invocation executes the checked-in corpus on the running
+  host Linux and generates a fresh expected trace;
+- fuzz and replay runs inject their exact saved/generated ELF, corpus, and trace
+  into the guest instead of re-recording or substituting checked-in artifacts;
 - Starry compares return values, normalized errno, poll events, capacity/query
   values, queued byte counts, and bytes returned by reads;
 - a mismatch identifies the scenario, operation index, operation text, expected
@@ -74,6 +76,8 @@ The implementation is complete when all of the following hold:
   extraction completes before the failure is propagated;
 - coverage capture is triggered by writing to `/proc/starry-test-coverage`,
   which is only compiled under `cfg(axtest_coverage)`;
+- the manual x86_64 case uses a case-local build config with
+  `AXTEST_COVERAGE=y`, and coverage analysis uses the instrumented StarryOS ELF;
 - the old Rust semantic model, model adapter, model-only axtest target, and
   coverage-batch orchestrator are removed;
 - `scripts/pipe-oracle/fuzz.py` drives coverage-guided mutation using `--seed`,
@@ -151,24 +155,25 @@ Starry, and compares each result with the expected trace.
 
 The coverage flow:
 
-1. Guest shell runs oracle `--compare`, saves exit code to `$?`.
-2. Shell writes to `/proc/starry-test-coverage` (a write-only proc node gated
-   on `cfg(axtest_coverage)`).
-3. Writing to that node calls `axtest::dump_coverage()`, which calls
-   `xcover::write_profraw()` and prints an `AXTEST_COVERAGE status=ready`
-   marker.
-4. On mismatch, the oracle prints `AXTEST_COVERAGE_DEFERRED_FAIL` after
-   its detailed mismatch output.
-5. The host-side `AxtestCoverageCaptureGuard` filters the deferred fail
+1. Guest shell runs oracle `--compare` and captures its exit status immediately.
+2. On any nonzero status, the shell prints
+   `AXTEST_COVERAGE_DEFERRED_FAIL` after the oracle's detailed diagnostic.
+3. Shell writes to `/proc/starry-test-coverage` (a write-only proc node gated
+   on `cfg(axtest_coverage)`). Writing to that node calls
+   `axtest::dump_coverage()`, which calls `xcover::write_profraw()` and prints
+   an `AXTEST_COVERAGE status=ready` marker.
+4. The host-side `AxtestCoverageCaptureGuard` filters the deferred fail
    marker from the terminal output during profraw extraction.
-6. After profraw extraction completes via QEMU monitor `memsave`, the
-   capture layer emits `AXTEST_COVERAGE_DONE` followed by the deferred
-   fail marker (if mismatch occurred).
-7. The QEMU runner (ostool) waits for `AXTEST_COVERAGE_DONE`, then the
-   outer `run_qemu_with_success_contract` checks the output against the
-   test success regex. If the deferred fail marker is present or the
-   `STARRY_PIPE_LINUX_ORACLE_PASSED` marker is absent, the test fails
-   with the profraw already saved.
+5. After profraw extraction completes via QEMU monitor `memsave`, the capture
+   layer emits `AXTEST_COVERAGE_DONE`, asks the same monitor to quit QEMU, and
+   then propagates the deferred fail marker (if mismatch occurred).
+6. In coverage mode, the QEMU runner's success regex set is replaced completely
+   by `AXTEST_COVERAGE_DONE`; ordinary case-specific success markers cannot stop
+   QEMU early. The original regexes remain the outer host-side success contract,
+   while `capture.finish()` requires a complete profraw before accepting the
+   monitor-driven exit. If the deferred fail marker is present or the
+   `STARRY_PIPE_LINUX_ORACLE_PASSED` marker is absent, the test fails with the
+   profraw already saved.
 
 This ensures that a mismatch never loses the coverage profile: the profraw
 is extracted before the failure is propagated.
@@ -205,8 +210,12 @@ does not exist and the production kernel carries no coverage-related code.
   errno, poll readiness, or any semantic result.
 - `artifact.py`: Failure artifact validation (ELF header, digest match) and
   atomic save.
-- `coverage.py`: `llvm-profdata merge -sparse` and `llvm-cov show --json` to
-  extract pipe.rs coverage regions.
+- `runner.py`: validates one absolute artifact directory, passes it to the QEMU
+  build through `STARRY_PIPE_ORACLE_ARTIFACT_DIR`, and returns only this run's
+  `starryos-x86_64-unknown-none.profraw`.
+- `coverage.py`: `llvm-profdata merge -sparse` and `llvm-cov export` against
+  `target/x86_64-unknown-none/release/starryos`; covered pipe regions use stable
+  `source:line:column` string IDs.
 - `fuzz.py`: Batch fuzzing with seed, batch count, batch size. Each batch
   runs one QEMU. Mismatch/panic/timeout/coverage failure stops immediately
   and saves a complete failure artifact to `coverage/pipe-oracle-fuzz/failures/`.
@@ -219,6 +228,24 @@ Constraints:
 - Single scenario ≤ 32 operations.
 - Fixed seed produces byte-identical `pipe.ops`.
 - Parsing malformed bytes deterministically truncates/maps, does not panic.
+
+### Artifact injection contract
+
+`STARRY_PIPE_ORACLE_ARTIFACT_DIR` is an internal orchestration interface. When
+set, it must be an absolute directory containing all three files:
+
+```
+pipe-linux-oracle
+pipe.ops
+linux.trace
+```
+
+The case CMake project validates and installs those files byte-for-byte. It does
+not compile a replacement oracle or record a replacement trace. Without the
+variable, the regular manual case keeps its original behavior: build the static
+oracle, use the checked-in corpus, and record the host trace during the case
+build. Fuzz creates a temporary directory for the current batch; replay passes
+the validated failure directory directly.
 
 ### Failure artifact schema
 
@@ -251,7 +278,12 @@ static x86_64 harness --record -- host Linux syscalls
          v
 generated trace (owned by one test run)
          |
-         +-- harness + corpus + trace injected into per-case rootfs overlay
+         +-- harness + corpus + trace collected in one absolute artifact dir
+                                       |
+                                       +-- STARRY_PIPE_ORACLE_ARTIFACT_DIR
+                                       |
+                                       v
+                             per-case rootfs overlay
                                        |
                                        v
                           Starry x86_64 QEMU, same ELF
@@ -264,7 +296,8 @@ generated trace (owned by one test run)
               host QEMU monitor memsave -> profraw
                                        |
                                        v
-              coverage region extraction (llvm-cov)
+              coverage region extraction (llvm-cov export)
+              object: target/x86_64-unknown-none/release/starryos
 ```
 
 The corpus is repository-owned. Trace, profraw, guest log, and prepared rootfs

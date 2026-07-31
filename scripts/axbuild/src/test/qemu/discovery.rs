@@ -439,6 +439,11 @@ pub(super) fn discover_qemu_case_index(
                             variant,
                         });
                     }
+                    stack.extend(
+                        fs::read_dir(&dir)
+                            .with_context(|| format!("failed to read {}", dir.display()))?
+                            .collect::<Result<Vec<_>, _>>()?,
+                    );
                     continue;
                 }
                 None
@@ -452,10 +457,15 @@ pub(super) fn discover_qemu_case_index(
         if let Some((variant, build_config_path)) = build_config_path {
             build_wrappers.push(TestBuildWrapper {
                 name: build_wrapper_name(test_group_dir, &dir, variant.as_deref())?,
-                dir,
+                dir: dir.clone(),
                 build_config_path,
                 variant,
             });
+            stack.extend(
+                fs::read_dir(&dir)
+                    .with_context(|| format!("failed to read {}", dir.display()))?
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
             continue;
         }
 

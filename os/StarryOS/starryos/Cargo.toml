@@ -39,6 +39,7 @@ jpeg = ["ax-driver/jpeg", "starry-kernel/jpeg"]
 rk3588-pwm = ["starry-kernel/rk3588-pwm"]
 rga = ["ax-driver/rga", "starry-kernel/rga"]
 stack-protector = ["ax-std/stack-protector", "starry-kernel/stack-protector"]
+axtest-coverage = ["starry-kernel/axtest-coverage"]
 
 [[bin]]
 name = "starryos"

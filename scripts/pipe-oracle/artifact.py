@@ -2,7 +2,7 @@ import shutil
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from .common import (
+from common import (
     FAILURES_DIR,
     atomic_save,
     build_metadata,

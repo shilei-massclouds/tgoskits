@@ -12,14 +12,21 @@ args = [
 uefi = true
 to_bin = true
 shell_prefix = "root@starry:"
-shell_init_cmd = "/usr/bin/pipe-linux-oracle --compare /usr/share/starry-tests/pipe-linux-oracle/pipe.ops /usr/share/starry-tests/pipe-linux-oracle/linux.trace; status=$?; echo ok > /proc/starry-test-coverage; exec sleep 300"
+shell_init_cmd = """
+/usr/bin/pipe-linux-oracle --compare /usr/share/starry-tests/pipe-linux-oracle/pipe.ops /usr/share/starry-tests/pipe-linux-oracle/linux.trace
+status=$?
+if [ "$status" -ne 0 ]; then
+    echo AXTEST_COVERAGE_DEFERRED_"FAIL"
+fi
+echo ok > /proc/starry-test-coverage
+exec sleep 300
+"""
 asset_cache = "bypass"
 default_run = false
 success_regex = ['(?m)^STARRY_PIPE_LINUX_ORACLE_PASSED: operations=[0-9]+ host_linux=[^\r\n]+\r?$']
 fail_regex = [
     '(?i)\bpanic(?:ked)?\b',
     "(?m)^lockdep fatal violation\\s*$",
-    "(?m)^STARRY_PIPE_LINUX_ORACLE_FAILED:",
     "AXTEST_COVERAGE_DEFERRED_FAIL",
 ]
 timeout = 300

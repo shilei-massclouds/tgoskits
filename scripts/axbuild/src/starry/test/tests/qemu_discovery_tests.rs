@@ -395,6 +395,35 @@ fn starry_qemu_subcase_selector_prefers_existing_direct_case() {
 }
 
 #[test]
+fn starry_qemu_subcase_selector_prefers_direct_case_with_nested_build_config() {
+    let root = tempdir().unwrap();
+    write_flat_qemu_build_config(root.path(), "qemu", "x86_64-unknown-none");
+    write_flat_grouped_qemu_test_config(root.path(), "qemu", "system", "x86_64");
+    let direct_build_config =
+        write_flat_qemu_build_config(root.path(), "qemu/manual-only", "x86_64-unknown-none");
+    fs::write(
+        root.path()
+            .join("test-suit/starryos/qemu/manual-only/qemu-x86_64.toml"),
+        "timeout = 1\ndefault_run = false\n",
+    )
+    .unwrap();
+
+    let cases = discover_qemu_cases(
+        root.path(),
+        "x86_64",
+        "x86_64-unknown-none",
+        Some("qemu/manual-only"),
+    )
+    .unwrap();
+
+    assert_eq!(cases.len(), 1);
+    assert_eq!(cases[0].case.display_name, "qemu/manual-only");
+    assert_eq!(cases[0].build_group, "qemu/manual-only");
+    assert_eq!(cases[0].build_config_path, direct_build_config);
+    assert_eq!(cases[0].case.grouped_subcase_filter, None);
+}
+
+#[test]
 fn starry_qemu_list_accepts_subcase_selector() {
     let root = tempdir().unwrap();
     write_flat_qemu_build_config(root.path(), "qemu", "x86_64-unknown-none");

@@ -1,29 +1,30 @@
 #!/usr/bin/env python3
 import argparse
 import hashlib
-import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from pipe_oracle.common import (
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+from common import (
     CORPUS_DIR,
     FAILURES_DIR,
     build_metadata,
     save_metadata,
     sha256_bytes,
 )
-from pipe_oracle.generator import (
+from generator import (
     GENERATOR_VERSION,
+    MAX_INPUT_BYTES,
     expand_input,
     ops_to_text,
-    MAX_INPUT_BYTES,
-    MAX_OPS_PER_SCENARIO,
 )
+from runner import coverage_object, run_guest_compare
 
 
 DEFAULT_SEED = 42
@@ -121,7 +122,7 @@ def _run_batch(
     corpus: Set[bytes],
     failures_dir: Path,
 ) -> bool:
-    all_scenarios: List[str] = []
+    all_scenarios: List[List[str]] = []
     input_map: Dict[str, bytes] = {}
 
     for inp in inputs:
@@ -130,9 +131,9 @@ def _run_batch(
             continue
         input_map[digest] = inp
         scenarios = expand_input(inp)
-        all_scenarios.append(ops_to_text(scenarios))
+        all_scenarios.extend(scenarios)
 
-    ops_text = "\n".join(all_scenarios)
+    ops_text = ops_to_text(all_scenarios)
     ops_digest = hashlib.sha256(ops_text.encode()).hexdigest()
 
     print(f"  Generated {len(all_scenarios)} scenario groups from {len(inputs)} inputs", flush=True)
@@ -141,9 +142,9 @@ def _run_batch(
         tmp = Path(tmp_str)
         ops_path = tmp / "pipe.ops"
         ops_path.write_text(ops_text)
-        elf_path = _find_elf(workspace)
+        elf_path = _find_or_build_host_oracle(workspace)
         if elf_path is None:
-            print("ERROR: cannot find pipe-linux-oracle ELF", flush=True)
+            print("ERROR: cannot build pipe-linux-oracle ELF", flush=True)
             return True
 
         trace_path = tmp / "linux.trace"
@@ -152,13 +153,42 @@ def _run_batch(
             print("ERROR: host record failed", flush=True)
             return True
 
-        result = _run_guest_compare(workspace, elf_path, ops_path, trace_path)
-        if result is None:
-            print("ERROR: guest compare failed to run", flush=True)
+        artifact_elf = tmp / "pipe-linux-oracle"
+        shutil.copy2(elf_path, artifact_elf)
+        guest_log, profraws, passed = _run_guest_compare(workspace, tmp)
+
+        if not passed:
+            failure_id = f"batch{batch_idx}_mismatch_{ops_digest[:12]}"
+            _save_batch_failure(
+                failures_dir / failure_id, input_map, ops_text,
+                artifact_elf, trace_path, guest_log, profraws,
+                batch_idx, "mismatch",
+            )
+            print(f"  MISMATCH saved to {failure_id}", flush=True)
             return True
 
-        guest_log, profraws, passed = result
-        new_regions = _extract_new_regions(profraws, elf_path, covered_regions)
+        try:
+            if not profraws:
+                raise RuntimeError("QEMU passed without producing the expected Starry profraw")
+            new_regions = _extract_new_regions(
+                profraws, coverage_object(workspace), covered_regions
+            )
+        except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+            guest_log += f"\nCoverage analysis failed: {error}\n"
+            failure_id = f"batch{batch_idx}_coverage_{ops_digest[:12]}"
+            _save_batch_failure(
+                failures_dir / failure_id,
+                input_map,
+                ops_text,
+                artifact_elf,
+                trace_path,
+                guest_log,
+                profraws,
+                batch_idx,
+                "coverage",
+            )
+            print(f"  COVERAGE FAILURE saved to {failure_id}", flush=True)
+            return True
 
         if new_regions:
             for inp_digest, inp_bytes in input_map.items():
@@ -166,40 +196,40 @@ def _run_batch(
                     corpus.add(inp_bytes)
                     print(f"  New corpus entry: {inp_digest[:12]}...", flush=True)
 
-        if not passed:
-            failure_id = f"batch{batch_idx}_mismatch_{ops_digest[:12]}"
-            _save_batch_failure(
-                failures_dir / failure_id, input_map, ops_text,
-                elf_path, trace_path, guest_log, profraws,
-                batch_idx, "mismatch",
-            )
-            print(f"  MISMATCH saved to {failure_id}", flush=True)
-            return True
-
-        if profraws:
-            print(f"  Coverage saved: {len(profraws)} profraw(s), {len(new_regions)} new pipe regions", flush=True)
-        else:
-            print("  WARNING: no profraws produced", flush=True)
+        print(
+            f"  Coverage saved: {len(profraws)} profraw(s), "
+            f"{len(new_regions)} new pipe regions",
+            flush=True,
+        )
 
     return False
 
 
-def _find_elf(workspace: Path) -> Optional[Path]:
-    candidates = [
-        workspace / "test-suit/starryos/qemu/pipe-linux-oracle/c/build/pipe-linux-oracle",
-    ]
-    for p in candidates:
-        if p.is_file():
-            return p
-    result = subprocess.run(
-        ["find", str(workspace / "target"), "-name", "pipe-linux-oracle", "-type", "f"],
-        capture_output=True, text=True,
-    )
-    for line in result.stdout.strip().splitlines():
-        p = Path(line.strip())
-        if p.is_file():
-            return p
-    return None
+def _find_or_build_host_oracle(workspace: Path) -> Optional[Path]:
+    source_dir = workspace / "test-suit/starryos/qemu/pipe-linux-oracle/c"
+    build_dir = workspace / "target/pipe-oracle-host"
+    elf_path = build_dir / "pipe-linux-oracle"
+    if elf_path.is_file():
+        return elf_path
+
+    build_env = os.environ.copy()
+    build_env.pop("STARRY_PIPE_ORACLE_ARTIFACT_DIR", None)
+    try:
+        subprocess.run(
+            ["cmake", "-S", str(source_dir), "-B", str(build_dir)],
+            cwd=str(workspace),
+            env=build_env,
+            check=True,
+        )
+        subprocess.run(
+            ["cmake", "--build", str(build_dir), "--target", "pipe-linux-oracle"],
+            cwd=str(workspace),
+            env=build_env,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return elf_path if elf_path.is_file() else None
 
 
 def _record_host(elf: Path, ops: Path, trace: Path) -> bool:
@@ -211,27 +241,9 @@ def _record_host(elf: Path, ops: Path, trace: Path) -> bool:
 
 
 def _run_guest_compare(
-    workspace: Path, elf: Path, ops: Path, trace: Path,
-):
-    try:
-        result = subprocess.run(
-            [
-                "cargo", "xtask", "starry", "test", "qemu",
-                "--arch", "x86_64",
-                "-c", "qemu/pipe-linux-oracle",
-            ],
-            cwd=str(workspace),
-            capture_output=True, text=True, timeout=600,
-        )
-    except subprocess.TimeoutExpired:
-        return None
-
-    guest_log = result.stdout + "\n" + result.stderr
-    profraw_dir = workspace / "coverage"
-    profraws = list(profraw_dir.glob("*.profraw"))
-
-    passed = result.returncode == 0
-    return guest_log, profraws, passed
+    workspace: Path, artifact_dir: Path
+) -> Tuple[str, List[Path], bool]:
+    return run_guest_compare(workspace, artifact_dir)
 
 
 def _extract_new_regions(
@@ -239,14 +251,11 @@ def _extract_new_regions(
 ) -> Set[str]:
     if not profraws:
         return set()
-    from pipe_oracle.coverage import pipe_region_set, merge_profraws
+    from coverage import merge_profraws, pipe_region_set
     with tempfile.TemporaryDirectory() as tmp_str:
         tmp = Path(tmp_str)
         profdata = tmp / "merged.profdata"
-        try:
-            merge_profraws(profraws, profdata)
-        except Exception:
-            return set()
+        merge_profraws(profraws, profdata)
         regions = pipe_region_set(profdata, elf)
         new_regions = regions - covered_regions
         covered_regions.update(new_regions)
@@ -264,8 +273,7 @@ def _save_batch_failure(
     batch_idx: int,
     category: str,
 ):
-    import shutil
-    from pipe_oracle.common import atomic_save
+    from common import atomic_save
     atomic_save(dest, lambda tmp: _write_failure_parts(
         tmp, input_map, ops_text, elf, trace, guest_log, profraws, batch_idx, category,
     ))
@@ -291,7 +299,6 @@ def _write_failure_parts(
         for digest, data in input_map.items():
             (inp_dir / f"{digest[:16]}.bin").write_bytes(data)
     (tmp / "pipe.ops").write_text(ops_text)
-    import shutil
     shutil.copy2(elf_path, tmp / "pipe-linux-oracle")
     shutil.copy2(trace_path, tmp / "linux.trace")
     (tmp / "guest.log").write_text(guest_log)
