@@ -41,6 +41,15 @@ INITIAL_SEEDS = [
     b"pipe" * 64,
 ]
 
+MUTATION_KINDS = (
+    "extend-empty",
+    "increment-byte",
+    "replace-byte",
+    "swap-bytes",
+    "delete-slice",
+    "insert-byte",
+)
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -90,28 +99,40 @@ def _select_batch(rng, corpus: Set[bytes], batch_size: int) -> List[bytes]:
 
 
 def _mutate(rng, data: bytes) -> bytes:
+    mutated, _kind = _mutate_with_kind(rng, data)
+    return mutated
+
+
+def _mutate_with_kind(rng, data: bytes) -> Tuple[bytes, str]:
     data = bytearray(data)
     if len(data) == 0:
-        return bytes([rng.next() % 256])
+        return bytes([rng.next() % 256]), "extend-empty"
     op = rng.range(0, 5)
     if op == 0:
+        kind = "increment-byte"
         idx = rng.range(0, len(data))
         data[idx] = (data[idx] + rng.range(1, 256)) % 256
     elif op == 1:
+        kind = "replace-byte"
         idx = rng.range(0, len(data))
         data[idx] = rng.next() % 256
-    elif op == 2 and len(data) > 1:
-        a = rng.range(0, len(data))
-        b = rng.range(0, len(data))
-        data[a], data[b] = data[b], data[a]
-    elif op == 3 and len(data) > 2:
-        start = rng.range(0, len(data) - 1)
-        end = rng.range(start + 1, len(data))
-        data[start:end] = b""
+    elif op == 2:
+        kind = "swap-bytes"
+        if len(data) > 1:
+            a = rng.range(0, len(data))
+            b = rng.range(0, len(data))
+            data[a], data[b] = data[b], data[a]
+    elif op == 3:
+        kind = "delete-slice"
+        if len(data) > 2:
+            start = rng.range(0, len(data) - 1)
+            end = rng.range(start + 1, len(data))
+            data[start:end] = b""
     elif op == 4:
+        kind = "insert-byte"
         start = rng.range(0, len(data) + 1)
         data.insert(start, rng.next() % 256)
-    return bytes(data[:MAX_INPUT_BYTES])
+    return bytes(data[:MAX_INPUT_BYTES]), kind
 
 
 def _run_batch(
