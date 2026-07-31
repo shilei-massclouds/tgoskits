@@ -112,7 +112,7 @@ fn do_poll(
             Ok(f) => {
                 fds.push((
                     f,
-                    IoEvents::from_bits(fd.events as _).ok_or(AxError::InvalidInput)?
+                    IoEvents::from_bits_truncate(u32::from(fd.events as u16))
                         | IoEvents::ALWAYS_POLL,
                 ));
                 revent_indices.push(index);

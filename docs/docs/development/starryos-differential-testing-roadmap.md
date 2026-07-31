@@ -239,7 +239,8 @@ executable entry（23 个 scenario、0 个 malformed），host record 成功，�
 StarryOS QEMU compare。compare 在 `poll 9 3260` 处发现 Linux 返回 `POLLHUP`、
 StarryOS 返回 `EINVAL` 的真实差异，保存为
 `batch0_mismatch_35f3571308ae`。阶段 1 不修改 StarryOS syscall 语义，也不将该
-差异改判为 malformed；该 artifact 作为后续语义修复的输入保留。
+差异改判为 malformed；该差异已由后续独立 ABI 修复处理，artifact 继续作为原始
+差异证据保留。
 
 ### 5.6 验收结果
 
