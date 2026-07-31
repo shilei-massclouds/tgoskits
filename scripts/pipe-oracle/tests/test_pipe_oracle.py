@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -16,6 +18,7 @@ ARTIFACT_ENV = "STARRY_PIPE_ORACLE_ARTIFACT_DIR"
 
 sys.path.insert(0, str(SCRIPT_DIR))
 
+import analyze  # noqa: E402
 import coverage  # noqa: E402
 import fuzz  # noqa: E402
 import generator  # noqa: E402
@@ -52,7 +55,7 @@ class PipeOracleRegressionTests(unittest.TestCase):
         cls._oracle_temp.cleanup()
 
     def test_script_help_works_from_the_command_path(self):
-        for script in ("fuzz.py", "replay.py"):
+        for script in ("analyze.py", "fuzz.py", "replay.py"):
             result = subprocess.run(
                 [sys.executable, str(SCRIPT_DIR / script), "--help"],
                 cwd=WORKSPACE_ROOT,
@@ -61,6 +64,115 @@ class PipeOracleRegressionTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("usage:", result.stdout)
+
+    def test_canonical_input_uses_actual_ops_text_and_sha256(self):
+        raw_input = bytes(range(32))
+
+        canonical_text, digest = generator.canonicalize_input(raw_input)
+
+        self.assertEqual(
+            canonical_text,
+            generator.ops_to_text(generator.expand_input(raw_input)),
+        )
+        self.assertEqual(
+            digest,
+            hashlib.sha256(canonical_text.encode("utf-8")).hexdigest(),
+        )
+
+    def test_analysis_json_is_deterministic_and_satisfies_count_constraints(self):
+        first = analyze.analyze(seed=42, samples=128, mutations=256, top=3)
+        second = analyze.analyze(seed=42, samples=128, mutations=256, top=3)
+
+        first_json = json.dumps(first, indent=2, sort_keys=True)
+        second_json = json.dumps(second, indent=2, sort_keys=True)
+        self.assertEqual(first_json, second_json)
+        self.assertEqual(
+            set(first["sources"]), {"campaign_rng", "independent_rng"}
+        )
+
+        for source in first["sources"].values():
+            generation = source["generation"]
+            mutation = source["mutation"]
+            self.assertEqual(
+                generation["samples"],
+                generation["unique_canonical_scenarios"]
+                + generation["duplicate_samples"],
+            )
+            for field in ("attempts", "raw_changed", "scenario_changed"):
+                self.assertEqual(
+                    mutation[field],
+                    sum(
+                        kind_counts[field]
+                        for kind_counts in mutation["by_kind"].values()
+                    ),
+                )
+            self.assertGreater(
+                mutation["raw_changed_scenario_unchanged"],
+                0,
+            )
+            self.assertEqual(
+                sum(generation["parameter_buckets"]["length"].values()),
+                generation["operation_counts"]["read"]
+                + generation["operation_counts"]["write"],
+            )
+            self.assertEqual(
+                sum(generation["parameter_buckets"]["pipe_size"].values()),
+                generation["operation_counts"]["set-size"],
+            )
+            self.assertEqual(
+                sum(generation["parameter_buckets"]["poll_mask"].values()),
+                generation["operation_counts"]["poll"],
+            )
+            for operation, buckets in generation[
+                "endpoint_counts_before_operation"
+            ].items():
+                self.assertEqual(
+                    sum(buckets.values()),
+                    generation["operation_counts"][operation],
+                )
+            for scenario in generation["top_scenarios"]:
+                self.assertEqual(
+                    scenario["digest"],
+                    hashlib.sha256(
+                        scenario["canonical_text"].encode("utf-8")
+                    ).hexdigest(),
+                )
+
+    def test_analysis_is_offline_and_does_not_create_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            temp_path = Path(temp)
+            env = os.environ.copy()
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT_DIR / "analyze.py"),
+                    "--seed",
+                    "7",
+                    "--samples",
+                    "16",
+                    "--mutations",
+                    "32",
+                    "--top",
+                    "0",
+                    "--format",
+                    "json",
+                ],
+                cwd=temp_path,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(list(temp_path.iterdir()), [])
+
+        with mock.patch.object(
+            analyze.fuzz.subprocess,
+            "run",
+            side_effect=AssertionError("offline analysis must not run subprocesses"),
+        ):
+            analyze.analyze(seed=7, samples=16, mutations=32, top=0)
 
     def test_multi_input_batch_is_one_corpus_accepted_by_the_oracle(self):
         scenarios = []
