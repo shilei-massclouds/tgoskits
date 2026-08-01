@@ -5,9 +5,10 @@
 Implemented on 2026-07-30, extended with structured scenario generation,
 persistent canonical coverage corpus, resumable exact coverage attribution,
 and persistent coverage/mismatch minimization on 2026-07-31. Stage 3.2a added
-pipe fd/status flags and `dup2`/`dup3` coverage on 2026-07-31. This document
-records the design and implementation of the script-driven pipe differential
-oracle.
+pipe fd/status flags and `dup2`/`dup3` coverage on 2026-07-31. Stage 3.2b-1
+added bounded `readv`/`writev`, vector-aware reduction, and the Starry access
+capability fix on 2026-08-01. This document records the design and
+implementation of the script-driven pipe differential oracle.
 
 Base: `dev-cov2` at `fb399d055`.
 
@@ -116,8 +117,8 @@ The first implementation deliberately excludes:
   concurrent writers, and signal-delivery timing;
 - `epoll`, `select`, FIFO pathname/open semantics, `splice`, `tee`, and
   `vmsplice`;
-- `readv`/`writev`, multi-fd `poll`, `select`/`epoll`, exec-time fd lifecycle,
-  and blocking fd/pipe semantics in stage 3.2a;
+- `preadv`/`pwritev`, multi-fd `poll`, `select`/`epoll`, exec-time fd lifecycle,
+  and blocking fd/pipe semantics in stage 3.2b-1;
 - a general syscall differential framework or a stable public corpus/trace
   protocol;
 - a Linux VM pinned to a specific kernel release;
@@ -140,6 +141,8 @@ The first implementation deliberately excludes:
 | Coverage-guided in default path | Better corpus growth | Too heavy for regular CI; belongs in manual fuzz workflow | Reject for v1 |
 | Byte-level minimization | Simple implementation | Breaks resource relationships and spends QEMU launches on malformed inputs | Reject; reduce the scenario IR |
 | Structured hierarchical delta debugging | Preserves operation/resource structure and gives deterministic checkpoints | Does not guarantee a global minimum | Select with a bounded candidate budget |
+| Encode vector I/O as one flat byte count | Reuses scalar operations | Cannot compare segment boundaries, short-transfer placement, or untouched memory | Reject; use typed bounded segments |
+| Fix vector errno ordering with pipe-specific syscall branches | Small local patch | Duplicates access policy and leaves regular files/directories/memfd inconsistent | Reject; add a `FileLike` capability boundary |
 
 ## Architecture
 
@@ -222,7 +225,98 @@ explicit nonblocking setup; the reducer never synthesizes initialization.
 The trace writer emits version 2 and appends operation-kind numbers 12 through
 17 for the six new kinds. It does not reorder the version-1 numbering. Compare
 mode still accepts a version-1 trace for a version-1 corpus, while a version-2
-corpus requires a version-2 trace.
+corpus requires a version-2-or-newer trace.
+
+### Version-3 vectored I/O
+
+`pipe.ops` version 3 preserves every version-1/version-2 spelling and canonical
+digest and adds two bounded forms:
+
+```
+readv SLOT IOV_MODE IOVCNT SEGMENT_COUNT [BASE_MODE LENGTH]...
+writev SLOT IOV_MODE IOVCNT SEGMENT_COUNT [BASE_MODE LENGTH BYTE]...
+```
+
+`IOV_MODE` and `BASE_MODE` are decimal enums: `0` selects harness-owned valid
+memory and `1` selects the fixed invalid address `1`. `iovcnt` is restricted to
+`-1`, `0..4`, and `1025`; a valid vector has exactly `iovcnt` typed segments,
+while an invalid vector pointer or invalid count has none. Segment lengths and
+the valid-segment total are bounded by 8192 bytes. These restrictions keep the
+grammar strict, the trace fixed-size, and every generated call synchronous.
+
+Positive-length calls on the correct live endpoint require a statically known
+`O_NONBLOCK` open-file description. Zero total length, invalid fd, wrong access
+endpoint, invalid iovec pointer, and invalid count remain safe because they
+return before pipe I/O. A positive invalid base is not treated as proof of
+nonblocking safety: an empty pipe may wait for readiness before userspace is
+touched.
+
+Trace version 3 appends `readv` and `writev` as operation kinds 18 and 19 without
+renumbering older kinds. Before `readv`, every valid destination segment is
+filled with `0xa5`; after the syscall, all valid destination segments are
+flattened in iovec order into the trace. The comparison therefore observes
+cross-segment placement, short reads, and untouched suffixes in addition to the
+exact return value and errno. Version-1 and version-2 corpora remain readable;
+version-3 corpora require a version-3 trace.
+
+The checked-in version-3 corpus covers empty vectors, zero-length segments,
+cross-segment transfer, a 5000-byte nonblocking partial write into a 4096-byte
+pipe, invalid vector/base pointers, `iovcnt` boundaries, and bad descriptors.
+It contains 142 operations and records/compares self-consistently on the host.
+
+### Linux ordering evidence and Starry boundary
+
+The production ordering reference is Linux commit
+[`a2cf4ef33184df0ae9e1a2b05b550133dde1698c`](https://github.com/torvalds/linux/blob/a2cf4ef33184df0ae9e1a2b05b550133dde1698c/fs/read_write.c#L989-L1113),
+observed on 2026-08-01. `do_readv`/`do_writev` first resolve the fd, then
+`vfs_readv`/`vfs_writev` reject missing `FMODE_READ`/`FMODE_WRITE`, and only then
+call `import_iovec`. This is also the ordering required by the project syscall
+compatibility target for `readv` and `writev`.
+
+The same commit's
+[`import_iovec`](https://github.com/torvalds/linux/blob/a2cf4ef33184df0ae9e1a2b05b550133dde1698c/lib/iov_iter.c#L1342-L1443)
+uses `access_ok` to reject a segment outside the user address limit without
+requiring its pages to be mapped. Actual mapping faults occur during iterator
+copy. For an empty nonblocking pipe,
+[`anon_pipe_read`](https://github.com/torvalds/linux/blob/a2cf4ef33184df0ae9e1a2b05b550133dde1698c/fs/pipe.c#L361-L491)
+therefore returns `EAGAIN` before touching an unmapped in-range destination.
+
+The development host was Linux `5.15.0-186-generic`. Its raw syscalls returned
+`EBADF` for bad-fd plus bad-iovec conflicts, but returned `EFAULT` for a valid
+wrong-access fd plus a bad iovec. That older-host behavior is recorded as
+environment evidence; it does not weaken the comparator or change the fixed
+upstream production target.
+
+Before the fix, the Starry raw-syscall regression produced 70 passes and four
+failures: `writev` imported a bad vector/count before rejecting a bad fd, and
+both vector syscalls imported a bad vector before rejecting the wrong access
+mode. `FileLike::readable`/`writable` now expose this capability explicitly.
+Regular files and directories derive it from open access flags (including
+`O_PATH`), pipes derive it from their endpoint, and memfd delegates to its
+backing file. `sys_readv` and `sys_writev` check the fd and capability before
+constructing an `IoVectorBuf`; there is no pipe-specific syscall branch. The
+same guest regression then produced 74 passes and zero failures.
+
+The complete version-3 oracle subsequently exposed a second ordering defect:
+Starry's iovec import used the ordinary mapped-user-memory boundary, so address
+`1` failed before an empty nonblocking pipe could report `EAGAIN`.
+`IoVectorBuf` now performs only the Linux-style user-limit range check at
+import and defers mapping faults until a file operation actually reaches the
+segment. A raw-syscall regression necessarily failed with 75 passes and one
+failure before this fix and passed all 76 checks afterward.
+
+| Raw syscall conflict | Required result | Starry before | Starry after |
+|---|---:|---:|---:|
+| `readv(-1, bad_iov, 1)` | `EBADF` | `EBADF` | `EBADF` |
+| `readv(O_WRONLY, bad_iov, 1)` | `EBADF` | `EFAULT` | `EBADF` |
+| `writev(-1, bad_iov, 1)` | `EBADF` | `EFAULT` | `EBADF` |
+| `writev(-1, valid_iov, IOV_MAX+1)` | `EBADF` | `EINVAL` | `EBADF` |
+| `writev(O_RDONLY, bad_iov, 1)` | `EBADF` | `EFAULT` | `EBADF` |
+| `readv(empty_nonblock_pipe, bad_base, 1)` | `EAGAIN` | `EFAULT` | `EAGAIN` |
+
+The separate invalid-count `readv` conflict already returned `EBADF` before
+the fix. Keeping it in the regression guards the complete fd-before-count
+contract even though it did not expose the original bug.
 
 ### Coverage capture and deferred fail
 
@@ -284,15 +378,15 @@ does not exist and the production kernel carries no coverage-related code.
   exact-attribution admission.
 - `campaign_lock.py` and `corpus_errors.py`: Process-lock ownership and shared
   persistent-state error types.
-- `attribution.py` and `attribution_schema.py`: Atomic schema-v3 attribution
-  jobs (plus strict schema-v2 recovery), target-set-aware evidence validation,
+- `attribution.py` and `attribution_schema.py`: Atomic schema-v4 attribution
+  jobs (plus strict schema-v2/v3 recovery), target-set-aware evidence validation,
   deterministic representative selection, and resumable state transitions.
 - `attribution_campaign.py`: Fresh host-trace and QEMU replay orchestration,
   cross-campaign ELF restart, final representative proof, and baseline commit.
-- `scenario.py`: Immutable scenario/operation IR plus the version-1/version-2
+- `scenario.py`: Immutable scenario/operation IR plus the version-1/version-2/version-3
   `pipe.ops` parser, canonical serializer, digest, typed codec errors, shared
-  open-file-description state, per-fd flags, and campaign limits.
-- `generator.py`: Version-3 deterministic operation generation using a
+  open-file-description state, per-fd flags, typed vector segments, and campaign limits.
+- `generator.py`: Version-4 deterministic operation generation using a
   versioned SHA-256 counter stream and rejection sampling. It maintains only
   logical fd resource state and never predicts return values, errno, poll
   readiness, or any semantic result. The version-1 LCG remains only for the five
@@ -309,8 +403,8 @@ does not exist and the production kernel carries no coverage-related code.
 - `reducer.py` and `minimization.py`: Pure deterministic hierarchical reduction,
   operation-origin tracking, coverage responsibility assignment, mismatch
   predicate checks, digest deduplication, and shared candidate-QEMU budgets.
-- `minimization_schema.py` and `minimization_store.py`: Strict schema-v2 job and
-  evidence validation (plus schema-v1 recovery), atomic checkpoints, reducer
+- `minimization_schema.py` and `minimization_store.py`: Strict schema-v3 job and
+  evidence validation (plus schema-v1/v2 recovery), atomic checkpoints, reducer
   cursor persistence, target-set pinning, and stale/unstable failure
   preservation.
 - `minimization_source.py`, `minimization_campaign.py`, and `minimize.py`:
@@ -389,10 +483,10 @@ entries to mutation. If a minimized digest already exists, its historical
 region union and minimization lineage are merged instead of creating a duplicate
 directory.
 
-The current generator strictly reads corpus entries created by generator v2 or
-v3. Existing v2 metadata and provenance are not rewritten merely because the
-entry is loaded; a newly generated or mutated child records generator v3 and
-uses `pipe.ops` v2. Loading fails closed on an unknown schema or generator
+The current generator strictly reads corpus entries created by generator v2,
+v3, or v4. Existing metadata and provenance are not rewritten merely because
+the entry is loaded; a newly generated or mutated child records generator v4
+and uses `pipe.ops` v3. Loading fails closed on an unknown schema or generator
 version, a directory or
 file digest mismatch, noncanonical UTF-8 encoding, codec/resource-limit error,
 invalid metadata, symlink, or unexpected finalized file. The only implicit
@@ -407,17 +501,26 @@ replace. Run directories use the same temporary-directory/rename protocol.
 Only finalized 64-hex digest directories are loaded, so a process killed during
 its initial write cannot expose a half entry.
 
-Coverage state schema v2 is keyed by both the SHA-256 of the instrumented
-StarryOS ELF and a fixed target-set ID. New campaigns use `pipe-fd-v2`, which
-contains exactly `kernel/src/file/pipe.rs`, `kernel/src/syscall/fs/pipe.rs`, and
-`kernel/src/syscall/fs/fd_ops.rs`. Schema-v1 state is read only as the implicit
-`pipe-v1` target and never seeds a `pipe-fd-v2` baseline. A nonproductive batch
+Coverage state schema v3 is keyed by both the SHA-256 of the instrumented
+StarryOS ELF and a fixed target-set ID. New campaigns use `pipe-vector-v3`,
+which contains exactly `kernel/src/file/pipe.rs`, `kernel/src/syscall/fs/pipe.rs`,
+`kernel/src/syscall/fs/fd_ops.rs`, `kernel/src/syscall/fs/io.rs`, and
+`kernel/src/mm/io.rs`. Schema-v1 state is read only as the implicit `pipe-v1`
+target; schema-v2 state is restricted to `pipe-fd-v2`. Neither seeds a
+`pipe-vector-v3` baseline. A nonproductive batch
 saves the same baseline; a productive batch must finish exact attribution and
 the final representative replay before the enlarged baseline is atomically
 committed. Different ELFs and target sets therefore have independent
 baselines.
 
-Run metadata schema v4 stores the fixed `target_set_id`, seed, exact command,
+Persistent target ownership is schema-bound and fail-closed: attribution v2
+and minimization v1 imply `pipe-v1`; attribution v3 and minimization v2 require
+`pipe-fd-v2`; attribution v4 and minimization v3 require `pipe-vector-v3`.
+Replay evidence must use the same schema and target as its owning job. Unknown
+schemas, target mismatches, symlinks, and digest corruption are rejected rather
+than migrated. Corpus schema v3 and failure schema v2 remain unchanged.
+
+Run metadata schema v5 stores the fixed `target_set_id`, seed, exact command,
 measured duration,
 candidate/executable/malformed/unique counts, sources and ancestry, new regions,
 admitted digests, Starry ELF digest, result category, attribution job ID, every
@@ -431,7 +534,7 @@ for selection.
 
 Exact attribution is enabled by default for every productive batch. After the
 initial batch QEMU reports regions outside the active ELF baseline, the
-orchestrator atomically creates a schema-v3 job containing the canonical input
+orchestrator atomically creates a schema-v4 job containing the canonical input
 set and the initial batch evidence. It then:
 
 1. re-records a fresh Linux trace and starts a fresh QEMU for each of the `N`
@@ -518,8 +621,8 @@ canonical, strictly lower-complexity candidates in this order:
 5. compress `dup`/`dup2`/`dup3` chains, redirect compatible resource
    references, and
    rename live slots densely; and
-6. reduce length, byte, pipe size, poll masks, pipe/status/fd flags, and `dup3`
-   flags through fixed simple values.
+6. reduce scalar/vector length, vector count/base/byte, pipe size, poll masks,
+   pipe/status/fd flags, and `dup3` flags through fixed simple values.
 
 It neither consumes campaign RNG nor synthesizes initialization operations.
 Every candidate passes the canonical codec and must lower a well-founded
@@ -543,7 +646,7 @@ side. A mismatch candidate is accepted only when the observed difference maps
 back to that same origin and produces the identical fingerprint. A pass or a
 different fingerprint is an ordinary rejection, not a new failure.
 
-Each strict schema-v2 minimization job owns its fixed target set, source
+Each strict schema-v3 minimization job owns its fixed target set, source
 identity, original
 inputs, fixed host and Starry ELFs, current-best checkpoints with operation
 origins, reducer cursors and seen digests, shared budget/cursor, compact attempt
@@ -592,6 +695,22 @@ in both fresh final profiles, activated the minimized entries, and preserved
 the originals as superseded. An ENOSPC interruption after the first batch also
 demonstrated schema-v3 attribution recovery from its atomic checkpoint. No
 production Starry syscall change was required.
+
+The stage-3.2b-1 acceptance used the version-3 checked-in corpus for 142
+host/Starry operations. Host record/compare and the x86_64 QEMU oracle both
+passed, and QEMU exported a fresh coverage profile. The final raw vectored-I/O
+regression passed 76 checks. The fixed `seed=2`, two-candidate campaign generated
+both `readv` and `writev`, admitted both executable inputs, and added 1000
+`pipe-vector-v3` regions: 345 in `file/pipe.rs`, 33 in `syscall/fs/pipe.rs`,
+342 in `syscall/fs/fd_ops.rs`, 171 in `syscall/fs/io.rs`, and 109 in `mm/io.rs`.
+Exact attribution used three additional QEMU replays, mapped 993 and 956
+regions to the two entries, and retained two representatives. With a
+four-candidate budget, coverage minimization used one validation, four
+candidates, and two final proofs. One input remained 1308 bytes; the other
+shrunk from 672 to 629 bytes. The job completed `budget-limited` only after both
+fresh final proofs preserved all assigned regions. The run metadata uses schema
+v5, attribution schema v4, minimization schema v3, and target set
+`pipe-vector-v3`.
 
 The retained schema-v1 poll-mismatch artifact also passed strict lazy import:
 its old log yielded a fingerprint at original operation 16 with
@@ -648,7 +767,7 @@ monitor-socket, or other infrastructure errors therefore cannot be imported or
 reported as semantic mismatches.
 
 Saves use a temp-directory + atomic rename to prevent half-written artifacts.
-Attribution instability uses the separate schema-v3 job layout described above
+Attribution instability uses the separate schema-v4 job layout described above
 under `failures/attribution-<job-id>/`; moving the complete job preserves all
 initial, per-entry, representative, and ELF-transition evidence.
 
@@ -712,10 +831,14 @@ If a Linux upgrade changes an observable result, the differential test fails.
 The fd semantics follow the public Linux contracts in
 [`pipe2(2)`](https://man7.org/linux/man-pages/man2/pipe.2.html),
 [`fcntl(2)`](https://man7.org/linux/man-pages/man2/fcntl.2.html), and
-[`dup(2)`](https://man7.org/linux/man-pages/man2/dup.2.html). The execution
+[`dup(2)`](https://man7.org/linux/man-pages/man2/dup.2.html). Vector contracts
+follow [`readv(2)`](https://man7.org/linux/man-pages/man2/readv.2.html), with
+fd/access/iovec ordering checked against the fixed Linux source commit linked
+in the version-3 section. The execution
 oracle, rather than a hard-coded kernel version, determines the exact result
-and errno for the recorded host release. Stage 3.2a changes only the oracle and
-its test formats; it does not claim a new Starry production-syscall change.
+and errno for the recorded host release. Where an older host disagrees with the
+fixed source ordering, the discrepancy is documented and the production
+regression remains strict.
 
 ## Syscall impact map
 
@@ -724,6 +847,8 @@ its test formats; it does not claim a new Starry production-syscall change.
 | `pipe2` | Four `O_NONBLOCK`/`O_CLOEXEC` combinations, fixed unknown-bit `EINVAL`, and logical slots |
 | `read` | Zero-length success, nonblocking `EAGAIN`, EOF, byte count, exact bytes |
 | `write` | Zero-length success, `EPIPE`, `PIPE_BUF` atomicity, partial writes |
+| `readv` | Empty/count/pointer boundaries, fd/access error priority, cross-segment and short-read placement, untouched sentinel suffix |
+| `writev` | Empty/count/pointer boundaries, fd/access error priority, per-segment bytes, nonblocking partial writes |
 | `close` | Endpoint lifetime transitions, `EBADF` for invalid slots |
 | `dup` | Success/error; shared description state and cleared destination `FD_CLOEXEC` |
 | `dup2` | Same-fd behavior, invalid source, occupied-destination replacement, cleared destination `FD_CLOEXEC`, normalized success |

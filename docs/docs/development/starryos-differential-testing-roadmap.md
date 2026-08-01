@@ -446,14 +446,49 @@ operation 全部通过并成功导出 coverage。小预算真实 campaign 完成
 schema-v3 job 从原子 checkpoint 恢复，未重复生成输入。未发现 StarryOS 语义差分，
 生产 Rust 逻辑无需修改。
 
-#### 阶段 3.2b：向量 I/O 与 multi-fd poll
+#### 阶段 3.2b-1：Pipe 向量 I/O 差分
 
-3.2a 已证明 fd target region 有稳定增量。3.2b 优先实现 `readv`/`writev`，因为它可
-继续复用单 fd、同步、静态 nonblocking 的执行模型；multi-fd poll 随后单独扩展
-resource/result 映射：
+**状态：已完成（2026-08-01）。**
 
-- `readv`、`writev` 的空 iovec、跨 iovec 和部分完成；
-- 一次 `poll` 多个 fd、重复 fd 和负 fd。
+`pipe.ops` version 3 增加有界 `readv`/`writev`，覆盖空向量、零长度段、跨段布局、
+短读/部分写、无效 iovec/base、负数和超限 `iovcnt`、坏 fd 及错误优先级。trace
+version 3 追加 kind 18/19；`readv` 将全部有效目标段（包括固定哨兵的未写区域）扁平
+写入 trace。generator v4、mutation 和 reducer 均理解向量 count、segment、base、
+length 和 byte，正长度路径继续要求静态 `O_NONBLOCK`。
+
+coverage 使用 `pipe-vector-v3`，在 3.2a 的三个文件上追加 `syscall/fs/io.rs` 与
+`mm/io.rs`。新持久格式为 coverage-state v3、attribution v4、minimization v3、run
+v5；旧格式分别严格恢复到 `pipe-v1` 或 `pipe-fd-v2`，corpus schema v3 与 failure
+schema v2 保持不变。
+
+直接 raw-syscall 回归证明 Starry 原先在 `sys_writev` 中先导入 iovec，且 read/write
+访问模式也晚于 iovec 校验。生产修复为 `FileLike` 增加读写能力查询，由普通文件、
+目录、pipe 和 memfd 实现；`sys_readv`/`sys_writev` 在导入用户 iovec 前统一检查 fd
+及能力，没有 pipe 特判。预修复 x86_64 QEMU 为 70 pass / 4 fail，修复后为
+74 pass / 0 fail。
+
+完整 oracle 随后发现第二个校验时机差分：空 nonblocking pipe 的 `readv` 使用未映射
+但仍位于 Linux user limit 内的 segment base 时，Linux 在实际访问目标内存前返回
+`EAGAIN`，Starry 却在导入 iovec 时返回 `EFAULT`。新增 raw-syscall 回归在修复前为
+75 pass / 1 fail；`IoVectorBuf` 改为导入时只做 Linux `access_ok` 风格的地址上限检查、
+把映射错误延迟到实际段访问后，回归为 76 pass / 0 fail。
+
+最终验收中，114 个 Python/host-harness 回归、23 项 `starry-kernel` clippy、
+`py_compile`、workspace rustfmt、`git diff --check` 和 host C record/compare 全部通过；
+checked-in version-3 corpus 的 142 个 x86_64 QEMU operation 全部通过并导出 coverage。
+真实 `seed=2`、`batch-size=2` campaign 同时执行 `readv`/`writev`，2 个输入均可执行，
+新增 1000 个 `pipe-vector-v3` region：`file/pipe.rs` 345、`syscall/fs/pipe.rs` 33、
+`syscall/fs/fd_ops.rs` 342、`syscall/fs/io.rs` 171、`mm/io.rs` 109。精确归因使用 3 次
+额外 QEMU，将 993/956 个 region 映射到 2 个代表。最小化使用 1 次验证、4 次候选和
+2 次最终证明；两个输入分别保持 1308 bytes 和由 672 缩至 629 bytes，最终以
+`budget-limited` 完成并保留全部责任 region。
+
+#### 阶段 3.2b-2：multi-fd poll
+
+**状态：待实现。**
+
+后续独立扩展 resource/result 映射，覆盖一次 `poll` 的多个 fd、重复 fd 和负 fd。
+本阶段不复用 3.2b-1 的单 fd 结果结构来隐式编码多 fd 状态。
 
 阻塞 flag 组合必须使用不会自然挂起的操作序列，或由明确 watchdog 判定基础设施
 失败；不能用宽松 timeout 把不确定结果当作语义通过。

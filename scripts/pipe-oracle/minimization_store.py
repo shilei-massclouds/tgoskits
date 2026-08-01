@@ -26,6 +26,7 @@ from minimization_schema import (
     HOST_ORACLE_NAME,
     INPUTS_NAME,
     JOB_ID_PATTERN,
+    FD_MINIMIZATION_SCHEMA_VERSION,
     job_target_set_id,
     METADATA_NAME,
     MINIMIZATION_JOBS_NAME,
@@ -453,7 +454,10 @@ class MinimizationStore:
                 "guest_log_sha256": sha256_file(temporary / "guest.log"),
                 "profraws": profraw_metadata,
             }
-            if job.metadata["schema_version"] == MINIMIZATION_SCHEMA_VERSION:
+            if job.metadata["schema_version"] in (
+                FD_MINIMIZATION_SCHEMA_VERSION,
+                MINIMIZATION_SCHEMA_VERSION,
+            ):
                 result["target_set_id"] = job_target_set_id(job.metadata)
             _write_json(temporary / "result.json", result)
             _sync_directory(profraws_dir)

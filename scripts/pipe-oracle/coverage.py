@@ -7,14 +7,22 @@ from typing import Dict, List, Set
 
 
 LEGACY_TARGET_SET_ID = "pipe-v1"
-TARGET_SET_ID = "pipe-fd-v2"
+FD_TARGET_SET_ID = "pipe-fd-v2"
+TARGET_SET_ID = "pipe-vector-v3"
 
 TARGET_SOURCE_PATHS = {
     LEGACY_TARGET_SET_ID: ("kernel/src/file/pipe.rs",),
+    FD_TARGET_SET_ID: (
+        "kernel/src/file/pipe.rs",
+        "kernel/src/syscall/fs/pipe.rs",
+        "kernel/src/syscall/fs/fd_ops.rs",
+    ),
     TARGET_SET_ID: (
         "kernel/src/file/pipe.rs",
         "kernel/src/syscall/fs/pipe.rs",
         "kernel/src/syscall/fs/fd_ops.rs",
+        "kernel/src/syscall/fs/io.rs",
+        "kernel/src/mm/io.rs",
     ),
 }
 

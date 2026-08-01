@@ -1,6 +1,6 @@
-# Starry pipe/fd Linux-oracle regression corpus, version 2.
+# Starry pipe/vector Linux-oracle regression corpus, version 3.
 # Descriptor slots are logical and local to each scenario.
-version 2
+version 3
 
 scenario zero_length_and_closed_peer
 pipe2 0 1 526336
@@ -138,3 +138,36 @@ close 1
 pipe2 2 3 1073741824
 get-status-flags 2
 get-fd-flags 3
+
+scenario vector_empty_cross_segment_and_short_read
+pipe2 0 1 526336
+writev 1 0 0 0
+readv 0 0 0 0
+writev 1 0 4 4 0 2 65 0 0 66 0 3 67 0 1 68
+readv 0 0 4 4 0 1 0 3 0 0 0 4
+close 0
+close 1
+
+scenario vector_partial_nonblocking_write
+pipe2 0 1 526336
+set-size 1 4096
+writev 1 0 3 3 0 1000 69 0 2000 70 0 2000 71
+fionread 0
+readv 0 0 2 2 0 4095 0 1
+close 0
+close 1
+
+scenario vector_pointer_base_count_and_fd_errors
+pipe2 0 1 526336
+readv 15 1 1 0
+writev 15 1 1 0
+readv 15 0 -1 0
+writev 15 0 1025 0
+readv 0 1 0 0
+writev 1 1 0 0
+readv 0 0 1 1 1 0
+writev 1 0 1 1 1 0 90
+readv 0 0 1 1 1 1
+writev 1 0 1 1 1 1 90
+close 0
+close 1

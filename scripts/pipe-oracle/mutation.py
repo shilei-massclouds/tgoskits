@@ -16,6 +16,9 @@ from scenario import (
     GetFdFlags,
     GetSize,
     GetStatusFlags,
+    IOVCNT_VALUES,
+    IovBaseMode,
+    IovMode,
     MAX_IO_BYTES,
     MAX_LOGICAL_SLOTS,
     MAX_OPS_PER_SCENARIO,
@@ -28,6 +31,8 @@ from scenario import (
     Poll,
     Read,
     ReadNull,
+    Readv,
+    ReadvSegment,
     Scenario,
     ScenarioCodecError,
     ScenarioDocument,
@@ -37,6 +42,8 @@ from scenario import (
     SetStatusFlags,
     Write,
     WriteNull,
+    Writev,
+    WritevSegment,
     parse_document,
     serialize_document,
     serialize_unchecked_document,
@@ -313,11 +320,18 @@ def _mutate_parameter(rng, parent):
     if not families:
         return None
     family = families[rng.range(0, len(families))]
-    scenario_index, operation_index = _choose(rng, locations[family])
+    location = _choose(rng, locations[family])
+    scenario_index, operation_index = location[:2]
+    segment_index = location[2] if len(location) == 3 else None
     scenarios = list(parent.scenarios)
     operations = list(scenarios[scenario_index].operations)
     operation = operations[operation_index]
-    operations[operation_index] = _mutate_operation_parameter(rng, operation, family)
+    operations[operation_index] = _mutate_operation_parameter(
+        rng,
+        operation,
+        family,
+        segment_index,
+    )
     scenarios[scenario_index] = Scenario(operations)
     return ScenarioDocument(scenarios)
 
@@ -327,6 +341,10 @@ def _parameter_locations(document):
         "slot": [],
         "length": [],
         "byte": [],
+        "iov-mode": [],
+        "iov-count": [],
+        "segment-length": [],
+        "base-mode": [],
         "pipe-size": [],
         "poll-mask": [],
         "flags": [],
@@ -338,6 +356,15 @@ def _parameter_locations(document):
                 locations["length"].append((scenario_index, operation_index))
             if isinstance(operation, Write):
                 locations["byte"].append((scenario_index, operation_index))
+            if isinstance(operation, (Readv, Writev)):
+                locations["iov-mode"].append((scenario_index, operation_index))
+                locations["iov-count"].append((scenario_index, operation_index))
+                for segment_index, _segment in enumerate(operation.segments):
+                    location = (scenario_index, operation_index, segment_index)
+                    locations["segment-length"].append(location)
+                    locations["base-mode"].append(location)
+                    if isinstance(operation, Writev):
+                        locations["byte"].append(location)
             if isinstance(operation, SetSize):
                 locations["pipe-size"].append((scenario_index, operation_index))
             if isinstance(operation, Poll):
@@ -350,7 +377,7 @@ def _parameter_locations(document):
     return locations
 
 
-def _mutate_operation_parameter(rng, operation, family):
+def _mutate_operation_parameter(rng, operation, family, segment_index=None):
     if family == "slot":
         return _replace_one_slot(rng, operation)
     if family == "length":
@@ -363,8 +390,49 @@ def _mutate_operation_parameter(rng, operation, family):
         )
         return replace(operation, length=value)
     if family == "byte":
+        if isinstance(operation, Writev):
+            return _mutate_vector_segment_number(
+                rng,
+                operation,
+                segment_index,
+                "byte",
+                BYTE_BOUNDARIES,
+                0,
+                255,
+            )
         value = _mutated_number(rng, operation.byte, BYTE_BOUNDARIES, 0, 255)
         return replace(operation, byte=value)
+    if family == "iov-mode":
+        return _mutate_iov_mode(operation)
+    if family == "iov-count":
+        return _mutate_iov_count(rng, operation)
+    if family == "segment-length":
+        other_length = sum(
+            segment.length
+            for index, segment in enumerate(operation.segments)
+            if index != segment_index
+        )
+        return _mutate_vector_segment_number(
+            rng,
+            operation,
+            segment_index,
+            "length",
+            LENGTH_BOUNDARIES,
+            0,
+            MAX_IO_BYTES - other_length,
+        )
+    if family == "base-mode":
+        segments = list(operation.segments)
+        segment = segments[segment_index]
+        segments[segment_index] = replace(
+            segment,
+            base_mode=(
+                IovBaseMode.INVALID
+                if segment.base_mode == IovBaseMode.VALID
+                else IovBaseMode.VALID
+            ),
+        )
+        return replace(operation, segments=tuple(segments))
     if family == "pipe-size":
         value = _mutated_number(
             rng,
@@ -393,6 +461,64 @@ def _mutate_operation_parameter(rng, operation, family):
     return replace(operation, events=value)
 
 
+def _mutate_iov_mode(operation):
+    if operation.iov_mode == IovMode.VALID:
+        return replace(operation, iov_mode=IovMode.INVALID, segments=())
+    segments = _zero_vector_segments(operation, operation.iovcnt)
+    return replace(operation, iov_mode=IovMode.VALID, segments=segments)
+
+
+def _mutate_iov_count(rng, operation):
+    choices = [value for value in IOVCNT_VALUES if value != operation.iovcnt]
+    iovcnt = _choose(rng, choices)
+    segments = (
+        _resize_vector_segments(operation, iovcnt)
+        if operation.iov_mode == IovMode.VALID
+        else ()
+    )
+    return replace(operation, iovcnt=iovcnt, segments=segments)
+
+
+def _resize_vector_segments(operation, count):
+    if count < 0 or count > 4:
+        return ()
+    segments = list(operation.segments[:count])
+    segments.extend(_zero_vector_segments(operation, count - len(segments)))
+    return tuple(segments)
+
+
+def _zero_vector_segments(operation, count):
+    if count < 0 or count > 4:
+        return ()
+    if isinstance(operation, Writev):
+        return tuple(
+            WritevSegment(IovBaseMode.VALID, 0, 0) for _ in range(count)
+        )
+    return tuple(ReadvSegment(IovBaseMode.VALID, 0) for _ in range(count))
+
+
+def _mutate_vector_segment_number(
+    rng,
+    operation,
+    segment_index,
+    field,
+    boundaries,
+    legal_minimum,
+    legal_maximum,
+):
+    segments = list(operation.segments)
+    segment = segments[segment_index]
+    value = _mutated_number(
+        rng,
+        getattr(segment, field),
+        boundaries,
+        legal_minimum,
+        legal_maximum,
+    )
+    segments[segment_index] = replace(segment, **{field: value})
+    return replace(operation, segments=tuple(segments))
+
+
 def _replace_one_slot(rng, operation):
     fields = []
     if isinstance(operation, Pipe2):
@@ -415,7 +541,13 @@ def _replace_one_slot(rng, operation):
 
 def _mutated_number(rng, current, boundaries, legal_minimum, legal_maximum):
     if rng.range(0, 4) < 3:
-        choices = [value for value in boundaries if value != current]
+        choices = [
+            value
+            for value in boundaries
+            if legal_minimum <= value <= legal_maximum and value != current
+        ]
+        if not choices:
+            return current
         return _choose(rng, choices)
     if legal_minimum == legal_maximum:
         return legal_minimum
@@ -502,10 +634,7 @@ def _repair_scenario(scenario: Scenario) -> Scenario:
         if slot is None or len(repaired) >= MAX_OPS_PER_SCENARIO:
             continue
         repaired_operation = replace(operation, slot=slot)
-        if (
-            isinstance(repaired_operation, (Read, Write))
-            and repaired_operation.length > 0
-        ):
+        if _positive_io_length(repaired_operation) > 0:
             repaired.append(SetStatusFlags(slot, O_NONBLOCK))
             if len(repaired) >= MAX_OPS_PER_SCENARIO:
                 break
@@ -546,11 +675,23 @@ def _resolve_endpoint(
 
 
 def _required_states(operation):
-    if isinstance(operation, (Read, ReadNull)):
+    if isinstance(operation, (Read, ReadNull, Readv)):
         return (READER,)
-    if isinstance(operation, (Write, WriteNull)):
+    if isinstance(operation, (Write, WriteNull, Writev)):
         return (WRITER,)
     return (READER, WRITER)
+
+
+def _positive_io_length(operation):
+    if isinstance(operation, (Read, Write)):
+        return operation.length
+    if (
+        isinstance(operation, (Readv, Writev))
+        and operation.iov_mode == IovMode.VALID
+        and 0 < operation.iovcnt <= 4
+    ):
+        return sum(segment.length for segment in operation.segments)
+    return 0
 
 
 def _random_template_operation(rng):

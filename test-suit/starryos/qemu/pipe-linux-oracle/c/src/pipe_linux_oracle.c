@@ -12,20 +12,25 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <sys/utsname.h>
 #include <unistd.h>
 
 #define LEGACY_TRACE_VERSION 1U
-#define TRACE_VERSION 2U
+#define FD_TRACE_VERSION 2U
+#define TRACE_VERSION 3U
 #define LEGACY_CORPUS_VERSION 1L
-#define CORPUS_VERSION 2L
+#define FD_CORPUS_VERSION 2L
+#define CORPUS_VERSION 3L
 #define MAX_SLOTS 16
 #define DUP_TARGET_FD_BASE 64
 #define MAX_IO_BYTES 8192
+#define MAX_IOV_SEGMENTS 4
 #define MAX_LINE_BYTES 256
 #define TRACE_RELEASE_BYTES 64
 #define TRACE_MACHINE_BYTES 32
 #define UNKNOWN_FLAG 0x40000000L
+#define READV_SENTINEL 0xa5U
 
 static const unsigned char trace_magic[8] = {'P', 'I', 'P', 'E', 'O', 'R', 'C', '1'};
 
@@ -47,6 +52,8 @@ enum operation_kind {
     OP_SET_FD_FLAGS,
     OP_DUP2,
     OP_DUP3,
+    OP_READV,
+    OP_WRITEV,
 };
 
 enum operation_difference {
@@ -182,6 +189,12 @@ static int is_supported_dup3_flags(long flags)
            flags == (O_CLOEXEC | O_NONBLOCK) || flags == UNKNOWN_FLAG;
 }
 
+static int is_supported_iovcnt(long iovcnt)
+{
+    return iovcnt == -1 || (iovcnt >= 0 && iovcnt <= MAX_IOV_SEGMENTS) ||
+           iovcnt == 1025;
+}
+
 static void finish_syscall_result(struct operation_result *result, long syscall_result)
 {
     result->result = syscall_result;
@@ -207,12 +220,34 @@ static int positive_io_is_nonblocking(const struct run_context *context, int slo
     return flags < 0 || (flags & O_NONBLOCK) != 0;
 }
 
+static int positive_vector_io_is_nonblocking(const struct run_context *context,
+                                             int slot, long iov_mode,
+                                             long iovcnt, size_t total_length,
+                                             int write_side)
+{
+    long flags;
+    long access_mode;
+
+    if (iov_mode != 0 || iovcnt <= 0 || iovcnt > MAX_IOV_SEGMENTS ||
+        total_length == 0U || context->slots[slot] < 0)
+        return 1;
+    errno = 0;
+    flags = syscall(SYS_fcntl, context->slots[slot], F_GETFL, 0);
+    if (flags < 0)
+        return 1;
+    access_mode = flags & O_ACCMODE;
+    if ((write_side && access_mode == O_RDONLY) ||
+        (!write_side && access_mode == O_WRONLY))
+        return 1;
+    return (flags & O_NONBLOCK) != 0;
+}
+
 static int execute_pipe2(struct run_context *context, char *save,
                          struct operation_result *result)
 {
     char *read_slot_text = strtok_r(NULL, " \t", &save);
     char *write_slot_text = strtok_r(NULL, " \t", &save);
-    char *flags_text = context->corpus_version == CORPUS_VERSION
+    char *flags_text = context->corpus_version >= FD_CORPUS_VERSION
                            ? strtok_r(NULL, " \t", &save)
                            : NULL;
     int read_slot;
@@ -223,9 +258,9 @@ static int execute_pipe2(struct run_context *context, char *save,
 
     if (parse_slot(read_slot_text, &read_slot) != 0 ||
         parse_slot(write_slot_text, &write_slot) != 0 ||
-        (context->corpus_version == CORPUS_VERSION &&
+        (context->corpus_version >= FD_CORPUS_VERSION &&
          parse_long_value(flags_text, 0, INT_MAX, &flags) != 0) ||
-        (context->corpus_version == CORPUS_VERSION &&
+        (context->corpus_version >= FD_CORPUS_VERSION &&
          !is_supported_pipe2_flags(flags)) ||
         strtok_r(NULL, " \t", &save) != NULL)
         return -1;
@@ -321,6 +356,84 @@ static int execute_write(struct run_context *context, char *save,
     syscall_result = syscall(SYS_write, context->slots[slot], buffer, (size_t)length);
     finish_syscall_result(result, syscall_result);
     result->kind = OP_WRITE;
+    return 0;
+}
+
+static int execute_vector_io(struct run_context *context, char *save,
+                             struct operation_result *result, int write_side)
+{
+    char *slot_text = strtok_r(NULL, " \t", &save);
+    char *iov_mode_text = strtok_r(NULL, " \t", &save);
+    char *iovcnt_text = strtok_r(NULL, " \t", &save);
+    char *segment_count_text = strtok_r(NULL, " \t", &save);
+    struct iovec iov[MAX_IOV_SEGMENTS];
+    unsigned char storage[MAX_IO_BYTES];
+    size_t storage_offset = 0U;
+    size_t total_length = 0U;
+    long iov_mode;
+    long iovcnt;
+    long segment_count;
+    long expected_segment_count;
+    long syscall_result;
+    int slot;
+    long segment_index;
+
+    if (parse_slot(slot_text, &slot) != 0 ||
+        parse_long_value(iov_mode_text, 0, 1, &iov_mode) != 0 ||
+        parse_long_value(iovcnt_text, -1, 1025, &iovcnt) != 0 ||
+        !is_supported_iovcnt(iovcnt) ||
+        parse_long_value(segment_count_text, 0, MAX_IOV_SEGMENTS,
+                         &segment_count) != 0)
+        return -1;
+    expected_segment_count =
+        iov_mode == 0 && iovcnt >= 0 && iovcnt <= MAX_IOV_SEGMENTS ? iovcnt : 0;
+    if (segment_count != expected_segment_count)
+        return -1;
+
+    memset(iov, 0, sizeof(iov));
+    memset(storage, READV_SENTINEL, sizeof(storage));
+    for (segment_index = 0; segment_index < segment_count; segment_index++) {
+        char *base_mode_text = strtok_r(NULL, " \t", &save);
+        char *length_text = strtok_r(NULL, " \t", &save);
+        char *byte_text = write_side ? strtok_r(NULL, " \t", &save) : NULL;
+        long base_mode;
+        long length;
+        long byte_value = 0;
+
+        if (parse_long_value(base_mode_text, 0, 1, &base_mode) != 0 ||
+            parse_long_value(length_text, 0, MAX_IO_BYTES, &length) != 0 ||
+            (write_side &&
+             parse_long_value(byte_text, 0, UCHAR_MAX, &byte_value) != 0) ||
+            (size_t)length > MAX_IO_BYTES - total_length)
+            return -1;
+        total_length += (size_t)length;
+        iov[segment_index].iov_len = (size_t)length;
+        if (base_mode == 0) {
+            iov[segment_index].iov_base = storage + storage_offset;
+            if (write_side)
+                memset(storage + storage_offset, (unsigned char)byte_value,
+                       (size_t)length);
+            storage_offset += (size_t)length;
+        } else {
+            iov[segment_index].iov_base = (void *)(uintptr_t)1;
+        }
+    }
+    if (strtok_r(NULL, " \t", &save) != NULL ||
+        !positive_vector_io_is_nonblocking(context, slot, iov_mode, iovcnt,
+                                           total_length, write_side))
+        return -1;
+
+    errno = 0;
+    syscall_result = syscall(write_side ? SYS_writev : SYS_readv,
+                             context->slots[slot],
+                             iov_mode == 0 ? iov : (void *)(uintptr_t)1,
+                             iovcnt);
+    finish_syscall_result(result, syscall_result);
+    if (!write_side) {
+        result->data_len = (uint32_t)storage_offset;
+        memcpy(result->data, storage, storage_offset);
+    }
+    result->kind = write_side ? OP_WRITEV : OP_READV;
     return 0;
 }
 
@@ -511,6 +624,12 @@ static int execute_operation(struct run_context *context, char *line,
         return execute_write(context, save, result);
     if (strcmp(operation, "write-null") == 0)
         return execute_null_io(context, save, result, 1);
+    if (context->corpus_version == CORPUS_VERSION &&
+        strcmp(operation, "readv") == 0)
+        return execute_vector_io(context, save, result, 0);
+    if (context->corpus_version == CORPUS_VERSION &&
+        strcmp(operation, "writev") == 0)
+        return execute_vector_io(context, save, result, 1);
     if (strcmp(operation, "dup") == 0)
         return execute_dup(context, save, result);
     if (strcmp(operation, "close") == 0)
@@ -523,7 +642,7 @@ static int execute_operation(struct run_context *context, char *line,
         return execute_fcntl(context, save, result, 0);
     if (strcmp(operation, "fionread") == 0)
         return execute_fionread(context, save, result);
-    if (context->corpus_version != CORPUS_VERSION)
+    if (context->corpus_version < FD_CORPUS_VERSION)
         return -1;
     if (strcmp(operation, "get-status-flags") == 0)
         return execute_flag_fcntl(context, save, result, F_GETFL,
@@ -798,6 +917,7 @@ static int compare_trace(const char *corpus_path, const char *trace_path,
     if (fread(&context.header, sizeof(context.header), 1, context.trace) != 1 ||
         memcmp(context.header.magic, trace_magic, sizeof(trace_magic)) != 0 ||
         (context.header.version != LEGACY_TRACE_VERSION &&
+         context.header.version != FD_TRACE_VERSION &&
          context.header.version != TRACE_VERSION) ||
         context.header.corpus_digest != corpus_digest) {
         fclose(context.trace);
@@ -809,9 +929,12 @@ static int compare_trace(const char *corpus_path, const char *trace_path,
            context.header.release, context.header.machine, context.header.page_size,
            context.header.record_count);
     status = process_corpus(&context, corpus_path);
+    if (status == 0 && context.corpus_version == FD_CORPUS_VERSION &&
+        context.header.version < FD_TRACE_VERSION)
+        status = fail("version-2 corpus requires a version-2 or newer trace");
     if (status == 0 && context.corpus_version == CORPUS_VERSION &&
         context.header.version != TRACE_VERSION)
-        status = fail("version-2 corpus requires a version-2 trace");
+        status = fail("version-3 corpus requires a version-3 trace");
     if (status == 0 && context.operation_index != context.header.record_count)
         status = fail("expected trace operation count does not match corpus");
     if (status == 0 && fread(&trailing_byte, 1, 1, context.trace) != 0U)

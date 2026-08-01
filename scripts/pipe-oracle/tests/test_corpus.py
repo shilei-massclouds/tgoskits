@@ -527,8 +527,8 @@ class PersistentCorpusRegressionTests(unittest.TestCase):
             self.assertEqual(
                 {path.stem for path in store.coverage_state_dir.glob("*.json")},
                 {
-                    f"{first_digest}-pipe-fd-v2",
-                    f"{second_digest}-pipe-fd-v2",
+                    f"{first_digest}-pipe-vector-v3",
+                    f"{second_digest}-pipe-vector-v3",
                 },
             )
 
@@ -549,6 +549,11 @@ class PersistentCorpusRegressionTests(unittest.TestCase):
                 {"os/StarryOS/kernel/src/file/pipe.rs:2:1"},
                 pipe_coverage.LEGACY_TARGET_SET_ID,
             )
+            store.save_coverage_regions(
+                elf,
+                {"os/StarryOS/kernel/src/syscall/fs/pipe.rs:3:1"},
+                pipe_coverage.FD_TARGET_SET_ID,
+            )
 
             self.assertEqual(
                 store.load_coverage_regions(elf, pipe_coverage.TARGET_SET_ID),
@@ -557,6 +562,10 @@ class PersistentCorpusRegressionTests(unittest.TestCase):
             self.assertEqual(
                 store.load_coverage_regions(elf, pipe_coverage.LEGACY_TARGET_SET_ID),
                 {"os/StarryOS/kernel/src/file/pipe.rs:2:1"},
+            )
+            self.assertEqual(
+                store.load_coverage_regions(elf, pipe_coverage.FD_TARGET_SET_ID),
+                {"os/StarryOS/kernel/src/syscall/fs/pipe.rs:3:1"},
             )
 
             legacy_elf = workspace / "legacy-starryos"
@@ -595,13 +604,36 @@ class PersistentCorpusRegressionTests(unittest.TestCase):
             digest = store.elf_digest(elf)
             external = workspace / "external.json"
             external.write_text("{}")
-            state = store.coverage_state_dir / f"{digest}-pipe-fd-v2.json"
+            state = store.coverage_state_dir / f"{digest}-pipe-vector-v3.json"
             state.symlink_to(external)
 
             with self.assertRaisesRegex(Exception, "not a regular file"):
                 store.load_coverage_regions(elf)
 
-    def test_current_corpus_loader_accepts_generator_v2_and_v3_but_rejects_v1(self):
+    def test_coverage_state_schema_and_target_mapping_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            elf = workspace / "starryos"
+            elf.write_bytes(b"elf")
+            store = corpus.CorpusStore(workspace)
+            digest = store.save_coverage_regions(elf, {"vector-region"})
+            state = store.coverage_state_dir / f"{digest}-pipe-vector-v3.json"
+            metadata = json.loads(state.read_text())
+
+            metadata["schema_version"] = 2
+            state.write_text(json.dumps(metadata))
+            with self.assertRaisesRegex(Exception, "schema target set mismatch"):
+                store.load_coverage_regions(elf)
+
+            metadata["schema_version"] = 99
+            state.write_text(json.dumps(metadata))
+            with self.assertRaisesRegex(Exception, "unsupported coverage-state schema"):
+                store.load_coverage_regions(elf)
+
+            with self.assertRaisesRegex(ValueError, "unknown coverage target set"):
+                store.load_coverage_regions(elf, "unknown-target")
+
+    def test_current_corpus_loader_accepts_generator_v2_v3_v4_but_rejects_v1(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             workspace = Path(temporary_directory)
             store = corpus.CorpusStore(workspace)
@@ -616,14 +648,15 @@ class PersistentCorpusRegressionTests(unittest.TestCase):
             metadata = json.loads(metadata_path.read_text())
             original_origin = metadata["origin"]
 
-            metadata["generator_version"] = "2"
-            metadata_path.write_text(json.dumps(metadata))
-            loaded = corpus.CorpusStore(workspace).load_corpus()
-            self.assertEqual(len(loaded), 1)
-            self.assertEqual(
-                json.loads(metadata_path.read_text())["origin"],
-                original_origin,
-            )
+            for compatible_version in ("2", "3", "4"):
+                metadata["generator_version"] = compatible_version
+                metadata_path.write_text(json.dumps(metadata))
+                loaded = corpus.CorpusStore(workspace).load_corpus()
+                self.assertEqual(len(loaded), 1)
+                self.assertEqual(
+                    json.loads(metadata_path.read_text())["origin"],
+                    original_origin,
+                )
 
             metadata["generator_version"] = "1"
             metadata_path.write_text(json.dumps(metadata))

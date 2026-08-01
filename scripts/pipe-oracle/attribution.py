@@ -18,6 +18,7 @@ from scenario import ScenarioDocument, parse_document, serialize_document
 from attribution_schema import (
     ATTRIBUTION_JOBS_NAME,
     ATTRIBUTION_SCHEMA_VERSION,
+    FD_ATTRIBUTION_SCHEMA_VERSION,
     ELFS_NAME,
     FAILURES_NAME,
     HOST_ORACLE_NAME,
@@ -577,7 +578,10 @@ class AttributionStore:
                 "trace_sha256": sha256_file(temporary / "linux.trace"),
                 "profraws": profraw_metadata,
             }
-            if evidence_schema_version == ATTRIBUTION_SCHEMA_VERSION:
+            if evidence_schema_version in (
+                FD_ATTRIBUTION_SCHEMA_VERSION,
+                ATTRIBUTION_SCHEMA_VERSION,
+            ):
                 coverage["target_set_id"] = target_set_id
             _write_json(temporary / "coverage.json", coverage)
             _sync_directory(profraw_dir)

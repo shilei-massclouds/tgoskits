@@ -23,6 +23,7 @@
 #include <sys/syscall.h>
 #include <limits.h>
 #include <signal.h>
+#include <stdint.h>
 
 /* ---- Minimal test framework (matches test_framework.h conventions) ---- */
 static int __pass = 0;
@@ -243,11 +244,47 @@ int main(void)
     CHECK_ERR(writev(fd, iov, 1), EBADF, "2.4 writev on O_RDONLY => EBADF");
     close(fd);
 
-    /* 2.5 pread64 on bad fd */
-    CHECK_ERR(pread(-1, buf1, 4, 0), EBADF, "2.5 pread64(-1) => EBADF");
+    /* Linux validates the fd and its access mode before importing iovec.
+     * Keep these as raw syscalls so libc cannot validate or rewrite either
+     * argument before the kernel observes the conflicting errors. */
+    CHECK_ERR(syscall(SYS_readv, -1, (void *)(uintptr_t)1, 1L), EBADF,
+              "2.5 readv bad fd takes priority over bad iovec");
+    CHECK_ERR(syscall(SYS_writev, -1, (void *)(uintptr_t)1, 1L), EBADF,
+              "2.6 writev bad fd takes priority over bad iovec");
+    CHECK_ERR(syscall(SYS_readv, -1, iov, (long)IOV_MAX + 1L), EBADF,
+              "2.7 readv bad fd takes priority over invalid iovcnt");
+    CHECK_ERR(syscall(SYS_writev, -1, iov, (long)IOV_MAX + 1L), EBADF,
+              "2.8 writev bad fd takes priority over invalid iovcnt");
 
-    /* 2.6 pwrite64 on bad fd */
-    CHECK_ERR(pwrite(-1, dummy, 4, 0), EBADF, "2.6 pwrite64(-1) => EBADF");
+    fd = open(TMPFILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    CHECK(fd >= 0, "2.9 open write-only for error priority");
+    CHECK_ERR(syscall(SYS_readv, fd, (void *)(uintptr_t)1, 1L), EBADF,
+              "2.9 readv O_WRONLY takes priority over bad iovec");
+    close(fd);
+
+    fd = open(TMPFILE, O_RDONLY);
+    CHECK(fd >= 0, "2.10 open read-only for error priority");
+    CHECK_ERR(syscall(SYS_writev, fd, (void *)(uintptr_t)1, 1L), EBADF,
+              "2.10 writev O_RDONLY takes priority over bad iovec");
+    close(fd);
+
+    int nonblock_pipe[2];
+    CHECK(pipe2(nonblock_pipe, O_NONBLOCK) == 0,
+          "2.11 create nonblocking pipe for deferred iovec access");
+    struct iovec bad_segment = {
+        .iov_base = (void *)(uintptr_t)1,
+        .iov_len = 1,
+    };
+    CHECK_ERR(syscall(SYS_readv, nonblock_pipe[0], &bad_segment, 1L), EAGAIN,
+              "2.12 empty nonblocking pipe takes priority over bad iovec base");
+    close(nonblock_pipe[0]);
+    close(nonblock_pipe[1]);
+
+    /* 2.13 pread64 on bad fd */
+    CHECK_ERR(pread(-1, buf1, 4, 0), EBADF, "2.13 pread64(-1) => EBADF");
+
+    /* 2.14 pwrite64 on bad fd */
+    CHECK_ERR(pwrite(-1, dummy, 4, 0), EBADF, "2.14 pwrite64(-1) => EBADF");
 
     /* ================================================================
      * SECTION 3: Error conditions — EINVAL (iovcnt)

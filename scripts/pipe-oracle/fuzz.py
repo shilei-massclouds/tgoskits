@@ -36,6 +36,7 @@ from corpus import (
     CorpusStorageError,
     CorpusStore,
 )
+from coverage import TARGET_SET_ID
 from generator import (
     GENERATOR_VERSION,
     CampaignRng,
@@ -934,7 +935,7 @@ def _extract_new_regions(
     profraws: List[Path],
     elf: Path,
     covered_regions: Set[str],
-    target_set_id: str = "pipe-fd-v2",
+    target_set_id: str = TARGET_SET_ID,
 ) -> Set[str]:
     if not profraws:
         return set()
@@ -953,7 +954,7 @@ def _extract_new_regions(
 def _extract_regions(
     profraws: List[Path],
     elf: Path,
-    target_set_id: str = "pipe-fd-v2",
+    target_set_id: str = TARGET_SET_ID,
 ) -> Set[str]:
     if not profraws:
         return set()

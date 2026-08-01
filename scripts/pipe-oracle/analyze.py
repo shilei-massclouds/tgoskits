@@ -31,12 +31,14 @@ from scenario import (
     Poll,
     Read,
     ReadNull,
+    Readv,
     ScenarioDocument,
     SetFdFlags,
     SetSize,
     SetStatusFlags,
     Write,
     WriteNull,
+    Writev,
     operation_name,
     serialize_document,
 )
@@ -51,8 +53,10 @@ OPERATION_NAMES = (
     "pipe2",
     "read",
     "read-null",
+    "readv",
     "write",
     "write-null",
+    "writev",
     "dup",
     "close",
     "poll",
@@ -139,7 +143,7 @@ def analyze(seed: int, samples: int, mutations: int, top: int) -> Dict:
     source_specs = (
         (
             "campaign_rng",
-            "SHA-256 counter stream v2 with rejection sampling",
+            "SHA-256 counter stream v3 with rejection sampling",
             generator.CampaignRng,
         ),
         (
@@ -386,6 +390,9 @@ def _record_document(document: ScenarioDocument, distributions: MutableMapping):
 def _record_parameters(operation, distributions):
     if isinstance(operation, (Read, Write)):
         distributions["length_buckets"][_length_bucket(operation.length)] += 1
+    elif isinstance(operation, (Readv, Writev)):
+        for segment in operation.segments:
+            distributions["length_buckets"][_length_bucket(segment.length)] += 1
     elif isinstance(operation, SetSize):
         distributions["pipe_size_buckets"][_pipe_size_bucket(operation.size)] += 1
     elif isinstance(operation, Poll):
@@ -415,9 +422,9 @@ def _record_resource_category(operation, slots, distributions):
         categories["closed-slot"] += 1
     if isinstance(operation, Close) and slot_state == CLOSED:
         categories["duplicate-close"] += 1
-    if isinstance(operation, (Read, ReadNull)) and slot_state == WRITER:
+    if isinstance(operation, (Read, ReadNull, Readv)) and slot_state == WRITER:
         categories["wrong-endpoint"] += 1
-    if isinstance(operation, (Write, WriteNull)) and slot_state == READER:
+    if isinstance(operation, (Write, WriteNull, Writev)) and slot_state == READER:
         categories["wrong-endpoint"] += 1
     if isinstance(operation, (SetSize, GetSize, Fionread)):
         if slot_state == READER:

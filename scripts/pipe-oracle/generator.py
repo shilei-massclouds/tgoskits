@@ -1,4 +1,4 @@
-"""Deterministic legacy migration and version-2 structured generation."""
+"""Deterministic legacy migration and version-3 structured generation."""
 
 import hashlib
 import struct
@@ -17,6 +17,9 @@ from scenario import (
     GetFdFlags,
     GetSize,
     GetStatusFlags,
+    IOVCNT_VALUES,
+    IovBaseMode,
+    IovMode,
     LEGACY_CORPUS_VERSION,
     MAX_ENTRY_BYTES,
     MAX_IO_BYTES,
@@ -32,6 +35,8 @@ from scenario import (
     Poll,
     Read,
     ReadNull,
+    Readv,
+    ReadvSegment,
     Scenario,
     ScenarioDocument,
     SetFdFlags,
@@ -39,16 +44,20 @@ from scenario import (
     SetStatusFlags,
     Write,
     WriteNull,
+    Writev,
+    WritevSegment,
     canonical_digest,
     serialize_document,
     validate_entry_limits,
 )
 
 
-GENERATOR_VERSION = "3"
-PREVIOUS_GENERATOR_VERSION = "2"
+GENERATOR_VERSION = "4"
+PREVIOUS_GENERATOR_VERSION = "3"
+FD_GENERATOR_VERSION = "2"
 LEGACY_GENERATOR_VERSION = "1"
 SUPPORTED_CORPUS_GENERATOR_VERSIONS = (
+    FD_GENERATOR_VERSION,
     PREVIOUS_GENERATOR_VERSION,
     GENERATOR_VERSION,
 )
@@ -60,7 +69,7 @@ READER = 1
 WRITER = 2
 CLOSED = 3
 
-_CAMPAIGN_RNG_DOMAIN = b"starry-pipe-oracle-campaign-rng-v2\x00"
+_CAMPAIGN_RNG_DOMAIN = b"starry-pipe-oracle-campaign-rng-v3\x00"
 _UINT64_RANGE = 1 << 64
 
 _GENERATION_LENGTH_BOUNDARIES = (0, 1, 2, 4095, 4096, 4097, 8191, 8192)
@@ -94,6 +103,14 @@ _PIPE2_FLAG_BOUNDARIES = PIPE2_FLAG_VALUES
 _STATUS_FLAG_BOUNDARIES = (0, O_NONBLOCK, O_CLOEXEC, PIPE2_ALLOWED_FLAGS)
 _FD_FLAG_BOUNDARIES = (0, FD_CLOEXEC, 2, 3)
 _DUP3_FLAG_BOUNDARIES = DUP3_FLAG_VALUES
+_IOV_MODE_BOUNDARIES = (IovMode.VALID, IovMode.VALID, IovMode.VALID, IovMode.INVALID)
+_IOV_BASE_MODE_BOUNDARIES = (
+    IovBaseMode.VALID,
+    IovBaseMode.VALID,
+    IovBaseMode.VALID,
+    IovBaseMode.INVALID,
+)
+_IOVCNT_BOUNDARIES = IOVCNT_VALUES
 
 
 @dataclass
@@ -179,7 +196,7 @@ class LegacyLcgRng:
 
 
 def generate_document(rng) -> ScenarioDocument:
-    """Generate one bounded version-3 corpus entry directly as scenario IR."""
+    """Generate one bounded generator-v4 corpus entry directly as scenario IR."""
 
     scenario_count = rng.range(1, 5)
     scenarios = []
@@ -246,8 +263,10 @@ def _structured_operation_families(state: _GenerationState):
     families = [
         "read",
         "read-null",
+        "readv",
         "write",
         "write-null",
+        "writev",
         "close",
         "poll",
         "set-size",
@@ -287,6 +306,9 @@ def _emit_structured_operation(rng, family: str, state: _GenerationState):
         return Read(slot, _safe_generation_length(rng, state, slot))
     if family == "read-null":
         return ReadNull(_choose(rng, readers or open_slots))
+    if family == "readv":
+        slot = _choose(rng, readers or open_slots)
+        return _generate_vector_operation(rng, state, slot, False)
     if family == "write":
         slot = _choose(rng, writers or open_slots)
         return Write(
@@ -296,6 +318,9 @@ def _emit_structured_operation(rng, family: str, state: _GenerationState):
         )
     if family == "write-null":
         return WriteNull(_choose(rng, writers or open_slots))
+    if family == "writev":
+        slot = _choose(rng, writers or open_slots)
+        return _generate_vector_operation(rng, state, slot, True)
     if family == "dup":
         source = _choose(rng, open_slots)
         destination = _choose(rng, available_slots)
@@ -380,20 +405,58 @@ def _emit_resource_error(rng, state: _GenerationState):
             return Read(slot, _safe_generation_length(rng, state, slot))
         return ReadNull(slot)
 
-    operation_kind = rng.range(0, 7)
+    operation_kind = rng.range(0, 9)
     if operation_kind == 0:
         return Read(slot, _generation_length(rng))
     if operation_kind == 1:
         return Write(slot, _generation_length(rng), rng.range(0, 256))
     if operation_kind == 2:
-        return Close(slot)
+        return _generate_vector_operation(rng, state, slot, False)
     if operation_kind == 3:
-        return Poll(slot, _generation_poll_mask(rng))
+        return _generate_vector_operation(rng, state, slot, True)
     if operation_kind == 4:
-        return GetSize(slot)
+        return Close(slot)
     if operation_kind == 5:
+        return Poll(slot, _generation_poll_mask(rng))
+    if operation_kind == 6:
+        return GetSize(slot)
+    if operation_kind == 7:
         return Fionread(slot)
     return ReadNull(slot) if rng.range(0, 2) == 0 else WriteNull(slot)
+
+
+def _generate_vector_operation(rng, state, slot: int, write_side: bool):
+    iov_mode = _choose(rng, _IOV_MODE_BOUNDARIES)
+    iovcnt = _choose(rng, _IOVCNT_BOUNDARIES)
+    segments = []
+    if iov_mode == IovMode.VALID and 0 <= iovcnt <= 4:
+        remaining = MAX_IO_BYTES
+        can_transfer = _vector_can_transfer_without_blocking(state, slot, write_side)
+        for _ in range(iovcnt):
+            length = _generation_segment_length(rng, remaining) if can_transfer else 0
+            remaining -= length
+            base_mode = _choose(rng, _IOV_BASE_MODE_BOUNDARIES)
+            if write_side:
+                segments.append(
+                    WritevSegment(base_mode, length, rng.range(0, 256))
+                )
+            else:
+                segments.append(ReadvSegment(base_mode, length))
+    if write_side:
+        return Writev(slot, iov_mode, iovcnt, segments)
+    return Readv(slot, iov_mode, iovcnt, segments)
+
+
+def _vector_can_transfer_without_blocking(state, slot: int, write_side: bool) -> bool:
+    endpoint = WRITER if write_side else READER
+    return state.slots[slot] != endpoint or state.is_nonblocking(slot)
+
+
+def _generation_segment_length(rng, remaining: int) -> int:
+    boundaries = [value for value in _GENERATION_LENGTH_BOUNDARIES if value <= remaining]
+    if rng.range(0, 2) == 0:
+        return _choose(rng, boundaries)
+    return rng.range(0, remaining + 1)
 
 
 def _generation_length(rng) -> int:

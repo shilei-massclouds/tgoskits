@@ -128,6 +128,9 @@ pub fn sys_read(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
 pub fn sys_readv(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> {
     debug!("sys_readv <= fd: {fd}, iovcnt: {iovcnt}");
     let f = get_file_like(fd)?;
+    if !f.readable() {
+        return Err(AxError::BadFileDescriptor);
+    }
     f.read(&mut IoVectorBuf::new(iov, iovcnt)?.into_io())
         .map(|n| n as _)
 }
@@ -146,8 +149,11 @@ pub fn sys_write(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
 
 pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> {
     debug!("sys_writev <= fd: {fd}, iovcnt: {iovcnt}");
-    let total = validate_user_iov_buf_regions(iov, iovcnt)?;
     let file_like = get_file_like(fd)?;
+    if !file_like.writable() {
+        return Err(AxError::BadFileDescriptor);
+    }
+    let total = validate_user_iov_buf_regions(iov, iovcnt)?;
     memfd_checks_before_stream_write(&file_like, total as u64)?;
     let data = copy_user_iov_read_buf(iov, iovcnt)?;
     file_like.write(&mut data.as_slice()).map(|n| n as _)

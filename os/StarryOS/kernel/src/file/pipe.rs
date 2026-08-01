@@ -446,6 +446,14 @@ fn raise_pipe() {
 }
 
 impl FileLike for Pipe {
+    fn readable(&self) -> bool {
+        self.is_read()
+    }
+
+    fn writable(&self) -> bool {
+        self.is_write()
+    }
+
     fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
         if !self.is_read() {
             return Err(AxError::BadFileDescriptor);

@@ -20,7 +20,7 @@ from corpus_errors import (
     CorpusStorageError,
     CorpusValidationError,
 )
-from coverage import LEGACY_TARGET_SET_ID, TARGET_SET_ID
+from coverage import FD_TARGET_SET_ID, LEGACY_TARGET_SET_ID, TARGET_SET_ID
 from generator import (
     GENERATOR_VERSION,
     SUPPORTED_CORPUS_GENERATOR_VERSIONS,
@@ -38,8 +38,9 @@ LEGACY_CORPUS_SCHEMA_VERSION = 1
 ATTRIBUTED_CORPUS_SCHEMA_VERSION = 2
 CORPUS_SCHEMA_VERSION = 3
 LEGACY_COVERAGE_STATE_SCHEMA_VERSION = 1
-COVERAGE_STATE_SCHEMA_VERSION = 2
-RUN_SCHEMA_VERSION = 4
+FD_COVERAGE_STATE_SCHEMA_VERSION = 2
+COVERAGE_STATE_SCHEMA_VERSION = 3
+RUN_SCHEMA_VERSION = 5
 
 CORPUS_ENTRIES_NAME = "corpus"
 RUNS_NAME = "runs"
@@ -464,7 +465,8 @@ class CorpusStore:
                 "coverage-state is not a regular file",
             )
         metadata = _read_json(state_path)
-        if metadata.get("schema_version") == LEGACY_COVERAGE_STATE_SCHEMA_VERSION:
+        schema_version = metadata.get("schema_version")
+        if schema_version == LEGACY_COVERAGE_STATE_SCHEMA_VERSION:
             _require_exact_keys(
                 metadata,
                 {
@@ -480,7 +482,10 @@ class CorpusStore:
                     state_path,
                     "legacy coverage-state belongs to the pipe-v1 target set",
                 )
-        else:
+        elif schema_version in (
+            FD_COVERAGE_STATE_SCHEMA_VERSION,
+            COVERAGE_STATE_SCHEMA_VERSION,
+        ):
             _require_exact_keys(
                 metadata,
                 {
@@ -492,13 +497,26 @@ class CorpusStore:
                 },
                 state_path,
             )
-            if metadata.get("target_set_id") != target_set_id:
+            expected_target_set_id = (
+                FD_TARGET_SET_ID
+                if schema_version == FD_COVERAGE_STATE_SCHEMA_VERSION
+                else TARGET_SET_ID
+            )
+            if metadata.get("target_set_id") != expected_target_set_id:
+                raise CorpusValidationError(
+                    state_path,
+                    "coverage-state schema target set mismatch",
+                )
+            if expected_target_set_id != target_set_id:
                 raise CorpusValidationError(
                     state_path,
                     "coverage-state target set mismatch",
                 )
-        if metadata["schema_version"] not in (
+        else:
+            raise CorpusValidationError(state_path, "unsupported coverage-state schema")
+        if schema_version not in (
             LEGACY_COVERAGE_STATE_SCHEMA_VERSION,
+            FD_COVERAGE_STATE_SCHEMA_VERSION,
             COVERAGE_STATE_SCHEMA_VERSION,
         ):
             raise CorpusValidationError(state_path, "unsupported coverage-state schema")
@@ -523,18 +541,30 @@ class CorpusStore:
         state_path = self._coverage_state_path(elf_digest, target_set_id)
         if state_path.exists():
             self.load_coverage_regions(elf_path, target_set_id)
+        schema_version = {
+            LEGACY_TARGET_SET_ID: LEGACY_COVERAGE_STATE_SCHEMA_VERSION,
+            FD_TARGET_SET_ID: FD_COVERAGE_STATE_SCHEMA_VERSION,
+            TARGET_SET_ID: COVERAGE_STATE_SCHEMA_VERSION,
+        }.get(target_set_id)
+        if schema_version is None:
+            raise ValueError(f"unknown coverage target set: {target_set_id}")
         metadata = {
-            "schema_version": COVERAGE_STATE_SCHEMA_VERSION,
-            "target_set_id": target_set_id,
+            "schema_version": schema_version,
             "starry_elf_sha256": elf_digest,
             "covered_regions": _sorted_regions(regions),
             "last_updated": self.verification_environment(),
         }
+        if schema_version != LEGACY_COVERAGE_STATE_SCHEMA_VERSION:
+            metadata["target_set_id"] = target_set_id
         _atomic_write_json(state_path, metadata)
         return elf_digest
 
     def _coverage_state_path(self, elf_digest: str, target_set_id: str) -> Path:
-        if target_set_id not in (LEGACY_TARGET_SET_ID, TARGET_SET_ID):
+        if target_set_id not in (
+            LEGACY_TARGET_SET_ID,
+            FD_TARGET_SET_ID,
+            TARGET_SET_ID,
+        ):
             raise ValueError(f"unknown coverage target set: {target_set_id}")
         return self.coverage_state_dir / f"{elf_digest}-{target_set_id}.json"
 

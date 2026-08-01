@@ -197,6 +197,21 @@ pub type IoSrc<'a> = dyn ReadBuf + 'a;
 
 #[allow(dead_code)]
 pub trait FileLike: Pollable + DowncastSync {
+    /// Whether this open file description permits read operations.
+    ///
+    /// Bidirectional file-like objects keep the default. Objects whose access
+    /// mode is fixed at open or creation time override this query so syscalls
+    /// can reject `EBADF` before importing user buffers, matching Linux VFS
+    /// ordering.
+    fn readable(&self) -> bool {
+        true
+    }
+
+    /// Whether this open file description permits write operations.
+    fn writable(&self) -> bool {
+        true
+    }
+
     fn read(&self, _dst: &mut IoDst) -> AxResult<usize> {
         Err(AxError::InvalidInput)
     }

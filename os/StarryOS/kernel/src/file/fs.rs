@@ -14,7 +14,10 @@ use ax_task::future::{block_on, poll_io};
 use axfs_ng_vfs::{FsIoEvents, FsPollable, Location, Metadata, NodeFlags};
 use axpoll::{IoEvents, Pollable};
 use linux_raw_sys::{
-    general::{AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, O_APPEND, O_EXCL},
+    general::{
+        AT_EMPTY_PATH, AT_FDCWD, AT_SYMLINK_NOFOLLOW, O_ACCMODE, O_APPEND, O_EXCL, O_PATH,
+        O_RDONLY, O_WRONLY,
+    },
     ioctl::TIOCSCTTY,
 };
 use starry_vm::VmPtr;
@@ -170,6 +173,14 @@ fn io_events_to_fs(events: IoEvents) -> FsIoEvents {
 }
 
 impl FileLike for File {
+    fn readable(&self) -> bool {
+        self.open_flags & O_PATH == 0 && self.open_flags & O_ACCMODE != O_WRONLY
+    }
+
+    fn writable(&self) -> bool {
+        self.open_flags & O_PATH == 0 && self.open_flags & O_ACCMODE != O_RDONLY
+    }
+
     fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
         let inner = self.inner();
         if likely(self.is_blocking()) {
@@ -319,6 +330,14 @@ impl Directory {
 }
 
 impl FileLike for Directory {
+    fn readable(&self) -> bool {
+        self.open_flags & O_PATH == 0 && self.open_flags & O_ACCMODE != O_WRONLY
+    }
+
+    fn writable(&self) -> bool {
+        self.open_flags & O_PATH == 0 && self.open_flags & O_ACCMODE != O_RDONLY
+    }
+
     fn read(&self, _dst: &mut IoDst) -> AxResult<usize> {
         Err(AxError::IsADirectory)
     }

@@ -229,6 +229,107 @@ class PipeOracleRegressionTests(unittest.TestCase):
         self.assertEqual(scenario.parse_document(canonical), document)
         self._assert_host_record_compare(canonical)
 
+    def test_v3_vector_operations_round_trip_and_run_on_host(self):
+        encoded = (
+            "version 3\n"
+            "scenario vectors\n"
+            "pipe2 0 1 2048\n"
+            "writev 1 0 4 4 0 2 65 0 0 66 0 3 67 0 1 68\n"
+            "readv 0 0 4 4 0 1 0 3 0 0 0 4\n"
+        )
+
+        document = scenario.parse_document(encoded)
+        canonical = scenario.serialize_document(document)
+
+        self.assertEqual(
+            canonical,
+            encoded.replace("scenario vectors", "scenario generated-0001"),
+        )
+        self.assertIsInstance(document.scenarios[0].operations[1], scenario.Writev)
+        self.assertIsInstance(document.scenarios[0].operations[2], scenario.Readv)
+        self.assertEqual(scenario.parse_document(canonical), document)
+        self._assert_host_record_compare(canonical)
+
+    def test_vector_codec_rejects_versions_fields_modes_counts_and_shapes(self):
+        invalid_documents = (
+            "version 1\nscenario x\nreadv 0 0 0 0\n",
+            "version 2\nscenario x\nwritev 0 0 0 0\n",
+            "version 3\nscenario x\nreadv 0 2 0 0\n",
+            "version 3\nscenario x\nreadv 0 0 5 0\n",
+            "version 3\nscenario x\nreadv 0 0 1 0\n",
+            "version 3\nscenario x\nreadv 0 0 1 1 2 1\n",
+            "version 3\nscenario x\nwritev 0 0 1 1 0 1\n",
+            "version 3\nscenario x\nreadv 0 0 2 2 0 8192 0 1\n",
+        )
+
+        for encoded in invalid_documents:
+            with self.subTest(encoded=encoded):
+                with self.assertRaises(scenario.ScenarioCodecError):
+                    scenario.parse_document(encoded)
+
+    def test_vector_blocking_safety_accepts_only_pre_io_failures_or_nonblocking_io(self):
+        for operation in (
+            "readv 0 0 1 1 0 1",
+            "writev 1 0 1 1 0 1 65",
+            "readv 0 0 1 1 1 1",
+        ):
+            encoded = f"version 3\nscenario blocking\npipe2 0 1 0\n{operation}\n"
+            with self.subTest(operation=operation):
+                with self.assertRaises(scenario.ScenarioCodecError) as caught:
+                    scenario.parse_document(encoded)
+                self.assertEqual(
+                    caught.exception.category,
+                    scenario.CodecErrorCategory.BLOCKING_IO,
+                )
+
+        safe = (
+            "version 3\n"
+            "scenario safe-vector-errors\n"
+            "pipe2 0 1 0\n"
+            "readv 0 0 0 0\n"
+            "writev 1 0 1 1 1 0 65\n"
+            "readv 15 0 1 1 0 8192\n"
+            "writev 0 0 1 1 0 8192 65\n"
+            "readv 0 1 1 0\n"
+            "writev 1 0 1025 0\n"
+            "set-status-flags 0 2048\n"
+            "readv 0 0 1 1 1 1\n"
+        )
+        scenario.parse_document(safe)
+
+    def test_host_vector_trace_captures_errno_segments_and_read_sentinels(self):
+        encoded = (
+            "version 3\n"
+            "scenario vector-trace\n"
+            "pipe2 0 1 2048\n"
+            "writev 1 0 2 2 0 2 65 0 1 66\n"
+            "readv 0 0 3 3 0 1 0 2 0 2\n"
+            "writev 1 0 1 1 0 1 67\n"
+            "readv 0 0 1 1 1 1\n"
+            "writev 15 1 1 0\n"
+            "readv 0 0 1025 0\n"
+        )
+
+        records = self._record_host_records(encoded)
+
+        self.assertEqual((records[1].kind, records[1].result), (19, 3))
+        self.assertEqual((records[2].kind, records[2].result), (18, 3))
+        self.assertEqual(records[2].data_len, 5)
+        self.assertEqual(bytes(records[2].data[:5]), b"AAB\xa5\xa5")
+        self.assertEqual(
+            (records[4].kind, records[4].result, records[4].error),
+            (18, -1, 14),
+        )
+        self.assertEqual(records[4].data_len, 0)
+        self.assertEqual(
+            (records[5].kind, records[5].result, records[5].error),
+            (19, -1, 9),
+        )
+        self.assertEqual(
+            (records[6].kind, records[6].result, records[6].error),
+            (18, -1, 22),
+        )
+
     def test_v2_rejects_blocking_io_but_keeps_safe_error_and_zero_length_paths(self):
         unsafe = (
             "version 2\nscenario blocking\npipe2 0 1 0\nread 0 1\n"
@@ -414,7 +515,7 @@ class PipeOracleRegressionTests(unittest.TestCase):
                 2,
             ),
             (
-                "version 3\nscenario x\npipe2 0 1\n",
+                "version 4\nscenario x\npipe2 0 1\n",
                 scenario.CodecErrorCategory.INVALID_VERSION,
                 1,
             ),
@@ -569,6 +670,42 @@ class PipeOracleRegressionTests(unittest.TestCase):
         )
         self.assertEqual(compared.returncode, 0, compared.stderr)
 
+    def test_v2_trace_remains_compatible_but_v3_requires_trace_v3(self):
+        corpora = {
+            2: "version 2\nscenario fd\npipe2 0 1 2048\nget-fd-flags 0\n",
+            3: "version 3\nscenario vector\npipe2 0 1 2048\nreadv 0 0 0 0\n",
+        }
+        for corpus_version, corpus_text in corpora.items():
+            with self.subTest(corpus_version=corpus_version), tempfile.TemporaryDirectory() as temporary_directory:
+                temporary = Path(temporary_directory)
+                ops = temporary / "pipe.ops"
+                trace = temporary / "linux.trace"
+                ops.write_text(corpus_text)
+                recorded = subprocess.run(
+                    [str(self.oracle), "--record", str(ops), str(trace)],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(recorded.returncode, 0, recorded.stderr)
+                encoded = trace.read_bytes()
+                trace.write_bytes(
+                    encoded[:8] + (2).to_bytes(4, "little") + encoded[12:]
+                )
+                compared = subprocess.run(
+                    [str(self.oracle), "--compare", str(ops), str(trace)],
+                    capture_output=True,
+                    text=True,
+                )
+
+                if corpus_version == 2:
+                    self.assertEqual(compared.returncode, 0, compared.stderr)
+                else:
+                    self.assertNotEqual(compared.returncode, 0)
+                    self.assertIn(
+                        "version-3 corpus requires a version-3 trace",
+                        compared.stderr,
+                    )
+
     def test_multi_entry_batch_is_one_canonical_corpus_accepted_by_the_oracle(self):
         documents = [
             generator.legacy_document_from_input(raw_input)
@@ -576,7 +713,7 @@ class PipeOracleRegressionTests(unittest.TestCase):
         ]
         corpus = scenario.serialize_document(scenario.combine_documents(documents))
 
-        self.assertEqual(corpus.count("version 2\n"), 1)
+        self.assertEqual(corpus.count("version 3\n"), 1)
         scenario_names = [
             line.split(maxsplit=1)[1]
             for line in corpus.splitlines()
@@ -641,7 +778,7 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
         compact = json.dumps(selected, separators=(",", ":"))
         self.assertEqual(
             hashlib.sha256(compact.encode()).hexdigest(),
-            "205e6e546ab50dd12ac8e4b757a033e41375c846e0285e55fbb27afa1ad0d328",
+            "c83784cc832311f19d9df4218de263521d12a2d639442c242e4e55760c012d09",
         )
 
     def test_every_structural_mutation_changes_digest_and_stays_within_limits(self):
@@ -765,8 +902,8 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
             store = corpus.CorpusStore(Path(temporary_directory))
             run_path = store.save_run("run-0001", metadata)
             saved = json.loads((run_path / "metadata.json").read_text())
-        self.assertEqual(saved["schema_version"], 4)
-        self.assertEqual(saved["target_set_id"], "pipe-fd-v2")
+        self.assertEqual(saved["schema_version"], 5)
+        self.assertEqual(saved["target_set_id"], "pipe-vector-v3")
         self.assertEqual(saved["generator_version"], generator.GENERATOR_VERSION)
         self.assertEqual(saved["result"], "passed")
 
@@ -894,6 +1031,43 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
             & malformed_categories
         )
 
+    def test_vector_parameter_mutation_changes_each_typed_dimension(self):
+        operation = scenario.Writev(
+            1,
+            scenario.IovMode.VALID,
+            2,
+            (
+                scenario.WritevSegment(scenario.IovBaseMode.VALID, 4096, 65),
+                scenario.WritevSegment(scenario.IovBaseMode.INVALID, 4096, 255),
+            ),
+        )
+
+        mutated_mode = mutation._mutate_operation_parameter(
+            generator.CampaignRng(1), operation, "iov-mode"
+        )
+        mutated_count = mutation._mutate_operation_parameter(
+            generator.CampaignRng(2), operation, "iov-count"
+        )
+        mutated_length = mutation._mutate_operation_parameter(
+            generator.CampaignRng(3), operation, "segment-length", 0
+        )
+        mutated_base = mutation._mutate_operation_parameter(
+            generator.CampaignRng(4), operation, "base-mode", 0
+        )
+        mutated_byte = mutation._mutate_operation_parameter(
+            generator.CampaignRng(5), operation, "byte", 0
+        )
+
+        self.assertNotEqual(mutated_mode.iov_mode, operation.iov_mode)
+        self.assertNotEqual(mutated_count.iovcnt, operation.iovcnt)
+        self.assertNotEqual(mutated_length.segments[0].length, 4096)
+        self.assertLessEqual(
+            sum(segment.length for segment in mutated_length.segments),
+            scenario.MAX_IO_BYTES,
+        )
+        self.assertNotEqual(mutated_base.segments[0].base_mode, operation.segments[0].base_mode)
+        self.assertNotEqual(mutated_byte.segments[0].byte, operation.segments[0].byte)
+
     def test_generator_reaches_all_operations_boundaries_and_resource_errors(self):
         report = analyze.analyze(seed=42, samples=512, mutations=512, top=0)
         campaign = report["sources"]["campaign_rng"]["generation"]
@@ -948,8 +1122,37 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
             },
             set(analyze.OPERATION_NAMES),
         )
+        vectors = [
+            operation
+            for operation in operations
+            if isinstance(operation, (scenario.Readv, scenario.Writev))
+        ]
+        self.assertEqual(
+            {type(operation) for operation in vectors},
+            {scenario.Readv, scenario.Writev},
+        )
+        self.assertEqual({int(operation.iov_mode) for operation in vectors}, {0, 1})
+        self.assertEqual(
+            {operation.iovcnt for operation in vectors},
+            set(scenario.IOVCNT_VALUES),
+        )
+        self.assertEqual(
+            {
+                int(segment.base_mode)
+                for operation in vectors
+                for segment in operation.segments
+            },
+            {0, 1},
+        )
+        self.assertTrue(
+            all(
+                sum(segment.length for segment in operation.segments)
+                <= scenario.MAX_IO_BYTES
+                for operation in vectors
+            )
+        )
 
-    def test_mutation_repair_upgrades_to_v2_and_synthesizes_only_nonblocking_setup(self):
+    def test_mutation_repair_upgrades_to_v3_and_synthesizes_only_nonblocking_setup(self):
         unsafe_document = scenario.ScenarioDocument(
             [
                 scenario.Scenario(
@@ -965,7 +1168,7 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
         encoded = scenario.serialize_document(repaired)
         operations = repaired.scenarios[0].operations
 
-        self.assertTrue(encoded.startswith("version 2\n"))
+        self.assertTrue(encoded.startswith("version 3\n"))
         self.assertEqual(
             operations,
             (
@@ -974,6 +1177,41 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
                 scenario.Read(0, 8),
             ),
         )
+
+    def test_mutation_repair_adds_only_nonblocking_setup_for_positive_vector_io(self):
+        unsafe_document = scenario.ScenarioDocument(
+            [
+                scenario.Scenario(
+                    [
+                        scenario.Pipe2(0, 1, 0),
+                        scenario.Writev(
+                            1,
+                            scenario.IovMode.VALID,
+                            1,
+                            (
+                                scenario.WritevSegment(
+                                    scenario.IovBaseMode.VALID,
+                                    8,
+                                    65,
+                                ),
+                            ),
+                        ),
+                    ]
+                )
+            ]
+        )
+
+        repaired = mutation.repair_dependencies(unsafe_document)
+
+        self.assertEqual(
+            repaired.scenarios[0].operations,
+            (
+                scenario.Pipe2(0, 1, 0),
+                scenario.SetStatusFlags(1, scenario.O_NONBLOCK),
+                unsafe_document.scenarios[0].operations[1],
+            ),
+        )
+        scenario.parse_document(scenario.serialize_document(repaired))
 
     def test_analysis_schema_two_is_deterministic_and_satisfies_constraints(self):
         first = analyze.analyze(seed=42, samples=128, mutations=256, top=3)
@@ -1344,6 +1582,14 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
                             "filename": "/checkout/os/StarryOS/kernel/src/syscall/fs/fd_ops.rs",
                             "segments": [[30, 6, 1, True, True, False]],
                         },
+                        {
+                            "filename": "/checkout/os/StarryOS/kernel/src/syscall/fs/io.rs",
+                            "segments": [[40, 8, 3, True, True, False]],
+                        },
+                        {
+                            "filename": "/checkout/os/StarryOS/kernel/src/mm/io.rs",
+                            "segments": [[50, 9, 5, True, True, False]],
+                        },
                     ]
                 }
             ]
@@ -1351,6 +1597,19 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
         region_ids = coverage.covered_pipe_region_ids(export)
         self.assertEqual(
             region_ids,
+            {
+                "os/StarryOS/kernel/src/file/pipe.rs:10:2",
+                "os/StarryOS/kernel/src/syscall/fs/pipe.rs:20:4",
+                "os/StarryOS/kernel/src/syscall/fs/fd_ops.rs:30:6",
+                "os/StarryOS/kernel/src/syscall/fs/io.rs:40:8",
+                "os/StarryOS/kernel/src/mm/io.rs:50:9",
+            },
+        )
+        self.assertEqual(
+            coverage.covered_pipe_region_ids(
+                export,
+                coverage.FD_TARGET_SET_ID,
+            ),
             {
                 "os/StarryOS/kernel/src/file/pipe.rs:10:2",
                 "os/StarryOS/kernel/src/syscall/fs/pipe.rs:20:4",
@@ -1456,7 +1715,7 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
             encoded = trace.read_bytes()
 
         header = TraceHeader.from_buffer_copy(encoded)
-        self.assertEqual(header.version, 2)
+        self.assertEqual(header.version, 3)
         offset = ctypes.sizeof(TraceHeader)
         record_size = ctypes.sizeof(OperationResult)
         self.assertEqual(len(encoded), offset + header.record_count * record_size)

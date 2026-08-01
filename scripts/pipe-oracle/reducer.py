@@ -13,6 +13,8 @@ from scenario import (
     GetFdFlags,
     GetSize,
     GetStatusFlags,
+    IovBaseMode,
+    IovMode,
     Operation,
     O_CLOEXEC,
     O_NONBLOCK,
@@ -20,6 +22,7 @@ from scenario import (
     Poll,
     Read,
     ReadNull,
+    Readv,
     Scenario,
     ScenarioCodecError,
     ScenarioDocument,
@@ -29,6 +32,7 @@ from scenario import (
     SetStatusFlags,
     Write,
     WriteNull,
+    Writev,
     serialize_document,
     validate_entry_limits,
 )
@@ -495,6 +499,8 @@ def _operation_parameter_replacements(
     if isinstance(operation, Write):
         for value in _smaller_simple_values(operation.byte, (0, 1, 65, 127, 255)):
             replacements.append(("byte", value, replace(operation, byte=value)))
+    if isinstance(operation, (Readv, Writev)):
+        replacements.extend(_vector_parameter_replacements(operation))
     if isinstance(operation, Poll):
         for value in _smaller_simple_values(operation.events, (0, 1, 2, 4, 8, 16, 32, 64)):
             replacements.append(("poll-mask", value, replace(operation, events=value)))
@@ -522,6 +528,75 @@ def _operation_parameter_replacements(
             (0, O_NONBLOCK, O_CLOEXEC, O_NONBLOCK | O_CLOEXEC),
         ):
             replacements.append(("dup3-flags", value, replace(operation, flags=value)))
+    return tuple(replacements)
+
+
+def _vector_parameter_replacements(operation):
+    replacements = []
+    if operation.iovcnt != 0:
+        replacements.append(
+            (
+                "iov-count",
+                0,
+                replace(operation, iovcnt=0, segments=()),
+            )
+        )
+    if operation.iov_mode == IovMode.INVALID and operation.iovcnt in (-1, 0, 1025):
+        replacements.append(
+            (
+                "iov-mode",
+                int(IovMode.VALID),
+                replace(operation, iov_mode=IovMode.VALID),
+            )
+        )
+    for segment_index, segment in enumerate(operation.segments):
+        if segment.base_mode == IovBaseMode.INVALID:
+            segments = list(operation.segments)
+            segments[segment_index] = replace(segment, base_mode=IovBaseMode.VALID)
+            replacements.append(
+                (
+                    f"base-mode-{segment_index}",
+                    int(IovBaseMode.VALID),
+                    replace(operation, segments=tuple(segments)),
+                )
+            )
+        for value in _smaller_simple_values(
+            segment.length,
+            (0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 4096),
+        ):
+            segments = list(operation.segments)
+            segments[segment_index] = replace(segment, length=value)
+            replacements.append(
+                (
+                    f"segment-length-{segment_index}",
+                    value,
+                    replace(operation, segments=tuple(segments)),
+                )
+            )
+        if isinstance(operation, Writev):
+            for value in _smaller_simple_values(segment.byte, (0, 1, 65, 127, 255)):
+                segments = list(operation.segments)
+                segments[segment_index] = replace(segment, byte=value)
+                replacements.append(
+                    (
+                        f"segment-byte-{segment_index}",
+                        value,
+                        replace(operation, segments=tuple(segments)),
+                    )
+                )
+    if operation.iov_mode == IovMode.VALID and operation.iovcnt > 1:
+        for count in range(operation.iovcnt - 1, 0, -1):
+            replacements.append(
+                (
+                    "iov-count",
+                    count,
+                    replace(
+                        operation,
+                        iovcnt=count,
+                        segments=operation.segments[:count],
+                    ),
+                )
+            )
     return tuple(replacements)
 
 
@@ -576,6 +651,8 @@ def _replace_operation_slots(
             ReadNull,
             Write,
             WriteNull,
+            Readv,
+            Writev,
             Close,
             Poll,
             SetSize,
@@ -609,6 +686,8 @@ def _operation_slots(operation: Operation) -> Tuple[int, ...]:
             ReadNull,
             Write,
             WriteNull,
+            Readv,
+            Writev,
             Close,
             Poll,
             SetSize,
@@ -629,6 +708,19 @@ def _operation_parameter_cost(operation: Operation) -> int:
         return operation.length
     if isinstance(operation, Write):
         return operation.length + operation.byte
+    if isinstance(operation, (Readv, Writev)):
+        segment_cost = sum(
+            int(segment.base_mode)
+            + segment.length
+            + (segment.byte if isinstance(operation, Writev) else 0)
+            for segment in operation.segments
+        )
+        return (
+            int(operation.iov_mode)
+            + abs(operation.iovcnt)
+            + len(operation.segments)
+            + segment_cost
+        )
     if isinstance(operation, Poll):
         return operation.events
     if isinstance(operation, SetSize):

@@ -208,6 +208,43 @@ class StructuredReducerRegressionTests(unittest.TestCase):
             )
         )
 
+    def test_v3_reducer_simplifies_vector_shape_base_length_and_byte(self):
+        document = scenario.parse_document(
+            "version 3\n"
+            "scenario vectors\n"
+            "pipe2 8 9 2048\n"
+            "writev 9 0 3 3 1 16 255 0 32 127 0 64 65\n"
+            "readv 8 0 2 2 0 8 0 16\n"
+        )
+        critical = self.reducer.OperationOrigin(0, 1)
+        reducer = self.reducer.StructuredReducer(
+            self.reducer.ReductionInput.initial(document),
+            critical_origin=critical,
+        )
+        candidates = self._collect(reducer)
+        transforms = {candidate.transform for candidate in candidates}
+        original_key = self.reducer.complexity_key(document)
+
+        self.assertTrue(any(name.startswith("shrink-iov-count") for name in transforms))
+        self.assertTrue(any(name.startswith("shrink-base-mode-0") for name in transforms))
+        self.assertTrue(any(name.startswith("shrink-segment-length-0") for name in transforms))
+        self.assertTrue(any(name.startswith("shrink-segment-byte-0") for name in transforms))
+        self.assertTrue(all(candidate.complexity < original_key for candidate in candidates))
+        self.assertEqual(len({candidate.digest for candidate in candidates}), len(candidates))
+        for candidate in candidates:
+            flattened = {
+                origin
+                for origins in candidate.reduction_input.origins
+                for origin in origins
+            }
+            self.assertIn(critical, flattened)
+            self.assertEqual(
+                scenario.parse_document(
+                    scenario.serialize_document(candidate.reduction_input.document)
+                ),
+                candidate.reduction_input.document,
+            )
+
     def test_snapshot_resumes_after_last_yielded_candidate(self):
         first = self.reducer.StructuredReducer(
             self.reducer.ReductionInput.initial(self.document)
@@ -680,6 +717,56 @@ class MinimizationPersistenceRegressionTests(unittest.TestCase):
                 "pipe-v1",
             )
 
+    def test_fd_schema_v2_job_loads_only_with_pipe_fd_target(self):
+        import generator
+        import minimization
+        import minimization_schema
+        import minimization_store
+        import reducer
+
+        document = scenario.parse_document(
+            "version 2\nscenario fd\npipe2 0 1 2048\nget-fd-flags 0\n"
+        )
+        item = minimization.MinimizationItem(
+            scenario.canonical_digest(document),
+            reducer.ReductionInput.initial(document),
+            frozenset({"fd-region"}),
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            executable = Path(sys.executable).resolve()
+            store = minimization_store.MinimizationStore(
+                workspace,
+                generator.GENERATOR_VERSION,
+            )
+            job = store.create_job(
+                "fd-minimization",
+                kind="coverage",
+                source={"kind": "attribution", "path": "/job", "id": "attr-2"},
+                items=(item,),
+                starry_elf=executable,
+                host_oracle=executable,
+                max_qemu=4,
+                expected_fingerprint=None,
+            )
+            metadata_path = job.path / "metadata.json"
+            metadata = __import__("json").loads(metadata_path.read_text())
+            metadata["schema_version"] = 2
+            metadata["generator_version"] = "3"
+            metadata["target_set_id"] = "pipe-fd-v2"
+            metadata_path.write_text(__import__("json").dumps(metadata))
+
+            loaded = store.load_job(job.job_id)
+            self.assertEqual(
+                minimization_schema.job_target_set_id(loaded.metadata),
+                "pipe-fd-v2",
+            )
+
+            metadata["target_set_id"] = "pipe-vector-v3"
+            metadata_path.write_text(__import__("json").dumps(metadata))
+            with self.assertRaisesRegex(Exception, "unsupported minimization target set"):
+                store.load_job(job.job_id)
+
     def test_changed_active_elf_moves_job_to_stale_failure(self):
         import minimization
         import minimization_store
@@ -958,7 +1045,7 @@ class MinimizationPersistenceRegressionTests(unittest.TestCase):
                 if mutation == "version":
                     metadata_path = job.path / "metadata.json"
                     metadata = __import__("json").loads(metadata_path.read_text())
-                    metadata["schema_version"] = 3
+                    metadata["schema_version"] = 4
                     metadata_path.write_text(__import__("json").dumps(metadata))
                 elif mutation == "elf-digest":
                     with (job.path / "starryos").open("ab") as output:

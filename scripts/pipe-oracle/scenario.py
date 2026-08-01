@@ -3,14 +3,16 @@
 import hashlib
 import re
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, IntEnum
 from typing import Dict, Iterable, Optional, Tuple, Union
 
 
 LEGACY_CORPUS_VERSION = 1
-CORPUS_VERSION = 2
+FD_CORPUS_VERSION = 2
+CORPUS_VERSION = 3
 MAX_LOGICAL_SLOTS = 16
 MAX_IO_BYTES = 8192
+MAX_IOV_SEGMENTS = 4
 MAX_POLL_MASK = 32767
 MAX_PIPE_SIZE = 2147483647
 MAX_FLAG_VALUE = 2147483647
@@ -39,6 +41,17 @@ DUP3_FLAG_VALUES = (
     O_CLOEXEC | O_NONBLOCK,
     UNKNOWN_FLAG,
 )
+IOVCNT_VALUES = (-1, 0, 1, 2, 3, 4, 1025)
+
+
+class IovMode(IntEnum):
+    VALID = 0
+    INVALID = 1
+
+
+class IovBaseMode(IntEnum):
+    VALID = 0
+    INVALID = 1
 
 
 @dataclass(frozen=True)
@@ -69,6 +82,59 @@ class Write:
 @dataclass(frozen=True)
 class WriteNull:
     slot: int
+
+
+@dataclass(frozen=True)
+class ReadvSegment:
+    base_mode: IovBaseMode
+    length: int
+
+
+@dataclass(frozen=True)
+class WritevSegment:
+    base_mode: IovBaseMode
+    length: int
+    byte: int
+
+
+@dataclass(frozen=True)
+class Readv:
+    slot: int
+    iov_mode: IovMode
+    iovcnt: int
+    segments: Tuple[ReadvSegment, ...]
+
+    def __init__(
+        self,
+        slot: int,
+        iov_mode: IovMode,
+        iovcnt: int,
+        segments: Iterable[ReadvSegment],
+    ):
+        object.__setattr__(self, "slot", slot)
+        object.__setattr__(self, "iov_mode", iov_mode)
+        object.__setattr__(self, "iovcnt", iovcnt)
+        object.__setattr__(self, "segments", tuple(segments))
+
+
+@dataclass(frozen=True)
+class Writev:
+    slot: int
+    iov_mode: IovMode
+    iovcnt: int
+    segments: Tuple[WritevSegment, ...]
+
+    def __init__(
+        self,
+        slot: int,
+        iov_mode: IovMode,
+        iovcnt: int,
+        segments: Iterable[WritevSegment],
+    ):
+        object.__setattr__(self, "slot", slot)
+        object.__setattr__(self, "iov_mode", iov_mode)
+        object.__setattr__(self, "iovcnt", iovcnt)
+        object.__setattr__(self, "segments", tuple(segments))
 
 
 @dataclass(frozen=True)
@@ -145,6 +211,8 @@ Operation = Union[
     ReadNull,
     Write,
     WriteNull,
+    Readv,
+    Writev,
     Dup,
     GetStatusFlags,
     SetStatusFlags,
@@ -258,7 +326,11 @@ def parse_document(encoded: Union[str, bytes]) -> ScenarioDocument:
             if len(fields) != 2:
                 _raise(line_number, CodecErrorCategory.INVALID_VERSION, line)
             version = _parse_integer(fields[1], line_number)
-            if version not in (LEGACY_CORPUS_VERSION, CORPUS_VERSION):
+            if version not in (
+                LEGACY_CORPUS_VERSION,
+                FD_CORPUS_VERSION,
+                CORPUS_VERSION,
+            ):
                 _raise(line_number, CodecErrorCategory.INVALID_VERSION, line)
             saw_version = True
             continue
@@ -378,6 +450,34 @@ def format_operation(operation: Operation, version: int = CORPUS_VERSION) -> str
         return f"write {operation.slot} {operation.length} {operation.byte}"
     if isinstance(operation, WriteNull):
         return f"write-null {operation.slot}"
+    if isinstance(operation, Readv):
+        fields = [
+            "readv",
+            str(operation.slot),
+            str(int(operation.iov_mode)),
+            str(operation.iovcnt),
+            str(len(operation.segments)),
+        ]
+        for segment in operation.segments:
+            fields.extend((str(int(segment.base_mode)), str(segment.length)))
+        return " ".join(fields)
+    if isinstance(operation, Writev):
+        fields = [
+            "writev",
+            str(operation.slot),
+            str(int(operation.iov_mode)),
+            str(operation.iovcnt),
+            str(len(operation.segments)),
+        ]
+        for segment in operation.segments:
+            fields.extend(
+                (
+                    str(int(segment.base_mode)),
+                    str(segment.length),
+                    str(segment.byte),
+                )
+            )
+        return " ".join(fields)
     if isinstance(operation, Dup):
         return f"dup {operation.source_slot} {operation.destination_slot}"
     if isinstance(operation, GetStatusFlags):
@@ -424,6 +524,10 @@ def _decode_text(encoded: Union[str, bytes]) -> str:
 
 def _parse_operation(fields, line_number: int, version: int) -> Operation:
     keyword = fields[0]
+    if keyword in ("readv", "writev"):
+        if version != CORPUS_VERSION:
+            _raise(line_number, CodecErrorCategory.UNKNOWN_OPERATION, keyword)
+        return _parse_vector_operation(fields, line_number, keyword == "writev")
     arities = {
         "pipe2": 3 if version == LEGACY_CORPUS_VERSION else 4,
         "read": 3,
@@ -437,7 +541,7 @@ def _parse_operation(fields, line_number: int, version: int) -> Operation:
         "get-size": 2,
         "fionread": 2,
     }
-    if version == CORPUS_VERSION:
+    if version >= FD_CORPUS_VERSION:
         arities.update(
             {
                 "get-status-flags": 2,
@@ -531,6 +635,64 @@ def _parse_operation(fields, line_number: int, version: int) -> Operation:
     return Fionread(_slot(values[0], line_number))
 
 
+def _parse_vector_operation(fields, line_number: int, write_side: bool) -> Operation:
+    if len(fields) < 5:
+        _raise(line_number, CodecErrorCategory.INVALID_ARITY, " ".join(fields))
+    header = [_parse_integer(field, line_number) for field in fields[1:5]]
+    slot = _slot(header[0], line_number)
+    iov_mode = _iov_mode(header[1], line_number)
+    iovcnt = _iovcnt(header[2], line_number)
+    segment_count = _range(
+        header[3],
+        0,
+        MAX_IOV_SEGMENTS,
+        line_number,
+        "iovec segment count",
+    )
+    segment_arity = 3 if write_side else 2
+    if len(fields) != 5 + segment_count * segment_arity:
+        _raise(line_number, CodecErrorCategory.INVALID_ARITY, " ".join(fields))
+
+    segments = []
+    total_length = 0
+    for segment_index in range(segment_count):
+        start = 5 + segment_index * segment_arity
+        base_mode = _iov_base_mode(
+            _parse_integer(fields[start], line_number),
+            line_number,
+        )
+        length = _range(
+            _parse_integer(fields[start + 1], line_number),
+            0,
+            MAX_IO_BYTES,
+            line_number,
+            "iovec segment length",
+        )
+        total_length += length
+        if total_length > MAX_IO_BYTES:
+            _raise(
+                line_number,
+                CodecErrorCategory.OUT_OF_RANGE,
+                f"iovec total length {total_length} exceeds {MAX_IO_BYTES}",
+            )
+        if write_side:
+            byte = _range(
+                _parse_integer(fields[start + 2], line_number),
+                0,
+                255,
+                line_number,
+                "writev segment byte",
+            )
+            segments.append(WritevSegment(base_mode, length, byte))
+        else:
+            segments.append(ReadvSegment(base_mode, length))
+
+    _validate_iov_shape(iov_mode, iovcnt, segment_count, line_number)
+    if write_side:
+        return Writev(slot, iov_mode, iovcnt, segments)
+    return Readv(slot, iov_mode, iovcnt, segments)
+
+
 def _parse_integer(text: str, line_number: int) -> int:
     if not _DECIMAL_OR_HEX.fullmatch(text):
         _raise(line_number, CodecErrorCategory.INVALID_NUMBER, text)
@@ -564,6 +726,53 @@ def _enum_flags(
             f"unsupported {name} {value}",
         )
     return value
+
+
+def _iov_mode(value: int, line_number: int) -> IovMode:
+    try:
+        return IovMode(value)
+    except ValueError:
+        _raise(
+            line_number,
+            CodecErrorCategory.OUT_OF_RANGE,
+            f"unsupported iovec pointer mode {value}",
+        )
+
+
+def _iov_base_mode(value: int, line_number: int) -> IovBaseMode:
+    try:
+        return IovBaseMode(value)
+    except ValueError:
+        _raise(
+            line_number,
+            CodecErrorCategory.OUT_OF_RANGE,
+            f"unsupported iovec base mode {value}",
+        )
+
+
+def _iovcnt(value: int, line_number: int) -> int:
+    if value not in IOVCNT_VALUES:
+        _raise(
+            line_number,
+            CodecErrorCategory.OUT_OF_RANGE,
+            f"unsupported iovcnt {value}",
+        )
+    return value
+
+
+def _validate_iov_shape(
+    iov_mode: IovMode,
+    iovcnt: int,
+    segment_count: int,
+    line_number: int,
+) -> None:
+    expected_segments = iovcnt if iov_mode == IovMode.VALID and 0 <= iovcnt <= 4 else 0
+    if segment_count != expected_segments:
+        _raise(
+            line_number,
+            CodecErrorCategory.RESOURCE_CONFLICT,
+            f"iovec mode/count requires {expected_segments} segments, got {segment_count}",
+        )
 
 
 def _range(value: int, minimum: int, maximum: int, line_number: int, name: str) -> int:
@@ -619,6 +828,8 @@ class _ResourceState:
                 self.slots[operation.slot] = None
         elif isinstance(operation, (Read, Write)):
             self._validate_nonblocking_io(operation, line_number)
+        elif isinstance(operation, (Readv, Writev)):
+            self._validate_nonblocking_vector_io(operation, line_number)
 
     def _apply_pipe2(self, operation: Pipe2, line_number: int) -> None:
         if operation.flags & ~PIPE2_ALLOWED_FLAGS:
@@ -707,6 +918,28 @@ class _ResourceState:
                 line_number,
                 CodecErrorCategory.BLOCKING_IO,
                 "positive-length I/O requires statically enabled O_NONBLOCK",
+            )
+
+    def _validate_nonblocking_vector_io(
+        self,
+        operation: Union[Readv, Writev],
+        line_number: int,
+    ) -> None:
+        if operation.iov_mode == IovMode.INVALID or operation.iovcnt not in range(1, 5):
+            return
+        if sum(segment.length for segment in operation.segments) == 0:
+            return
+        resource = self.slots[operation.slot]
+        if resource is None:
+            return
+        expected_endpoint = "writer" if isinstance(operation, Writev) else "reader"
+        if resource.endpoint != expected_endpoint:
+            return
+        if not self.nonblocking[resource.description_id]:
+            _raise(
+                line_number,
+                CodecErrorCategory.BLOCKING_IO,
+                "positive-length vector I/O requires statically enabled O_NONBLOCK",
             )
 
     def _new_resource(

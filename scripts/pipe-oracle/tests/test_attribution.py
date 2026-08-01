@@ -378,6 +378,54 @@ class ExactAttributionRegressionTests(unittest.TestCase):
             with self.assertRaisesRegex(Exception, "metadata keys mismatch"):
                 attribution.AttributionStore(workspace).load_job(job.job_id)
 
+    def test_fd_schema_v3_job_loads_only_with_pipe_fd_target(self):
+        import attribution_schema
+
+        document = scenario.parse_document(
+            "version 2\nscenario fd\npipe2 0 1 2048\nget-fd-flags 0\n"
+        )
+        entry = attribution.AttributionInput.from_document(
+            document,
+            corpus.CorpusProvenance.generated(),
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            store = attribution.AttributionStore(workspace)
+            with self._evidence(workspace, "fd-v3", {"fd-region"}, b"fd elf") as evidence:
+                job = store.create_job(
+                    "fd-attribution",
+                    fuzz_seed=2,
+                    batch_index=0,
+                    entries=(entry,),
+                    baseline_regions=set(),
+                    target_regions={"fd-region"},
+                    initial_evidence=evidence,
+                    duration_seconds=0.1,
+                )
+
+            metadata_path = job.path / "metadata.json"
+            metadata = json.loads(metadata_path.read_text())
+            metadata["schema_version"] = 3
+            metadata["generator_version"] = "3"
+            metadata["target_set_id"] = "pipe-fd-v2"
+            metadata_path.write_text(json.dumps(metadata))
+            result_path = job.path / "replays/attempt-0001-batch/coverage.json"
+            result = json.loads(result_path.read_text())
+            result["schema_version"] = 3
+            result["target_set_id"] = "pipe-fd-v2"
+            result_path.write_text(json.dumps(result))
+
+            loaded = attribution.AttributionStore(workspace).load_job(job.job_id)
+            self.assertEqual(
+                attribution_schema.job_target_set_id(loaded.metadata),
+                "pipe-fd-v2",
+            )
+
+            metadata["target_set_id"] = "pipe-vector-v3"
+            metadata_path.write_text(json.dumps(metadata))
+            with self.assertRaisesRegex(Exception, "unsupported attribution target set"):
+                attribution.AttributionStore(workspace).load_job(job.job_id)
+
     def test_job_preserves_host_oracle_executable_mode(self):
         document = scenario.parse_document(
             "version 1\nscenario only\npipe2 0 1\n"
