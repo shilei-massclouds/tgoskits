@@ -971,7 +971,7 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
             store = corpus.CorpusStore(Path(temporary_directory))
             run_path = store.save_run("run-0001", metadata)
             saved = json.loads((run_path / "metadata.json").read_text())
-        self.assertEqual(saved["schema_version"], 6)
+        self.assertEqual(saved["schema_version"], 7)
         self.assertEqual(saved["target_set_id"], "pipe-poll-v4")
         self.assertEqual(saved["generator_version"], generator.GENERATOR_VERSION)
         self.assertEqual(saved["result"], "passed")

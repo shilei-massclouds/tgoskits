@@ -18,6 +18,107 @@ import scenario  # noqa: E402
 
 
 class PersistentCorpusRegressionTests(unittest.TestCase):
+    def test_external_sources_merge_sorted_without_replacing_existing_origin(self):
+        revision = "e611ffe1caa28a0228c8f3642cc768f0dba3dd0c"
+        first = corpus.ExternalSource("a" * 64, revision, "syz-pipe-v1", "1" * 64)
+        second = corpus.ExternalSource("b" * 64, revision, "syz-pipe-v1", "2" * 64)
+        document = scenario.parse_document(
+            "version 1\nscenario imported\npipe2 0 1\n"
+        )
+
+        imported = corpus.CorpusProvenance.imported((second, first, first))
+        self.assertEqual(imported.external_sources, (first, second))
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = corpus.CorpusStore(Path(temporary_directory))
+            store.admit_attributed_entry(
+                document,
+                corpus.CorpusProvenance.generated(),
+                {"pipe.rs:1:1"},
+                "attribution-generated",
+            )
+
+            self.assertFalse(
+                store.admit_attributed_entry(
+                    document,
+                    imported,
+                    {"pipe.rs:2:1"},
+                    "attribution-imported",
+                )
+            )
+            self.assertFalse(
+                store.admit_attributed_entry(
+                    document,
+                    imported,
+                    {"pipe.rs:2:1"},
+                    "attribution-imported",
+                )
+            )
+            metadata = store.entry_metadata(scenario.canonical_digest(document))
+
+        self.assertEqual(metadata["schema_version"], 4)
+        self.assertEqual(metadata["origin"]["source"], "generated")
+        self.assertEqual(
+            metadata["origin"]["external_sources"],
+            [first.as_metadata(), second.as_metadata()],
+        )
+        self.assertEqual(
+            metadata["coverage"]["attribution_jobs"],
+            ["attribution-generated", "attribution-imported"],
+        )
+
+    def test_external_source_and_unknown_origin_fail_closed(self):
+        revision = "e611ffe1caa28a0228c8f3642cc768f0dba3dd0c"
+        with self.assertRaisesRegex(ValueError, "program digest"):
+            corpus.ExternalSource("bad", revision, "syz-pipe-v1", "1" * 64).as_metadata()
+        with self.assertRaisesRegex(ValueError, "requires external sources"):
+            corpus.CorpusProvenance("syzkaller-import").as_metadata()
+        with self.assertRaisesRegex(ValueError, "unknown corpus source"):
+            corpus.CorpusProvenance("future-source").as_metadata()
+
+    def test_attributed_v2_and_minimized_v3_entries_remain_loadable(self):
+        exact = scenario.parse_document(
+            "version 1\nscenario exact\npipe2 0 1\n"
+        )
+        minimized = scenario.parse_document(
+            "version 1\nscenario minimized\npipe2 2 3\n"
+        )
+        original_digest = scenario.canonical_digest(exact)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = corpus.CorpusStore(Path(temporary_directory))
+            store.admit_attributed_entry(
+                exact,
+                corpus.CorpusProvenance.generated(),
+                {"pipe.rs:1:1"},
+                "attribution-v2",
+            )
+            exact_dir = store.corpus_dir / original_digest
+            exact_metadata = self._metadata(exact_dir)
+            exact_metadata["schema_version"] = 2
+            del exact_metadata["origin"]["external_sources"]
+            del exact_metadata["lifecycle"]
+            del exact_metadata["minimization"]
+            (exact_dir / corpus.METADATA_NAME).write_text(json.dumps(exact_metadata))
+
+            store.admit_minimized_entry(
+                minimized,
+                corpus.CorpusProvenance.generated(),
+                {"pipe.rs:2:1"},
+                "minimize-v3",
+                {original_digest},
+            )
+            minimized_dir = store.corpus_dir / scenario.canonical_digest(minimized)
+            minimized_metadata = self._metadata(minimized_dir)
+            minimized_metadata["schema_version"] = 3
+            del minimized_metadata["origin"]["external_sources"]
+            (minimized_dir / corpus.METADATA_NAME).write_text(
+                json.dumps(minimized_metadata)
+            )
+
+            loaded = store.load_corpus()
+
+        self.assertEqual(len(loaded), 2)
+
     def test_campaign_restart_loads_saved_canonical_entry(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             workspace = Path(temporary_directory)
@@ -126,7 +227,7 @@ class PersistentCorpusRegressionTests(unittest.TestCase):
 
     def test_schema_and_generator_incompatibility_fail_closed(self):
         cases = (
-            ("schema_version", 4, "unsupported corpus schema"),
+            ("schema_version", 5, "unsupported corpus schema"),
             ("generator_version", "future", "incompatible generator version"),
         )
         for field, value, reason in cases:
@@ -144,7 +245,7 @@ class PersistentCorpusRegressionTests(unittest.TestCase):
                 self.assertEqual(caught.exception.path, entry_dir)
                 self.assertIn(reason, str(caught.exception))
 
-    def test_v1_entry_lazily_upgrades_to_exact_v2_when_it_contributes_again(self):
+    def test_v1_entry_lazily_upgrades_to_exact_v4_when_it_contributes_again(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             store, entry_dir = self._saved_entry(Path(temporary_directory))
             document = scenario.parse_document((entry_dir / corpus.OPS_NAME).read_bytes())
@@ -160,7 +261,12 @@ class PersistentCorpusRegressionTests(unittest.TestCase):
             )
 
             upgraded = self._metadata(entry_dir)
-            self.assertEqual(upgraded["schema_version"], 2)
+            self.assertEqual(upgraded["schema_version"], 4)
+            self.assertEqual(upgraded["origin"]["external_sources"], [])
+            self.assertEqual(
+                upgraded["lifecycle"],
+                {"status": "active", "superseded_by": None},
+            )
             self.assertEqual(upgraded["coverage"]["attribution"], "exact")
             self.assertEqual(
                 upgraded["coverage"]["attributed_regions"],
@@ -178,7 +284,7 @@ class PersistentCorpusRegressionTests(unittest.TestCase):
             )
             self.assertEqual(len(store.load_corpus()), 1)
 
-    def test_new_exact_entry_is_written_as_strict_v2(self):
+    def test_new_exact_entry_is_written_as_strict_v4(self):
         document = scenario.parse_document(
             "version 1\nscenario exact\npipe2 0 1\nwrite 1 1 97\n"
         )
@@ -196,7 +302,11 @@ class PersistentCorpusRegressionTests(unittest.TestCase):
 
             entry_dir = store.corpus_dir / scenario.canonical_digest(document)
             metadata = self._metadata(entry_dir)
-            self.assertEqual(metadata["schema_version"], 2)
+            self.assertEqual(metadata["schema_version"], 4)
+            self.assertEqual(
+                metadata["minimization"],
+                {"original_digests": [], "minimization_jobs": []},
+            )
             self.assertEqual(
                 set(metadata["coverage"]),
                 {
@@ -246,7 +356,7 @@ class PersistentCorpusRegressionTests(unittest.TestCase):
 
         self.assertEqual(len(loaded), 1)
         self.assertEqual(loaded.ordered_entries()[0].digest, minimized_digest)
-        self.assertEqual(original_metadata["schema_version"], 3)
+        self.assertEqual(original_metadata["schema_version"], 4)
         self.assertEqual(original_metadata["lifecycle"]["status"], "superseded")
         self.assertEqual(
             original_metadata["lifecycle"]["superseded_by"],
@@ -294,7 +404,7 @@ class PersistentCorpusRegressionTests(unittest.TestCase):
             )
             metadata = store.entry_metadata(child_digest)
 
-        self.assertEqual(metadata["schema_version"], 3)
+        self.assertEqual(metadata["schema_version"], 4)
         self.assertEqual(
             metadata["coverage"]["attributed_regions"],
             ["pipe.rs:new:2", "pipe.rs:old:1"],

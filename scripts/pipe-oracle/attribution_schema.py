@@ -20,7 +20,8 @@ from scenario import parse_document, serialize_document
 LEGACY_ATTRIBUTION_SCHEMA_VERSION = 2
 FD_ATTRIBUTION_SCHEMA_VERSION = 3
 VECTOR_ATTRIBUTION_SCHEMA_VERSION = 4
-ATTRIBUTION_SCHEMA_VERSION = 5
+POLL_ATTRIBUTION_SCHEMA_VERSION = 5
+ATTRIBUTION_SCHEMA_VERSION = 6
 ATTRIBUTION_JOBS_NAME = "attribution-jobs"
 FAILURES_NAME = "failures"
 METADATA_NAME = "metadata.json"
@@ -70,6 +71,7 @@ def validate_job_metadata(
     if schema_version in (
         FD_ATTRIBUTION_SCHEMA_VERSION,
         VECTOR_ATTRIBUTION_SCHEMA_VERSION,
+        POLL_ATTRIBUTION_SCHEMA_VERSION,
         ATTRIBUTION_SCHEMA_VERSION,
     ):
         expected.add("target_set_id")
@@ -78,6 +80,7 @@ def validate_job_metadata(
         LEGACY_ATTRIBUTION_SCHEMA_VERSION,
         FD_ATTRIBUTION_SCHEMA_VERSION,
         VECTOR_ATTRIBUTION_SCHEMA_VERSION,
+        POLL_ATTRIBUTION_SCHEMA_VERSION,
         ATTRIBUTION_SCHEMA_VERSION,
     ):
         raise CorpusValidationError(path, "unsupported attribution schema")
@@ -91,6 +94,7 @@ def validate_job_metadata(
     if schema_version in (
         FD_ATTRIBUTION_SCHEMA_VERSION,
         VECTOR_ATTRIBUTION_SCHEMA_VERSION,
+        POLL_ATTRIBUTION_SCHEMA_VERSION,
         ATTRIBUTION_SCHEMA_VERSION,
     ):
         expected_target_set_id = (
@@ -138,7 +142,7 @@ def validate_job_metadata(
         if not is_sorted_unique_strings(metadata[key]):
             raise CorpusValidationError(path, f"{key} must be sorted unique strings")
 
-    entry_digests = _validate_entries(metadata["entries"], path)
+    entry_digests = _validate_entries(metadata["entries"], path, schema_version)
     _validate_attribution_state(metadata, entry_digests, path)
     _validate_transitions(metadata["elf_transitions"], path)
     failure_reason = metadata["failure_reason"]
@@ -225,6 +229,7 @@ def validate_replay(job_path: Path, replay: Path) -> Dict[str, Any]:
     if evidence_version in (
         FD_ATTRIBUTION_SCHEMA_VERSION,
         VECTOR_ATTRIBUTION_SCHEMA_VERSION,
+        POLL_ATTRIBUTION_SCHEMA_VERSION,
         ATTRIBUTION_SCHEMA_VERSION,
     ):
         evidence_keys.add("target_set_id")
@@ -233,6 +238,7 @@ def validate_replay(job_path: Path, replay: Path) -> Dict[str, Any]:
         LEGACY_ATTRIBUTION_SCHEMA_VERSION,
         FD_ATTRIBUTION_SCHEMA_VERSION,
         VECTOR_ATTRIBUTION_SCHEMA_VERSION,
+        POLL_ATTRIBUTION_SCHEMA_VERSION,
         ATTRIBUTION_SCHEMA_VERSION,
     ):
         raise CorpusValidationError(replay, "unsupported replay evidence schema")
@@ -243,6 +249,7 @@ def validate_replay(job_path: Path, replay: Path) -> Dict[str, Any]:
         in (
             FD_ATTRIBUTION_SCHEMA_VERSION,
             VECTOR_ATTRIBUTION_SCHEMA_VERSION,
+            POLL_ATTRIBUTION_SCHEMA_VERSION,
             ATTRIBUTION_SCHEMA_VERSION,
         )
         and coverage["target_set_id"] != job_target_set_id(job_metadata)
@@ -326,7 +333,11 @@ def is_digest(value: Any) -> bool:
     return isinstance(value, str) and DIGEST_PATTERN.fullmatch(value) is not None
 
 
-def _validate_entries(entries: Any, path: Path) -> Tuple[str, ...]:
+def _validate_entries(
+    entries: Any,
+    path: Path,
+    schema_version: int,
+) -> Tuple[str, ...]:
     if not isinstance(entries, list) or not entries:
         raise CorpusValidationError(path, "attribution entries must be non-empty")
     entry_digests = []
@@ -334,7 +345,7 @@ def _validate_entries(entries: Any, path: Path) -> Tuple[str, ...]:
         require_exact_keys(entry, {"digest", "origin"}, path)
         if not is_digest(entry["digest"]):
             raise CorpusValidationError(path, "invalid attribution entry digest")
-        _validate_origin(entry["origin"], path)
+        _validate_origin(entry["origin"], path, schema_version)
         entry_digests.append(entry["digest"])
     if entry_digests != sorted(set(entry_digests)):
         raise CorpusValidationError(path, "attribution entries are not unique and sorted")
@@ -389,19 +400,13 @@ def _validate_attribution_state(
             raise CorpusValidationError(path, "nonproductive restart retained attribution")
 
 
-def _validate_origin(metadata: Any, path: Path) -> None:
-    require_exact_keys(
-        metadata,
-        {"source", "parent_digest", "donor_digest", "mutation_type"},
-        path,
-    )
+def _validate_origin(metadata: Any, path: Path, schema_version: int) -> None:
+    expected = {"source", "parent_digest", "donor_digest", "mutation_type"}
+    if schema_version == ATTRIBUTION_SCHEMA_VERSION:
+        expected.add("external_sources")
+    require_exact_keys(metadata, expected, path)
     try:
-        CorpusProvenance(
-            metadata["source"],
-            metadata["parent_digest"],
-            metadata["donor_digest"],
-            metadata["mutation_type"],
-        ).as_metadata()
+        CorpusProvenance.from_metadata(metadata)
     except ValueError as error:
         raise CorpusValidationError(path, str(error)) from error
 
@@ -478,6 +483,7 @@ __all__ = [
     "ATTRIBUTION_JOBS_NAME",
     "ATTRIBUTION_SCHEMA_VERSION",
     "FD_ATTRIBUTION_SCHEMA_VERSION",
+    "POLL_ATTRIBUTION_SCHEMA_VERSION",
     "VECTOR_ATTRIBUTION_SCHEMA_VERSION",
     "ELFS_NAME",
     "FAILURES_NAME",

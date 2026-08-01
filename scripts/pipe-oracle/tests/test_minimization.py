@@ -358,6 +358,64 @@ class FailureSchemaRegressionTests(unittest.TestCase):
             with self.assertRaisesRegex(Exception, "metadata keys mismatch"):
                 artifact.validate_failure(failure_dir)
 
+    def test_v3_retains_and_validates_imported_program_and_conversion_log(self):
+        import artifact
+        import corpus
+        import fingerprint
+        import hashlib
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            failure_dir = Path(temporary_directory)
+            (failure_dir / "pipe.ops").write_text(
+                "version 1\nscenario generated-0001\npipe2 0 1\n",
+                encoding="utf-8",
+            )
+            (failure_dir / "linux.trace").write_bytes(b"trace")
+            (failure_dir / "guest.log").write_text("semantic mismatch")
+            executable = Path(sys.executable).resolve()
+            (failure_dir / "pipe-linux-oracle").write_bytes(executable.read_bytes())
+            (failure_dir / "starryos").write_bytes(executable.read_bytes())
+            syz_program = b"pipe(&(0x7f0000000000)={<r0=>0, <r1=>0})\n"
+            conversion_log = b'{"schema_version":1}\n'
+            (failure_dir / "source.syz").write_bytes(syz_program)
+            (failure_dir / "conversion-log.json").write_bytes(conversion_log)
+            source = corpus.ExternalSource(
+                hashlib.sha256(syz_program).hexdigest(),
+                "e611ffe1caa28a0228c8f3642cc768f0dba3dd0c",
+                "syz-pipe-v1",
+                hashlib.sha256(conversion_log).hexdigest(),
+            )
+            mismatch = fingerprint.MismatchFingerprint(
+                fingerprint.OperationOrigin(0, 0),
+                "pipe2",
+                ("result",),
+                "error",
+                "zero",
+                1,
+                None,
+            )
+            metadata = artifact.build_failure_metadata_v3(
+                failure_dir,
+                generator_version="scenario-v1",
+                fuzz_seed=None,
+                batch_index=0,
+                command="import_syz.py --admit",
+                result_category=runner.GuestResultCategory.SEMANTIC_MISMATCH,
+                mismatch_fingerprint=mismatch,
+                external_source=source,
+            )
+            (failure_dir / "metadata.json").write_text(
+                __import__("json").dumps(metadata),
+                encoding="utf-8",
+            )
+
+            loaded = artifact.validate_failure(failure_dir)
+            self.assertEqual(loaded["schema_version"], 3)
+            self.assertEqual(loaded["external_source"], source.as_metadata())
+            (failure_dir / "source.syz").write_bytes(syz_program + b"# corrupt\n")
+            with self.assertRaisesRegex(Exception, "artifact file size mismatch"):
+                artifact.validate_failure(failure_dir)
+
     def test_v1_lazy_import_replays_only_a_strict_semantic_mismatch(self):
         import common
         import corpus
@@ -737,6 +795,8 @@ class MinimizationPersistenceRegressionTests(unittest.TestCase):
             metadata["schema_version"] = 1
             metadata["generator_version"] = "2"
             del metadata["target_set_id"]
+            for saved_item in metadata["items"]:
+                del saved_item["origin"]["external_sources"]
             metadata_path.write_text(__import__("json").dumps(metadata))
 
             loaded = store.load_job(job.job_id)
@@ -782,6 +842,8 @@ class MinimizationPersistenceRegressionTests(unittest.TestCase):
             metadata["schema_version"] = 2
             metadata["generator_version"] = "3"
             metadata["target_set_id"] = "pipe-fd-v2"
+            for saved_item in metadata["items"]:
+                del saved_item["origin"]["external_sources"]
             metadata_path.write_text(__import__("json").dumps(metadata))
 
             loaded = store.load_job(job.job_id)
@@ -832,6 +894,8 @@ class MinimizationPersistenceRegressionTests(unittest.TestCase):
             metadata["schema_version"] = 3
             metadata["generator_version"] = "4"
             metadata["target_set_id"] = "pipe-vector-v3"
+            for saved_item in metadata["items"]:
+                del saved_item["origin"]["external_sources"]
             metadata_path.write_text(__import__("json").dumps(metadata))
 
             loaded = store.load_job(job.job_id)
@@ -844,6 +908,92 @@ class MinimizationPersistenceRegressionTests(unittest.TestCase):
             metadata_path.write_text(__import__("json").dumps(metadata))
             with self.assertRaisesRegex(Exception, "unsupported minimization target set"):
                 store.load_job(job.job_id)
+
+    def test_poll_schema_v4_job_remains_loadable_after_v5_upgrade(self):
+        import generator
+        import minimization
+        import minimization_store
+        import reducer
+
+        document = scenario.parse_document(
+            "version 1\nscenario poll-era\npipe2 0 1\n"
+        )
+        item = minimization.MinimizationItem(
+            scenario.canonical_digest(document),
+            reducer.ReductionInput.initial(document),
+            frozenset({"poll-region"}),
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            executable = Path(sys.executable).resolve()
+            store = minimization_store.MinimizationStore(
+                workspace,
+                generator.GENERATOR_VERSION,
+            )
+            job = store.create_job(
+                "poll-minimization",
+                kind="coverage",
+                source={"kind": "attribution", "path": "/job", "id": "attr-4"},
+                items=(item,),
+                starry_elf=executable,
+                host_oracle=executable,
+                max_qemu=4,
+                expected_fingerprint=None,
+            )
+            metadata_path = job.path / "metadata.json"
+            metadata = __import__("json").loads(metadata_path.read_text())
+            self.assertEqual(metadata["schema_version"], 5)
+            metadata["schema_version"] = 4
+            for saved_item in metadata["items"]:
+                del saved_item["origin"]["external_sources"]
+            metadata_path.write_text(__import__("json").dumps(metadata))
+
+            loaded = store.load_job(job.job_id)
+            self.assertEqual(loaded.metadata["target_set_id"], "pipe-poll-v4")
+
+    def test_v5_round_trips_imported_external_sources(self):
+        import corpus
+        import generator
+        import minimization
+        import minimization_store
+        import reducer
+
+        source = corpus.ExternalSource(
+            "a" * 64,
+            "e611ffe1caa28a0228c8f3642cc768f0dba3dd0c",
+            "syz-pipe-v1",
+            "b" * 64,
+        )
+        document = scenario.parse_document(
+            "version 1\nscenario imported\npipe2 0 1\n"
+        )
+        item = minimization.MinimizationItem(
+            scenario.canonical_digest(document),
+            reducer.ReductionInput.initial(document),
+            frozenset({"imported-region"}),
+            provenance=corpus.CorpusProvenance.imported((source,)),
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            executable = Path(sys.executable).resolve()
+            store = minimization_store.MinimizationStore(
+                workspace,
+                generator.GENERATOR_VERSION,
+            )
+            job = store.create_job(
+                "imported-minimization",
+                kind="coverage",
+                source={"kind": "attribution", "path": "/job", "id": "attr-imported"},
+                items=(item,),
+                starry_elf=executable,
+                host_oracle=executable,
+                max_qemu=4,
+                expected_fingerprint=None,
+            )
+
+            loaded = store.load_job(job.job_id)
+            self.assertEqual(loaded.metadata["schema_version"], 5)
+            self.assertEqual(store.load_items(loaded)[0].provenance, item.provenance)
 
     def test_changed_active_elf_moves_job_to_stale_failure(self):
         import minimization
@@ -1123,7 +1273,7 @@ class MinimizationPersistenceRegressionTests(unittest.TestCase):
                 if mutation == "version":
                     metadata_path = job.path / "metadata.json"
                     metadata = __import__("json").loads(metadata_path.read_text())
-                    metadata["schema_version"] = 5
+                    metadata["schema_version"] = 6
                     metadata_path.write_text(__import__("json").dumps(metadata))
                 elif mutation == "elf-digest":
                     with (job.path / "starryos").open("ab") as output:

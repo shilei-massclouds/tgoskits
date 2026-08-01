@@ -349,6 +349,8 @@ class ExactAttributionRegressionTests(unittest.TestCase):
             metadata["schema_version"] = 2
             metadata["generator_version"] = "2"
             del metadata["target_set_id"]
+            for saved_entry in metadata["entries"]:
+                del saved_entry["origin"]["external_sources"]
             metadata_path.write_text(json.dumps(metadata))
             result_path = (
                 job.path / "replays/attempt-0001-batch/coverage.json"
@@ -408,6 +410,8 @@ class ExactAttributionRegressionTests(unittest.TestCase):
             metadata["schema_version"] = 3
             metadata["generator_version"] = "3"
             metadata["target_set_id"] = "pipe-fd-v2"
+            for saved_entry in metadata["entries"]:
+                del saved_entry["origin"]["external_sources"]
             metadata_path.write_text(json.dumps(metadata))
             result_path = job.path / "replays/attempt-0001-batch/coverage.json"
             result = json.loads(result_path.read_text())
@@ -461,6 +465,8 @@ class ExactAttributionRegressionTests(unittest.TestCase):
             metadata["schema_version"] = 4
             metadata["generator_version"] = "4"
             metadata["target_set_id"] = "pipe-vector-v3"
+            for saved_entry in metadata["entries"]:
+                del saved_entry["origin"]["external_sources"]
             metadata_path.write_text(json.dumps(metadata))
             result_path = job.path / "replays/attempt-0001-batch/coverage.json"
             result = json.loads(result_path.read_text())
@@ -478,6 +484,87 @@ class ExactAttributionRegressionTests(unittest.TestCase):
             metadata_path.write_text(json.dumps(metadata))
             with self.assertRaisesRegex(Exception, "unsupported attribution target set"):
                 attribution.AttributionStore(workspace).load_job(job.job_id)
+
+    def test_poll_schema_v5_job_remains_loadable_after_v6_upgrade(self):
+        document = scenario.parse_document(
+            "version 1\nscenario poll-era\npipe2 0 1\n"
+        )
+        entry = attribution.AttributionInput.from_document(
+            document,
+            corpus.CorpusProvenance.generated(),
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            store = attribution.AttributionStore(workspace)
+            with self._evidence(
+                workspace,
+                "poll-v5",
+                {"poll-region"},
+                b"poll elf",
+            ) as evidence:
+                job = store.create_job(
+                    "poll-attribution",
+                    fuzz_seed=4,
+                    batch_index=0,
+                    entries=(entry,),
+                    baseline_regions=set(),
+                    target_regions={"poll-region"},
+                    initial_evidence=evidence,
+                    duration_seconds=0.1,
+                )
+
+            metadata_path = job.path / "metadata.json"
+            metadata = json.loads(metadata_path.read_text())
+            self.assertEqual(metadata["schema_version"], 6)
+            metadata["schema_version"] = 5
+            for saved_entry in metadata["entries"]:
+                del saved_entry["origin"]["external_sources"]
+            metadata_path.write_text(json.dumps(metadata))
+            result_path = job.path / "replays/attempt-0001-batch/coverage.json"
+            result = json.loads(result_path.read_text())
+            result["schema_version"] = 5
+            result_path.write_text(json.dumps(result))
+
+            loaded = attribution.AttributionStore(workspace).load_job(job.job_id)
+            self.assertEqual(loaded.metadata["target_set_id"], "pipe-poll-v4")
+
+    def test_v6_round_trips_imported_external_sources(self):
+        source = corpus.ExternalSource(
+            "a" * 64,
+            "e611ffe1caa28a0228c8f3642cc768f0dba3dd0c",
+            "syz-pipe-v1",
+            "b" * 64,
+        )
+        document = scenario.parse_document(
+            "version 1\nscenario imported\npipe2 0 1\n"
+        )
+        entry = attribution.AttributionInput.from_document(
+            document,
+            corpus.CorpusProvenance.imported((source,)),
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            store = attribution.AttributionStore(workspace)
+            with self._evidence(
+                workspace,
+                "imported-v6",
+                {"imported-region"},
+                b"imported elf",
+            ) as evidence:
+                job = store.create_job(
+                    "imported-attribution",
+                    fuzz_seed=5,
+                    batch_index=0,
+                    entries=(entry,),
+                    baseline_regions=set(),
+                    target_regions={"imported-region"},
+                    initial_evidence=evidence,
+                    duration_seconds=0.1,
+                )
+
+            loaded = store.load_job(job.job_id)
+            self.assertEqual(loaded.metadata["schema_version"], 6)
+            self.assertEqual(store.input_entries(loaded)[0].provenance, entry.provenance)
 
     def test_job_preserves_host_oracle_executable_mode(self):
         document = scenario.parse_document(

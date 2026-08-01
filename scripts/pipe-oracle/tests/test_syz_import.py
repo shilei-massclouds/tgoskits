@@ -48,7 +48,12 @@ from syz_converter import (
     SyzRejectionCategory,
     convert_syz_program,
 )
-from syz_import import MAX_SYZ_FILE_BYTES, build_check_report, write_json_report
+from syz_import import (
+    MAX_SYZ_FILE_BYTES,
+    build_check_report,
+    conversion_log_bytes,
+    write_json_report,
+)
 from syz_parser import SyzSyntaxCategory, SyzSyntaxError, parse_syz_program
 
 
@@ -305,6 +310,30 @@ class SyzCheckCliTests(unittest.TestCase):
 
         self.assertEqual(first, second)
         self.assertEqual(json.loads(first), report)
+
+    def test_conversion_log_digest_is_path_independent(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            first = root / "first.syz"
+            second = root / "second.syz"
+            encoded = (FIXTURES / "accepted/anchored_and_auto.syz").read_bytes()
+            first.write_bytes(encoded)
+            second.write_bytes(encoded)
+            report, failed = build_check_report(
+                (second, first),
+                SUPPORTED_SYZKALLER_REVISION,
+            )
+
+        self.assertFalse(failed)
+        first_report, second_report = report["inputs"]
+        self.assertEqual(
+            first_report["conversion_log_sha256"],
+            second_report["conversion_log_sha256"],
+        )
+        self.assertEqual(
+            conversion_log_bytes(first_report, SUPPORTED_SYZKALLER_REVISION),
+            conversion_log_bytes(second_report, SUPPORTED_SYZKALLER_REVISION),
+        )
 
     def test_cli_rejections_return_zero_and_print_json(self):
         result = subprocess.run(

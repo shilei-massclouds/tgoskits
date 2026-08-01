@@ -24,7 +24,8 @@ from scenario import ScenarioDocument, parse_document, serialize_document
 LEGACY_MINIMIZATION_SCHEMA_VERSION = 1
 FD_MINIMIZATION_SCHEMA_VERSION = 2
 VECTOR_MINIMIZATION_SCHEMA_VERSION = 3
-MINIMIZATION_SCHEMA_VERSION = 4
+POLL_MINIMIZATION_SCHEMA_VERSION = 4
+MINIMIZATION_SCHEMA_VERSION = 5
 MINIMIZATION_JOBS_NAME = "minimization-jobs"
 JOB_STATES = {
     "validating",
@@ -82,6 +83,7 @@ def validate_job_metadata(
     if schema_version in (
         FD_MINIMIZATION_SCHEMA_VERSION,
         VECTOR_MINIMIZATION_SCHEMA_VERSION,
+        POLL_MINIMIZATION_SCHEMA_VERSION,
         MINIMIZATION_SCHEMA_VERSION,
     ):
         expected_keys.add("target_set_id")
@@ -90,6 +92,7 @@ def validate_job_metadata(
         LEGACY_MINIMIZATION_SCHEMA_VERSION,
         FD_MINIMIZATION_SCHEMA_VERSION,
         VECTOR_MINIMIZATION_SCHEMA_VERSION,
+        POLL_MINIMIZATION_SCHEMA_VERSION,
         MINIMIZATION_SCHEMA_VERSION,
     ):
         raise CorpusValidationError(path, "unsupported minimization schema")
@@ -103,6 +106,7 @@ def validate_job_metadata(
     if schema_version in (
         FD_MINIMIZATION_SCHEMA_VERSION,
         VECTOR_MINIMIZATION_SCHEMA_VERSION,
+        POLL_MINIMIZATION_SCHEMA_VERSION,
         MINIMIZATION_SCHEMA_VERSION,
     ):
         expected_target_set_id = (
@@ -169,7 +173,7 @@ def validate_job_metadata(
             raise CorpusValidationError(path, str(error)) from error
     elif fingerprint is not None:
         raise CorpusValidationError(path, "coverage job has a mismatch fingerprint")
-    items = _validate_items(metadata["items"], kind, path)
+    items = _validate_items(metadata["items"], kind, path, schema_version)
     if metadata["schedule_cursor"] >= len(items):
         raise CorpusValidationError(path, "schedule cursor is outside minimization items")
     _validate_attempts(metadata["attempts"], len(items), path)
@@ -307,7 +311,12 @@ def _validate_source(source: Any, path: Path) -> None:
         raise CorpusValidationError(path, "invalid minimization source id")
 
 
-def _validate_items(items: Any, kind: str, path: Path) -> tuple:
+def _validate_items(
+    items: Any,
+    kind: str,
+    path: Path,
+    schema_version: int,
+) -> tuple:
     if not isinstance(items, list) or not items:
         raise CorpusValidationError(path, "minimization items must be non-empty")
     if kind == "mismatch" and len(items) != 1:
@@ -350,18 +359,12 @@ def _validate_items(items: Any, kind: str, path: Path) -> tuple:
         ):
             raise CorpusValidationError(path, "invalid critical operation origin")
         origin = item["origin"]
-        require_exact_keys(
-            origin,
-            {"source", "parent_digest", "donor_digest", "mutation_type"},
-            path,
-        )
+        origin_keys = {"source", "parent_digest", "donor_digest", "mutation_type"}
+        if schema_version == MINIMIZATION_SCHEMA_VERSION:
+            origin_keys.add("external_sources")
+        require_exact_keys(origin, origin_keys, path)
         try:
-            CorpusProvenance(
-                origin["source"],
-                origin["parent_digest"],
-                origin["donor_digest"],
-                origin["mutation_type"],
-            ).as_metadata()
+            CorpusProvenance.from_metadata(origin)
         except ValueError as error:
             raise CorpusValidationError(path, str(error)) from error
         try:
@@ -511,6 +514,7 @@ def _validate_evidence(path: Path, job_metadata: Dict[str, Any]) -> None:
     if evidence_version in (
         FD_MINIMIZATION_SCHEMA_VERSION,
         VECTOR_MINIMIZATION_SCHEMA_VERSION,
+        POLL_MINIMIZATION_SCHEMA_VERSION,
         MINIMIZATION_SCHEMA_VERSION,
     ):
         expected_keys.add("target_set_id")
@@ -519,6 +523,7 @@ def _validate_evidence(path: Path, job_metadata: Dict[str, Any]) -> None:
         LEGACY_MINIMIZATION_SCHEMA_VERSION,
         FD_MINIMIZATION_SCHEMA_VERSION,
         VECTOR_MINIMIZATION_SCHEMA_VERSION,
+        POLL_MINIMIZATION_SCHEMA_VERSION,
         MINIMIZATION_SCHEMA_VERSION,
     ):
         raise CorpusValidationError(path, "unsupported minimization evidence schema")
@@ -529,6 +534,7 @@ def _validate_evidence(path: Path, job_metadata: Dict[str, Any]) -> None:
         in (
             FD_MINIMIZATION_SCHEMA_VERSION,
             VECTOR_MINIMIZATION_SCHEMA_VERSION,
+            POLL_MINIMIZATION_SCHEMA_VERSION,
             MINIMIZATION_SCHEMA_VERSION,
         )
         and result["target_set_id"] != job_target_set_id(job_metadata)
@@ -694,6 +700,7 @@ __all__ = [
     "METADATA_NAME",
     "MINIMIZATION_JOBS_NAME",
     "MINIMIZATION_SCHEMA_VERSION",
+    "POLL_MINIMIZATION_SCHEMA_VERSION",
     "VECTOR_MINIMIZATION_SCHEMA_VERSION",
     "STARRY_ELF_NAME",
     "TEMP_PATTERN",

@@ -112,32 +112,33 @@ def classify_input(
         "canonical_digest": None,
         "canonical_pipe_ops": None,
         "conversion_log": [],
+        "conversion_log_sha256": None,
         "rejection_category": None,
         "rejection_detail": None,
     }
     if discovered.discovery_rejection is not None:
         base["rejection_category"] = discovered.discovery_rejection
         base["rejection_detail"] = "input is not an ordinary .syz file"
-        return base, False
+        return _finalize_classification(base, syzkaller_revision), False
 
     try:
         file_stat = path.lstat()
         if stat.S_ISLNK(file_stat.st_mode) or not stat.S_ISREG(file_stat.st_mode):
             base["rejection_category"] = "symlink"
             base["rejection_detail"] = "input changed into a non-regular file"
-            return base, False
+            return _finalize_classification(base, syzkaller_revision), False
         base["program_size"] = file_stat.st_size
         if file_stat.st_size > MAX_SYZ_FILE_BYTES:
             base["rejection_category"] = "file-too-large"
             base["rejection_detail"] = (
                 f"{file_stat.st_size} exceeds {MAX_SYZ_FILE_BYTES} bytes"
             )
-            return base, False
+            return _finalize_classification(base, syzkaller_revision), False
         encoded = path.read_bytes()
     except OSError as error:
         base["rejection_category"] = "input-read-failure"
         base["rejection_detail"] = str(error)
-        return base, True
+        return _finalize_classification(base, syzkaller_revision), True
 
     base["program_size"] = len(encoded)
     base["program_sha256"] = hashlib.sha256(encoded).hexdigest()
@@ -147,11 +148,11 @@ def classify_input(
     except SyzSyntaxError as error:
         base["rejection_category"] = f"syntax-{error.category.value}"
         base["rejection_detail"] = str(error)
-        return base, False
+        return _finalize_classification(base, syzkaller_revision), False
     except SyzConversionError as error:
         base["rejection_category"] = error.category.value
         base["rejection_detail"] = str(error)
-        return base, False
+        return _finalize_classification(base, syzkaller_revision), False
 
     base.update(
         {
@@ -161,7 +162,36 @@ def classify_input(
             "conversion_log": list(conversion.operation_log),
         }
     )
-    return base, False
+    return _finalize_classification(base, syzkaller_revision), False
+
+
+def conversion_log_bytes(
+    report: Dict[str, object],
+    syzkaller_revision: str,
+) -> bytes:
+    """Encode the path-independent conversion evidence for one input."""
+    document = {
+        "schema_version": 1,
+        "syzkaller_revision": syzkaller_revision,
+        "importer_version": IMPORTER_VERSION,
+        "program_sha256": report["program_sha256"],
+        "program_size": report["program_size"],
+        "status": report["status"],
+        "canonical_digest": report["canonical_digest"],
+        "conversion_log": report["conversion_log"],
+        "rejection_category": report["rejection_category"],
+        "rejection_detail": report["rejection_detail"],
+    }
+    return (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _finalize_classification(
+    report: Dict[str, object],
+    syzkaller_revision: str,
+) -> Dict[str, object]:
+    encoded_log = conversion_log_bytes(report, syzkaller_revision)
+    report["conversion_log_sha256"] = hashlib.sha256(encoded_log).hexdigest()
+    return report
 
 
 def write_json_report(path: Path, report: Dict[str, object]) -> None:
@@ -220,6 +250,7 @@ __all__ = [
     "MAX_SYZ_FILE_BYTES",
     "build_check_report",
     "classify_input",
+    "conversion_log_bytes",
     "discover_inputs",
     "write_json_report",
 ]

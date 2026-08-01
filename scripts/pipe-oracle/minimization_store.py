@@ -27,6 +27,7 @@ from minimization_schema import (
     INPUTS_NAME,
     JOB_ID_PATTERN,
     FD_MINIMIZATION_SCHEMA_VERSION,
+    POLL_MINIMIZATION_SCHEMA_VERSION,
     VECTOR_MINIMIZATION_SCHEMA_VERSION,
     job_target_set_id,
     METADATA_NAME,
@@ -233,12 +234,7 @@ class MinimizationStore:
                     reduction_input,
                     frozenset(item["responsibility_regions"]),
                     OperationOrigin(*critical) if critical is not None else None,
-                    CorpusProvenance(
-                        item["origin"]["source"],
-                        item["origin"]["parent_digest"],
-                        item["origin"]["donor_digest"],
-                        item["origin"]["mutation_type"],
-                    ),
+                    CorpusProvenance.from_metadata(item["origin"]),
                 )
             )
         return tuple(items)
@@ -458,6 +454,7 @@ class MinimizationStore:
             if job.metadata["schema_version"] in (
                 FD_MINIMIZATION_SCHEMA_VERSION,
                 VECTOR_MINIMIZATION_SCHEMA_VERSION,
+                POLL_MINIMIZATION_SCHEMA_VERSION,
                 MINIMIZATION_SCHEMA_VERSION,
             ):
                 result["target_set_id"] = job_target_set_id(job.metadata)

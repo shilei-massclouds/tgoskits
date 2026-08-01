@@ -13,12 +13,14 @@ from common import (
     METADATA_NAME,
 )
 from corpus_errors import CorpusValidationError
+from corpus import ExternalSource
 from fingerprint import MismatchFingerprint
 from guest_result import GuestResultCategory
 from scenario import parse_document, serialize_document
 
 
-FAILURE_SCHEMA_VERSION = 2
+STRUCTURED_FAILURE_SCHEMA_VERSION = 2
+FAILURE_SCHEMA_VERSION = 3
 _FAILURE_V2_KEYS = {
     "schema_version",
     "generator_version",
@@ -44,6 +46,11 @@ _FAILURE_V2_KEYS = {
     "input",
     "inputs",
     "profraws",
+}
+_FAILURE_V3_KEYS = _FAILURE_V2_KEYS | {
+    "external_source",
+    "syz_program_size",
+    "conversion_log_size",
 }
 
 
@@ -118,7 +125,7 @@ def build_failure_metadata_v2(
         raise ValueError("failure artifact cannot contain both input.bin and inputs")
     profraws = _directory_file_metadata(failure_dir / "profraws")
     return {
-        "schema_version": FAILURE_SCHEMA_VERSION,
+        "schema_version": STRUCTURED_FAILURE_SCHEMA_VERSION,
         "generator_version": generator_version,
         "fuzz_seed": fuzz_seed,
         "batch_index": batch_index,
@@ -143,6 +150,50 @@ def build_failure_metadata_v2(
         "inputs": inputs,
         "profraws": profraws,
     }
+
+
+def build_failure_metadata_v3(
+    failure_dir: Path,
+    *,
+    generator_version: str,
+    fuzz_seed: Optional[int],
+    batch_index: int,
+    command: str,
+    result_category: GuestResultCategory,
+    mismatch_fingerprint: Optional[MismatchFingerprint],
+    external_source: ExternalSource,
+    failure_category: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build imported-failure metadata with the original program evidence."""
+    metadata = build_failure_metadata_v2(
+        failure_dir,
+        generator_version=generator_version,
+        fuzz_seed=fuzz_seed,
+        batch_index=batch_index,
+        command=command,
+        result_category=result_category,
+        mismatch_fingerprint=mismatch_fingerprint,
+        failure_category=failure_category,
+    )
+    syz_program = failure_dir / "source.syz"
+    conversion_log = failure_dir / "conversion-log.json"
+    for path in (syz_program, conversion_log):
+        if path.is_symlink() or not path.is_file():
+            raise FileNotFoundError(f"imported failure evidence is missing: {path}")
+    source_metadata = external_source.as_metadata()
+    if sha256_file(syz_program) != external_source.program_sha256:
+        raise ValueError("imported failure program digest mismatch")
+    if sha256_file(conversion_log) != external_source.conversion_log_sha256:
+        raise ValueError("imported failure conversion log digest mismatch")
+    metadata.update(
+        {
+            "schema_version": FAILURE_SCHEMA_VERSION,
+            "external_source": source_metadata,
+            "syz_program_size": syz_program.stat().st_size,
+            "conversion_log_size": conversion_log.stat().st_size,
+        }
+    )
+    return metadata
 
 
 def _write_failure(
@@ -188,7 +239,10 @@ def validate_failure(dir_path: Path) -> Dict:
     meta = load_metadata(dir_path)
     assert meta.get("schema_version") is not None
     if meta["schema_version"] == FAILURE_SCHEMA_VERSION:
-        _validate_failure_v2(dir_path, meta)
+        _validate_failure_v3(dir_path, meta)
+        return meta
+    if meta["schema_version"] == STRUCTURED_FAILURE_SCHEMA_VERSION:
+        _validate_structured_failure(dir_path, meta)
         return meta
     if meta["schema_version"] != 1:
         raise CorpusValidationError(dir_path, "unsupported failure schema")
@@ -210,9 +264,44 @@ def validate_failure(dir_path: Path) -> Dict:
     return meta
 
 
-def _validate_failure_v2(dir_path: Path, metadata: Dict[str, Any]) -> None:
-    _require_exact_keys(metadata, _FAILURE_V2_KEYS, dir_path / METADATA_NAME)
-    category = _validate_failure_v2_scalars(metadata, dir_path)
+def _validate_failure_v3(dir_path: Path, metadata: Dict[str, Any]) -> None:
+    _validate_structured_failure(
+        dir_path,
+        metadata,
+        schema_version=FAILURE_SCHEMA_VERSION,
+        expected_keys=_FAILURE_V3_KEYS,
+        extra_files={"source.syz", "conversion-log.json"},
+    )
+    try:
+        source = ExternalSource.from_metadata(metadata["external_source"])
+    except ValueError as error:
+        raise CorpusValidationError(dir_path, str(error)) from error
+    _validate_file_metadata(
+        dir_path / "source.syz",
+        source.program_sha256,
+        metadata["syz_program_size"],
+    )
+    _validate_file_metadata(
+        dir_path / "conversion-log.json",
+        source.conversion_log_sha256,
+        metadata["conversion_log_size"],
+    )
+
+
+def _validate_structured_failure(
+    dir_path: Path,
+    metadata: Dict[str, Any],
+    *,
+    schema_version: int = STRUCTURED_FAILURE_SCHEMA_VERSION,
+    expected_keys: Set[str] = _FAILURE_V2_KEYS,
+    extra_files: Optional[Set[str]] = None,
+) -> None:
+    _require_exact_keys(metadata, expected_keys, dir_path / METADATA_NAME)
+    category = _validate_structured_failure_scalars(
+        metadata,
+        dir_path,
+        schema_version,
+    )
     required_files = {
         "pipe-linux-oracle",
         "pipe.ops",
@@ -220,7 +309,12 @@ def _validate_failure_v2(dir_path: Path, metadata: Dict[str, Any]) -> None:
         "guest.log",
         METADATA_NAME,
     }
-    allowed_files = required_files | {"starryos", "input.bin", "inputs", "profraws"}
+    allowed_files = required_files | {
+        "starryos",
+        "input.bin",
+        "inputs",
+        "profraws",
+    } | (extra_files or set())
     unexpected = {entry.name for entry in dir_path.iterdir()} - allowed_files
     if unexpected:
         raise CorpusValidationError(
@@ -287,11 +381,12 @@ def _validate_failure_v2(dir_path: Path, metadata: Dict[str, Any]) -> None:
         _validate_x86_64_elf(dir_path / "starryos")
 
 
-def _validate_failure_v2_scalars(
+def _validate_structured_failure_scalars(
     metadata: Dict[str, Any],
     path: Path,
+    schema_version: int,
 ) -> GuestResultCategory:
-    if metadata["schema_version"] != FAILURE_SCHEMA_VERSION:
+    if metadata["schema_version"] != schema_version:
         raise CorpusValidationError(path, "unsupported failure schema")
     if not isinstance(metadata["generator_version"], str) or not metadata["generator_version"]:
         raise CorpusValidationError(path, "invalid generator version")

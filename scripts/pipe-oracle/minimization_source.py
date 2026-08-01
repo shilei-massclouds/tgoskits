@@ -59,7 +59,7 @@ def _create_mismatch_job(
     document = parse_document((source / "pipe.ops").read_bytes())
     canonical = serialize_document(document).encode("utf-8")
     reduction_input = ReductionInput.initial(document)
-    if metadata["schema_version"] == 2:
+    if metadata["schema_version"] in {2, 3}:
         if metadata["guest_result_category"] != GuestResultCategory.SEMANTIC_MISMATCH.value:
             raise ValueError("failure source is not a semantic mismatch")
         fingerprint = MismatchFingerprint.from_metadata(
