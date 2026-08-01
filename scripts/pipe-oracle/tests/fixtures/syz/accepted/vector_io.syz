@@ -1,0 +1,12 @@
+# syzkaller revision e611ffe1caa28a0228c8f3642cc768f0dba3dd0c
+pipe2(&AUTO={<r0=>0x0, <r1=>0x0}, 0x800)
+writev(r1, &AUTO=[{&AUTO='AA', 0x2}, {0x1, 0x0}, {&AUTO='BBB', 0x3}, {&AUTO='C', 0x1}], 0x4)
+readv(r0, &AUTO=[{&AUTO=""/1, 0x1}, {&AUTO=""/3, 0x3}, {0x1, 0x0}, {&AUTO=""/2, 0x2}], 0x4)
+writev(r1, &AUTO=[], 0x0)
+readv(r0, 0x1, 0x0)
+readv(r0, &AUTO=[], 0xffffffffffffffff)
+writev(r1, &AUTO=[], 0x401)
+readv(r0, 0x1, 0x1)
+writev(r1, 0x1, 0x1)
+close(r0)
+close(r1)

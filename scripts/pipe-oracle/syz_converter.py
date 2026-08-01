@@ -1,7 +1,6 @@
 """Lossless conversion from a restricted syzkaller AST to ``pipe.ops`` v4."""
 
 from dataclasses import dataclass
-from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
 from scenario import (
@@ -26,6 +25,7 @@ from scenario import (
     PollMany,
     Read,
     ReadNull,
+    Readv,
     Scenario,
     ScenarioCodecError,
     ScenarioDocument,
@@ -35,6 +35,7 @@ from scenario import (
     SetStatusFlags,
     Write,
     WriteNull,
+    Writev,
     format_operation,
     serialize_document,
     validate_entry_limits,
@@ -53,10 +54,18 @@ from syz_ast import (
     SyzString,
     SyzStruct,
 )
+from syz_rejection import SyzConversionError, SyzRejectionCategory
+from syz_vector import (
+    VectorMemoryRegion,
+    VectorPayloadError,
+    VectorShapeError,
+    convert_readv_arguments,
+    convert_writev_arguments,
+)
 
 
 SUPPORTED_SYZKALLER_REVISION = "e611ffe1caa28a0228c8f3642cc768f0dba3dd0c"
-IMPORTER_VERSION = "1"
+IMPORTER_VERSION = "2"
 
 F_GETFD = 1
 F_SETFD = 2
@@ -66,43 +75,6 @@ F_SETPIPE_SZ = 1031
 F_GETPIPE_SZ = 1032
 FIONREAD = 21531
 POLL_LITERAL_FDS = {-2, -1, 2147483647}
-
-
-class SyzRejectionCategory(str, Enum):
-    UNSUPPORTED_CALL = "unsupported-call"
-    PSEUDO_SYSCALL = "pseudo-syscall"
-    CALL_PROPERTIES = "call-properties"
-    INVALID_ARITY = "invalid-arity"
-    UNSUPPORTED_ARGUMENT = "unsupported-argument"
-    UNSUPPORTED_CONSTANT = "unsupported-constant"
-    UNSUPPORTED_RESULT = "unsupported-result"
-    DUPLICATE_RESULT = "duplicate-result"
-    UNDEFINED_RESOURCE = "undefined-resource"
-    RESOURCE_ARITHMETIC = "resource-arithmetic"
-    USE_AFTER_CLOSE = "use-after-close"
-    SLOT_LIMIT = "slot-limit"
-    POINTER_SHAPE = "pointer-shape"
-    MEMORY_OVERLAP = "memory-overlap"
-    BUFFER_SHAPE = "buffer-shape"
-    NON_UNIFORM_PAYLOAD = "non-uniform-payload"
-    POLL_SHAPE = "poll-shape"
-    BLOCKING_IO = "blocking-io"
-    ENTRY_LIMIT = "entry-limit"
-
-
-class SyzConversionError(ValueError):
-    """A stable rejection for a well-formed but unsupported syzkaller AST."""
-
-    def __init__(
-        self,
-        line_number: int,
-        category: SyzRejectionCategory,
-        detail: str,
-    ):
-        self.line_number = line_number
-        self.category = category
-        self.detail = detail
-        super().__init__(f"line {line_number}: {category.value}: {detail}")
 
 
 @dataclass(frozen=True)
@@ -193,6 +165,8 @@ class _Converter:
             "pipe2": self._convert_pipe2,
             "read": self._convert_read,
             "write": self._convert_write,
+            "readv": self._convert_readv,
+            "writev": self._convert_writev,
             "close": self._convert_close,
             "dup": self._convert_dup,
             "dup2": self._convert_dup2,
@@ -321,6 +295,54 @@ class _Converter:
                 "positive write payload prefix is not one repeated byte",
             )
         return Write(slot, count, prefix[0] if prefix else 0)
+
+    def _convert_readv(self, call: SyzCall, call_index: int) -> Readv:
+        self._require_no_assignment(call)
+        self._require_arity(call, 3)
+        slot = self._fd_slot(call, call.arguments[0])
+        try:
+            conversion = convert_readv_arguments(
+                call.arguments[1],
+                call.arguments[2],
+            )
+        except VectorShapeError as error:
+            self._reject(call, SyzRejectionCategory.VECTOR_SHAPE, str(error))
+        self._record_vector_regions(call, conversion.regions, call_index)
+        return Readv(
+            slot,
+            conversion.iov_mode,
+            conversion.iovcnt,
+            conversion.segments,
+        )
+
+    def _convert_writev(self, call: SyzCall, call_index: int) -> Writev:
+        self._require_no_assignment(call)
+        self._require_arity(call, 3)
+        slot = self._fd_slot(call, call.arguments[0])
+        try:
+            conversion = convert_writev_arguments(
+                call.arguments[1],
+                call.arguments[2],
+            )
+        except VectorShapeError as error:
+            self._reject(
+                call,
+                SyzRejectionCategory.VECTOR_SHAPE,
+                str(error),
+            )
+        except VectorPayloadError as error:
+            self._reject(
+                call,
+                SyzRejectionCategory.NON_UNIFORM_PAYLOAD,
+                str(error),
+            )
+        self._record_vector_regions(call, conversion.regions, call_index)
+        return Writev(
+            slot,
+            conversion.iov_mode,
+            conversion.iovcnt,
+            conversion.segments,
+        )
 
     def _convert_close(self, call: SyzCall, _call_index: int) -> Close:
         self._require_no_assignment(call)
@@ -646,6 +668,32 @@ class _Converter:
                 )
         self.memory_regions.append(_MemoryRegion(start, end, call_index, call.line_number))
 
+    def _record_vector_regions(
+        self,
+        call: SyzCall,
+        regions: Tuple[VectorMemoryRegion, ...],
+        call_index: int,
+    ) -> None:
+        for vector_region in regions:
+            for existing in self.memory_regions:
+                if (
+                    vector_region.start < existing.end
+                    and existing.start < vector_region.end
+                ):
+                    self._reject(
+                        call,
+                        SyzRejectionCategory.MEMORY_OVERLAP,
+                        f"anchored iovec region overlaps line {existing.line_number}",
+                    )
+            self.memory_regions.append(
+                _MemoryRegion(
+                    vector_region.start,
+                    vector_region.end,
+                    call_index,
+                    call.line_number,
+                )
+            )
+
     def _buffer_data(self, call: SyzCall, argument: Optional[SyzArgument]) -> bytes:
         if not isinstance(argument, SyzString) or argument.base64_encoded:
             self._reject(
@@ -746,12 +794,7 @@ def _signed_value(value: int, bits: int) -> int:
     sign_bit = 1 << (bits - 1)
     return truncated - (1 << bits) if truncated & sign_bit else truncated
 
-
 __all__ = [
-    "ConversionResult",
-    "IMPORTER_VERSION",
-    "SUPPORTED_SYZKALLER_REVISION",
-    "SyzConversionError",
-    "SyzRejectionCategory",
-    "convert_syz_program",
+    "ConversionResult", "IMPORTER_VERSION", "SUPPORTED_SYZKALLER_REVISION",
+    "SyzConversionError", "SyzRejectionCategory", "convert_syz_program",
 ]

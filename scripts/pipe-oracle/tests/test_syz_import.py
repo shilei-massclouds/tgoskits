@@ -24,16 +24,22 @@ from scenario import (
     GetFdFlags,
     GetSize,
     GetStatusFlags,
+    IovBaseMode,
+    IovMode,
     Pipe2,
     PollFdMode,
     PollMany,
     Read,
     ReadNull,
+    Readv,
+    ReadvSegment,
     SetFdFlags,
     SetSize,
     SetStatusFlags,
     Write,
     WriteNull,
+    Writev,
+    WritevSegment,
     canonical_digest,
     serialize_document,
 )
@@ -184,6 +190,196 @@ class SyzConverterTests(unittest.TestCase):
             [Pipe2, Read, ReadNull, Write, WriteNull],
         )
 
+    def test_maps_vector_io_with_per_segment_pointer_and_payload_semantics(self):
+        conversion = self._convert_fixture("accepted/vector_io.syz")
+        operations = conversion.document.scenarios[0].operations
+
+        self.assertEqual(operations[1], Writev(
+            1,
+            IovMode.VALID,
+            4,
+            (
+                WritevSegment(IovBaseMode.VALID, 2, ord("A")),
+                WritevSegment(IovBaseMode.INVALID, 0, 0),
+                WritevSegment(IovBaseMode.VALID, 3, ord("B")),
+                WritevSegment(IovBaseMode.VALID, 1, ord("C")),
+            ),
+        ))
+        self.assertEqual(operations[2], Readv(
+            0,
+            IovMode.VALID,
+            4,
+            (
+                ReadvSegment(IovBaseMode.VALID, 1),
+                ReadvSegment(IovBaseMode.VALID, 3),
+                ReadvSegment(IovBaseMode.INVALID, 0),
+                ReadvSegment(IovBaseMode.VALID, 2),
+            ),
+        ))
+        self.assertEqual(operations[3], Writev(1, IovMode.VALID, 0, ()))
+        self.assertEqual(operations[4], Readv(0, IovMode.INVALID, 0, ()))
+        self.assertEqual(operations[5], Readv(0, IovMode.VALID, -1, ()))
+        self.assertEqual(operations[6], Writev(1, IovMode.VALID, 1025, ()))
+
+    def test_vector_conversion_preserves_short_io_sentinel_shape_and_is_canonical(self):
+        encoded = (
+            "pipe2(&AUTO={<r0=>0, <r1=>0}, 0x800)\n"
+            "writev(r1, &AUTO=[{&AUTO='DD', 2}, {&AUTO='E', 1}], 2)\n"
+            'readv(r0, &AUTO=[{&AUTO=""/2, 2}, {&AUTO=""/3, 3}], 2)\n'
+        )
+
+        first = self._convert(encoded)
+        second = self._convert(encoded)
+
+        self.assertEqual(first, second)
+        self.assertEqual(canonical_digest(first.document), canonical_digest(second.document))
+        self.assertEqual(
+            first.document.scenarios[0].operations[2],
+            Readv(
+                0,
+                IovMode.VALID,
+                2,
+                (
+                    ReadvSegment(IovBaseMode.VALID, 2),
+                    ReadvSegment(IovBaseMode.VALID, 3),
+                ),
+            ),
+        )
+
+    def test_accepts_every_supported_iovcnt_and_anchored_vector_regions(self):
+        conversion = self._convert(
+            "pipe2(&AUTO={<r0=>0, <r1=>0}, 0x800)\n"
+            "readv(r0, &AUTO=[], 0xffffffffffffffff)\n"
+            "readv(r0, &AUTO=[], 0)\n"
+            "readv(r0, &(0x7f0000001000)=["
+            "{&(0x7f0000002000)=\"\"/0, 0}], 1)\n"
+            "readv(r0, &AUTO=[{&AUTO=\"\"/0, 0}, {0x1, 0}], 2)\n"
+            "writev(r1, &AUTO=[{&AUTO='', 0}, {0x1, 0}, {&AUTO='', 0}], 3)\n"
+            "writev(r1, &AUTO=[{&AUTO='', 0}, {&AUTO='', 0}, "
+            "{&AUTO='', 0}, {&AUTO='', 0}], 4)\n"
+            "writev(r1, &AUTO=[], 1025)\n"
+        )
+
+        vectors = conversion.document.scenarios[0].operations[1:]
+        self.assertEqual([operation.iovcnt for operation in vectors], [-1, 0, 1, 2, 3, 4, 1025])
+        self.assertEqual(
+            vectors[2].segments,
+            (ReadvSegment(IovBaseMode.VALID, 0),),
+        )
+
+    def test_vector_io_preserves_resource_lifecycle_checks(self):
+        with self.assertRaises(SyzConversionError) as raised:
+            self._convert(
+                "pipe2(&AUTO={<r0=>0, <r1=>0}, 0x800)\n"
+                "close(r0)\n"
+                "readv(r0, &AUTO=[], 0)\n"
+            )
+
+        self.assertEqual(raised.exception.category, SyzRejectionCategory.USE_AFTER_CLOSE)
+
+    def test_rejects_vector_shapes_outside_the_v4_boundary(self):
+        prefix = "pipe2(&AUTO={<r0=>0, <r1=>0}, 0x800)\n"
+        cases = {
+            "array-count-mismatch": "readv(r0, &AUTO=[], 1)\n",
+            "fifth-segment": (
+                "readv(r0, &AUTO=[{&AUTO=''/0, 0}, {&AUTO=''/0, 0}, "
+                "{&AUTO=''/0, 0}, {&AUTO=''/0, 0}, {&AUTO=''/0, 0}], 5)\n"
+            ),
+            "total-length": (
+                "writev(r1, &AUTO=[{&AUTO=''/4097, 4097}, "
+                "{&AUTO=''/4096, 4096}], 2)\n"
+            ),
+            "uninitialized-buffer": "readv(r0, &AUTO=[{&AUTO, 1}], 1)\n",
+            "complex-buffer": "writev(r1, &AUTO=[{&AUTO={0}, 1}], 1)\n",
+        }
+        for name, operation in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises(SyzConversionError) as raised:
+                    self._convert(prefix + operation)
+                self.assertEqual(
+                    raised.exception.category,
+                    SyzRejectionCategory.VECTOR_SHAPE,
+                )
+
+    def test_rejects_vector_payload_alias_blocking_and_unknown_calls(self):
+        cases = {
+            SyzRejectionCategory.NON_UNIFORM_PAYLOAD: (
+                "pipe2(&AUTO={<r0=>0, <r1=>0}, 0x800)\n"
+                "writev(r1, &AUTO=[{&AUTO='AB', 2}], 1)\n"
+            ),
+            SyzRejectionCategory.MEMORY_OVERLAP: (
+                "pipe2(&(0x7f0000000000)={<r0=>0, <r1=>0}, 0x800)\n"
+                "writev(r1, &(0x7f0000001000)=["
+                "{&(0x7f0000001008)='A', 1}], 1)\n"
+            ),
+            SyzRejectionCategory.BLOCKING_IO: (
+                "pipe(&AUTO={<r0=>0, <r1=>0})\n"
+                "readv(r0, &AUTO=[{&AUTO=\"\"/1, 1}], 1)\n"
+            ),
+            SyzRejectionCategory.UNSUPPORTED_CALL: (
+                "pipe2(&AUTO={<r0=>0, <r1=>0}, 0x800)\n"
+                "preadv(r0, &AUTO=[], 0, 0, 0)\n"
+            ),
+        }
+        for category, encoded in cases.items():
+            with self.subTest(category=category):
+                with self.assertRaises(SyzConversionError) as raised:
+                    self._convert(encoded)
+                self.assertEqual(raised.exception.category, category)
+
+    def test_rejects_every_unknown_vector_syscall(self):
+        calls = (
+            "preadv(r0, &AUTO=[], 0, 0, 0)",
+            "pwritev(r1, &AUTO=[], 0, 0, 0)",
+            "preadv2(r0, &AUTO=[], 0, 0, 0, 0)",
+            "pwritev2(r1, &AUTO=[], 0, 0, 0, 0)",
+            "vmsplice(r1, &AUTO=[], 0, 0)",
+        )
+        for call in calls:
+            with self.subTest(call=call):
+                with self.assertRaises(SyzConversionError) as raised:
+                    self._convert(
+                        "pipe2(&AUTO={<r0=>0, <r1=>0}, 0x800)\n"
+                        f"{call}\n"
+                    )
+                self.assertEqual(
+                    raised.exception.category,
+                    SyzRejectionCategory.UNSUPPORTED_CALL,
+                )
+
+    def test_rejects_vector_assignment_arity_and_entry_limit(self):
+        cases = {
+            SyzRejectionCategory.UNSUPPORTED_RESULT: (
+                "pipe2(&AUTO={<r0=>0, <r1=>0}, 0x800)\n"
+                "r2 = readv(r0, &AUTO=[], 0)\n"
+            ),
+            SyzRejectionCategory.INVALID_ARITY: (
+                "pipe2(&AUTO={<r0=>0, <r1=>0}, 0x800)\n"
+                "writev(r1, &AUTO=[])\n"
+            ),
+            SyzRejectionCategory.ENTRY_LIMIT: (
+                "pipe2(&AUTO={<r0=>0, <r1=>0}, 0x800)\n"
+                + "readv(r0, 0x1, 0)\n" * 32
+            ),
+        }
+        for category, encoded in cases.items():
+            with self.subTest(category=category):
+                with self.assertRaises(SyzConversionError) as raised:
+                    self._convert(encoded)
+                self.assertEqual(raised.exception.category, category)
+
+    def test_rejects_cross_call_vector_memory_overlap(self):
+        with self.assertRaises(SyzConversionError) as raised:
+            self._convert(
+                "pipe2(&(0x7f0000000000)={<r0=>0, <r1=>0}, 0x800)\n"
+                "writev(r1, &(0x7f0000001000)=["
+                "{&(0x7f0000002000)='A', 1}], 1)\n"
+                "readv(r0, &(0x7f0000003000)=["
+                "{&(0x7f0000002000)=\"\"/1, 1}], 1)\n"
+            )
+
+        self.assertEqual(raised.exception.category, SyzRejectionCategory.MEMORY_OVERLAP)
+
     def test_preserves_poll_order_duplicates_and_literals(self):
         conversion = self._convert(
             "pipe2(&AUTO={<r0=>0, <r1=>0}, 0x800)\n"
@@ -268,8 +464,8 @@ class SyzCheckCliTests(unittest.TestCase):
         )
 
         self.assertFalse(infrastructure_failed)
-        self.assertEqual(report["summary"]["total_inputs"], 4)
-        self.assertEqual(report["summary"]["accepted"], 2)
+        self.assertEqual(report["summary"]["total_inputs"], 6)
+        self.assertEqual(report["summary"]["accepted"], 4)
         self.assertEqual(report["summary"]["rejected"], 2)
         self.assertEqual(
             report["summary"]["rejection_categories"],
