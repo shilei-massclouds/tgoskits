@@ -18,19 +18,23 @@
 
 #define LEGACY_TRACE_VERSION 1U
 #define FD_TRACE_VERSION 2U
-#define TRACE_VERSION 3U
+#define VECTOR_TRACE_VERSION 3U
+#define TRACE_VERSION 4U
 #define LEGACY_CORPUS_VERSION 1L
 #define FD_CORPUS_VERSION 2L
-#define CORPUS_VERSION 3L
+#define VECTOR_CORPUS_VERSION 3L
+#define CORPUS_VERSION 4L
 #define MAX_SLOTS 16
 #define DUP_TARGET_FD_BASE 64
 #define MAX_IO_BYTES 8192
 #define MAX_IOV_SEGMENTS 4
+#define MAX_POLL_FDS 4
 #define MAX_LINE_BYTES 256
 #define TRACE_RELEASE_BYTES 64
 #define TRACE_MACHINE_BYTES 32
 #define UNKNOWN_FLAG 0x40000000L
 #define READV_SENTINEL 0xa5U
+#define POLL_REVENTS_SENTINEL ((short)0x5a5a)
 
 static const unsigned char trace_magic[8] = {'P', 'I', 'P', 'E', 'O', 'R', 'C', '1'};
 
@@ -54,6 +58,7 @@ enum operation_kind {
     OP_DUP3,
     OP_READV,
     OP_WRITEV,
+    OP_POLL_MANY,
 };
 
 enum operation_difference {
@@ -167,6 +172,32 @@ static int parse_long_value(const char *text, long minimum, long maximum,
     return 0;
 }
 
+static int parse_decimal_long_value(const char *text, long minimum,
+                                    long maximum, long *value)
+{
+    const char *cursor = text;
+    char *end;
+    long parsed;
+
+    if (cursor == NULL || *cursor == '\0')
+        return -1;
+    if (*cursor == '+' || *cursor == '-')
+        cursor++;
+    if (*cursor == '\0')
+        return -1;
+    for (; *cursor != '\0'; cursor++) {
+        if (*cursor < '0' || *cursor > '9')
+            return -1;
+    }
+
+    errno = 0;
+    parsed = strtol(text, &end, 10);
+    if (errno != 0 || *end != '\0' || parsed < minimum || parsed > maximum)
+        return -1;
+    *value = parsed;
+    return 0;
+}
+
 static int parse_slot(const char *text, int *slot)
 {
     long parsed;
@@ -193,6 +224,11 @@ static int is_supported_iovcnt(long iovcnt)
 {
     return iovcnt == -1 || (iovcnt >= 0 && iovcnt <= MAX_IOV_SEGMENTS) ||
            iovcnt == 1025;
+}
+
+static int is_supported_poll_literal_fd(long fd)
+{
+    return fd == -2 || fd == -1 || fd == INT_MAX;
 }
 
 static void finish_syscall_result(struct operation_result *result, long syscall_result)
@@ -537,6 +573,57 @@ static int execute_poll(struct run_context *context, char *save,
     return 0;
 }
 
+static int execute_poll_many(struct run_context *context, char *save,
+                             struct operation_result *result)
+{
+    char *count_text = strtok_r(NULL, " \t", &save);
+    struct pollfd poll_fds[MAX_POLL_FDS];
+    long count;
+    long entry_index;
+    long syscall_result;
+
+    if (parse_decimal_long_value(count_text, 0, MAX_POLL_FDS, &count) != 0)
+        return -1;
+
+    memset(poll_fds, 0, sizeof(poll_fds));
+    for (entry_index = 0; entry_index < count; entry_index++) {
+        char *mode_text = strtok_r(NULL, " \t", &save);
+        char *fd_arg_text = strtok_r(NULL, " \t", &save);
+        char *events_text = strtok_r(NULL, " \t", &save);
+        long mode;
+        long fd_arg;
+        long events;
+
+        if (parse_decimal_long_value(mode_text, 0, 1, &mode) != 0 ||
+            parse_decimal_long_value(fd_arg_text, INT_MIN, INT_MAX,
+                                     &fd_arg) != 0 ||
+            parse_decimal_long_value(events_text, 0, SHRT_MAX, &events) != 0 ||
+            (mode == 0 && (fd_arg < 0 || fd_arg >= MAX_SLOTS)) ||
+            (mode == 1 && !is_supported_poll_literal_fd(fd_arg)))
+            return -1;
+        poll_fds[entry_index].fd =
+            mode == 0 ? context->slots[fd_arg] : (int)fd_arg;
+        poll_fds[entry_index].events = (short)events;
+        poll_fds[entry_index].revents = POLL_REVENTS_SENTINEL;
+    }
+    if (strtok_r(NULL, " \t", &save) != NULL)
+        return -1;
+
+    errno = 0;
+    syscall_result = syscall(SYS_poll, poll_fds, (nfds_t)count, 0L);
+    finish_syscall_result(result, syscall_result);
+    result->value = count;
+    result->data_len = (uint32_t)count * 2U;
+    for (entry_index = 0; entry_index < count; entry_index++) {
+        uint16_t revents = (uint16_t)poll_fds[entry_index].revents;
+
+        result->data[entry_index * 2] = (unsigned char)(revents & 0xffU);
+        result->data[entry_index * 2 + 1] = (unsigned char)(revents >> 8);
+    }
+    result->kind = OP_POLL_MANY;
+    return 0;
+}
+
 static int execute_fcntl(struct run_context *context, char *save,
                          struct operation_result *result, int set_size)
 {
@@ -624,12 +711,15 @@ static int execute_operation(struct run_context *context, char *line,
         return execute_write(context, save, result);
     if (strcmp(operation, "write-null") == 0)
         return execute_null_io(context, save, result, 1);
-    if (context->corpus_version == CORPUS_VERSION &&
+    if (context->corpus_version >= VECTOR_CORPUS_VERSION &&
         strcmp(operation, "readv") == 0)
         return execute_vector_io(context, save, result, 0);
-    if (context->corpus_version == CORPUS_VERSION &&
+    if (context->corpus_version >= VECTOR_CORPUS_VERSION &&
         strcmp(operation, "writev") == 0)
         return execute_vector_io(context, save, result, 1);
+    if (context->corpus_version == CORPUS_VERSION &&
+        strcmp(operation, "poll-many") == 0)
+        return execute_poll_many(context, save, result);
     if (strcmp(operation, "dup") == 0)
         return execute_dup(context, save, result);
     if (strcmp(operation, "close") == 0)
@@ -918,6 +1008,7 @@ static int compare_trace(const char *corpus_path, const char *trace_path,
         memcmp(context.header.magic, trace_magic, sizeof(trace_magic)) != 0 ||
         (context.header.version != LEGACY_TRACE_VERSION &&
          context.header.version != FD_TRACE_VERSION &&
+         context.header.version != VECTOR_TRACE_VERSION &&
          context.header.version != TRACE_VERSION) ||
         context.header.corpus_digest != corpus_digest) {
         fclose(context.trace);
@@ -932,9 +1023,12 @@ static int compare_trace(const char *corpus_path, const char *trace_path,
     if (status == 0 && context.corpus_version == FD_CORPUS_VERSION &&
         context.header.version < FD_TRACE_VERSION)
         status = fail("version-2 corpus requires a version-2 or newer trace");
+    if (status == 0 && context.corpus_version == VECTOR_CORPUS_VERSION &&
+        context.header.version < VECTOR_TRACE_VERSION)
+        status = fail("version-3 corpus requires a version-3 or newer trace");
     if (status == 0 && context.corpus_version == CORPUS_VERSION &&
         context.header.version != TRACE_VERSION)
-        status = fail("version-3 corpus requires a version-3 trace");
+        status = fail("version-4 corpus requires a version-4 trace");
     if (status == 0 && context.operation_index != context.header.record_count)
         status = fail("expected trace operation count does not match corpus");
     if (status == 0 && fread(&trailing_byte, 1, 1, context.trace) != 0U)

@@ -1,6 +1,6 @@
-# Starry pipe/vector Linux-oracle regression corpus, version 3.
+# Starry pipe/vector/poll Linux-oracle regression corpus, version 4.
 # Descriptor slots are logical and local to each scenario.
-version 3
+version 4
 
 scenario zero_length_and_closed_peer
 pipe2 0 1 526336
@@ -171,3 +171,29 @@ readv 0 0 1 1 1 1
 writev 1 0 1 1 1 1 90
 close 0
 close 1
+
+scenario poll_many_empty_negative_invalid_and_ready
+pipe2 0 1 526336
+write 1 1 80
+poll-many 0
+poll-many 4 1 -2 1 1 -1 4 1 2147483647 4 0 0 1
+close 0
+close 1
+
+scenario poll_many_order_duplicates_and_aliases
+pipe2 0 1 526336
+dup 0 2
+write 1 1 81
+poll-many 4 0 2 1 0 0 1 0 1 4 0 0 0
+close 0
+close 1
+close 2
+
+scenario poll_many_closed_peer_events
+pipe2 0 1 526336
+close 1
+pipe2 2 3 526336
+close 2
+poll-many 2 0 0 1 0 3 4
+close 0
+close 3

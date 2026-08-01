@@ -20,7 +20,12 @@ from corpus_errors import (
     CorpusStorageError,
     CorpusValidationError,
 )
-from coverage import FD_TARGET_SET_ID, LEGACY_TARGET_SET_ID, TARGET_SET_ID
+from coverage import (
+    FD_TARGET_SET_ID,
+    LEGACY_TARGET_SET_ID,
+    TARGET_SET_ID,
+    VECTOR_TARGET_SET_ID,
+)
 from generator import (
     GENERATOR_VERSION,
     SUPPORTED_CORPUS_GENERATOR_VERSIONS,
@@ -39,8 +44,9 @@ ATTRIBUTED_CORPUS_SCHEMA_VERSION = 2
 CORPUS_SCHEMA_VERSION = 3
 LEGACY_COVERAGE_STATE_SCHEMA_VERSION = 1
 FD_COVERAGE_STATE_SCHEMA_VERSION = 2
-COVERAGE_STATE_SCHEMA_VERSION = 3
-RUN_SCHEMA_VERSION = 5
+VECTOR_COVERAGE_STATE_SCHEMA_VERSION = 3
+COVERAGE_STATE_SCHEMA_VERSION = 4
+RUN_SCHEMA_VERSION = 6
 
 CORPUS_ENTRIES_NAME = "corpus"
 RUNS_NAME = "runs"
@@ -484,6 +490,7 @@ class CorpusStore:
                 )
         elif schema_version in (
             FD_COVERAGE_STATE_SCHEMA_VERSION,
+            VECTOR_COVERAGE_STATE_SCHEMA_VERSION,
             COVERAGE_STATE_SCHEMA_VERSION,
         ):
             _require_exact_keys(
@@ -500,7 +507,11 @@ class CorpusStore:
             expected_target_set_id = (
                 FD_TARGET_SET_ID
                 if schema_version == FD_COVERAGE_STATE_SCHEMA_VERSION
-                else TARGET_SET_ID
+                else (
+                    VECTOR_TARGET_SET_ID
+                    if schema_version == VECTOR_COVERAGE_STATE_SCHEMA_VERSION
+                    else TARGET_SET_ID
+                )
             )
             if metadata.get("target_set_id") != expected_target_set_id:
                 raise CorpusValidationError(
@@ -517,6 +528,7 @@ class CorpusStore:
         if schema_version not in (
             LEGACY_COVERAGE_STATE_SCHEMA_VERSION,
             FD_COVERAGE_STATE_SCHEMA_VERSION,
+            VECTOR_COVERAGE_STATE_SCHEMA_VERSION,
             COVERAGE_STATE_SCHEMA_VERSION,
         ):
             raise CorpusValidationError(state_path, "unsupported coverage-state schema")
@@ -544,6 +556,7 @@ class CorpusStore:
         schema_version = {
             LEGACY_TARGET_SET_ID: LEGACY_COVERAGE_STATE_SCHEMA_VERSION,
             FD_TARGET_SET_ID: FD_COVERAGE_STATE_SCHEMA_VERSION,
+            VECTOR_TARGET_SET_ID: VECTOR_COVERAGE_STATE_SCHEMA_VERSION,
             TARGET_SET_ID: COVERAGE_STATE_SCHEMA_VERSION,
         }.get(target_set_id)
         if schema_version is None:
@@ -563,6 +576,7 @@ class CorpusStore:
         if target_set_id not in (
             LEGACY_TARGET_SET_ID,
             FD_TARGET_SET_ID,
+            VECTOR_TARGET_SET_ID,
             TARGET_SET_ID,
         ):
             raise ValueError(f"unknown coverage target set: {target_set_id}")

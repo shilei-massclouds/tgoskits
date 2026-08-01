@@ -485,13 +485,45 @@ checked-in version-3 corpus 的 142 个 x86_64 QEMU operation 全部通过并导
 
 #### 阶段 3.2b-2：multi-fd poll
 
-**状态：待实现。**
+**状态：已完成（2026-08-01）。**
 
-后续独立扩展 resource/result 映射，覆盖一次 `poll` 的多个 fd、重复 fd 和负 fd。
-本阶段不复用 3.2b-1 的单 fd 结果结构来隐式编码多 fd 状态。
+`pipe.ops` version 4 增加 `poll-many COUNT [FD_MODE FD_ARG EVENTS]...`，数组长度限制
+为 `0..4`。fd 可引用逻辑 slot，也可使用固定 literal `-2`、`-1`、`2147483647`；
+timeout 固定为零。它覆盖空数组、多个不同 fd、同一 slot 重复、dup alias、所有负 fd、
+无效正 fd、invalid/ready 混合顺序、不同 mask 以及 closed-peer `HUP/ERR`，不复用旧
+单 fd 结果结构。
 
-阻塞 flag 组合必须使用不会自然挂起的操作序列，或由明确 watchdog 判定基础设施
-失败；不能用宽松 timeout 把不确定结果当作语义通过。
+trace version 4 追加 kind 20，精确保存 syscall `result`/`errno`，并按数组顺序把每个
+`revents` 以两字节 little-endian 写入 `data`。调用前全部填充固定哨兵，ignored/unready
+条目必须由内核清零。generator v5、mutation 和 reducer 均理解 entry 增删、重复、
+顺序、fd mode/argument 与 event mask；reducer 保持复杂度严格下降，不合成资源初始化。
+
+新 coverage target 为 `pipe-poll-v4`，在 `pipe-vector-v3` 五个文件上追加
+`syscall/io_mpx/poll.rs` 与 `syscall/io_mpx/mod.rs`。持久格式升级为 coverage-state v4、
+attribution v5、minimization v4、run v6；旧 schema 严格绑定到 `pipe-v1`、
+`pipe-fd-v2` 或 `pipe-vector-v3`，corpus schema v3 与 failure schema v2 不变。
+
+直接 raw-syscall 回归证明 Starry 原先只忽略 `fd == -1`，并在遇到无效正 fd 后提前
+返回，遗漏同一数组中有效条目的 readiness。预修复新模块为 8 pass / 8 fail；共享
+`do_poll` 修复为清零并忽略所有负 fd、累计 invalid entry、即时扫描所有有效 entry 后
+返回，重复 fd 逐项计数，不增加 pipe 特判。修复后的 `poll`/`ppoll` 镜像回归为
+16 pass / 0 fail，完整 select/poll family 的 45 个模块全部通过。`ppoll` 仅验证共享
+生产路径，不加入 differential corpus。
+
+最终 checked-in version-4 corpus 的 162 个 host/Starry operation 全部通过并导出
+coverage。真实 `seed=0`、`batch-size=2` campaign 生成 11 个 `poll-many`，两个输入均
+可执行，新增 1205 个 region：`file/pipe.rs` 353、`syscall/fs/pipe.rs` 33、
+`syscall/fs/fd_ops.rs` 342、`syscall/fs/io.rs` 169、`mm/io.rs` 121、
+`syscall/io_mpx/poll.rs` 179、`syscall/io_mpx/mod.rs` 8。精确归因使用 3 次额外 QEMU，
+将 1187/1078 个 region 映射到两个代表；最小化使用 1 次验证、4 次候选和 2 次最终
+证明，责任 region 要求两个输入保持 1653/555 bytes，最终以 `budget-limited` 完成。
+
+实现前的旧 Python codec 与保存的 version-3 C harness 均严格拒绝 version-4 corpus。
+实现后 120 个 Python/host-harness 回归、`py_compile`、23 项 `starry-kernel` clippy、
+workspace rustfmt 与 `git diff --check` 全部通过。
+
+本阶段仍不包含坏 `pollfd *`、超限 `nfds`、非零/无限 timeout、信号 mask、线程关闭
+竞态或阻塞语义；这些边界继续由直接 syscall 测试或后续并发阶段负责。
 
 ### 7.3 readiness 与零拷贝接口
 

@@ -8,7 +8,8 @@ from typing import Dict, List, Set
 
 LEGACY_TARGET_SET_ID = "pipe-v1"
 FD_TARGET_SET_ID = "pipe-fd-v2"
-TARGET_SET_ID = "pipe-vector-v3"
+VECTOR_TARGET_SET_ID = "pipe-vector-v3"
+TARGET_SET_ID = "pipe-poll-v4"
 
 TARGET_SOURCE_PATHS = {
     LEGACY_TARGET_SET_ID: ("kernel/src/file/pipe.rs",),
@@ -17,12 +18,21 @@ TARGET_SOURCE_PATHS = {
         "kernel/src/syscall/fs/pipe.rs",
         "kernel/src/syscall/fs/fd_ops.rs",
     ),
+    VECTOR_TARGET_SET_ID: (
+        "kernel/src/file/pipe.rs",
+        "kernel/src/syscall/fs/pipe.rs",
+        "kernel/src/syscall/fs/fd_ops.rs",
+        "kernel/src/syscall/fs/io.rs",
+        "kernel/src/mm/io.rs",
+    ),
     TARGET_SET_ID: (
         "kernel/src/file/pipe.rs",
         "kernel/src/syscall/fs/pipe.rs",
         "kernel/src/syscall/fs/fd_ops.rs",
         "kernel/src/syscall/fs/io.rs",
         "kernel/src/mm/io.rs",
+        "kernel/src/syscall/io_mpx/poll.rs",
+        "kernel/src/syscall/io_mpx/mod.rs",
     ),
 }
 

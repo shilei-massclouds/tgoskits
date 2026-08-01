@@ -7,14 +7,20 @@ from pathlib import Path
 from typing import Any, Dict, Set, Tuple
 
 from corpus import CorpusProvenance, CorpusValidationError
-from coverage import FD_TARGET_SET_ID, LEGACY_TARGET_SET_ID, TARGET_SET_ID
+from coverage import (
+    FD_TARGET_SET_ID,
+    LEGACY_TARGET_SET_ID,
+    TARGET_SET_ID,
+    VECTOR_TARGET_SET_ID,
+)
 from generator import SUPPORTED_CORPUS_GENERATOR_VERSIONS
 from scenario import parse_document, serialize_document
 
 
 LEGACY_ATTRIBUTION_SCHEMA_VERSION = 2
 FD_ATTRIBUTION_SCHEMA_VERSION = 3
-ATTRIBUTION_SCHEMA_VERSION = 4
+VECTOR_ATTRIBUTION_SCHEMA_VERSION = 4
+ATTRIBUTION_SCHEMA_VERSION = 5
 ATTRIBUTION_JOBS_NAME = "attribution-jobs"
 FAILURES_NAME = "failures"
 METADATA_NAME = "metadata.json"
@@ -61,12 +67,17 @@ def validate_job_metadata(
         "failure_reason",
     }
     schema_version = metadata.get("schema_version")
-    if schema_version in (FD_ATTRIBUTION_SCHEMA_VERSION, ATTRIBUTION_SCHEMA_VERSION):
+    if schema_version in (
+        FD_ATTRIBUTION_SCHEMA_VERSION,
+        VECTOR_ATTRIBUTION_SCHEMA_VERSION,
+        ATTRIBUTION_SCHEMA_VERSION,
+    ):
         expected.add("target_set_id")
     require_exact_keys(metadata, expected, path)
     if schema_version not in (
         LEGACY_ATTRIBUTION_SCHEMA_VERSION,
         FD_ATTRIBUTION_SCHEMA_VERSION,
+        VECTOR_ATTRIBUTION_SCHEMA_VERSION,
         ATTRIBUTION_SCHEMA_VERSION,
     ):
         raise CorpusValidationError(path, "unsupported attribution schema")
@@ -77,11 +88,19 @@ def validate_job_metadata(
     )
     if metadata["generator_version"] not in compatible_generator_versions:
         raise CorpusValidationError(path, "incompatible generator version")
-    if schema_version in (FD_ATTRIBUTION_SCHEMA_VERSION, ATTRIBUTION_SCHEMA_VERSION):
+    if schema_version in (
+        FD_ATTRIBUTION_SCHEMA_VERSION,
+        VECTOR_ATTRIBUTION_SCHEMA_VERSION,
+        ATTRIBUTION_SCHEMA_VERSION,
+    ):
         expected_target_set_id = (
             FD_TARGET_SET_ID
             if schema_version == FD_ATTRIBUTION_SCHEMA_VERSION
-            else TARGET_SET_ID
+            else (
+                VECTOR_TARGET_SET_ID
+                if schema_version == VECTOR_ATTRIBUTION_SCHEMA_VERSION
+                else TARGET_SET_ID
+            )
         )
         if metadata["target_set_id"] != expected_target_set_id:
             raise CorpusValidationError(path, "unsupported attribution target set")
@@ -203,19 +222,29 @@ def validate_replay(job_path: Path, replay: Path) -> Dict[str, Any]:
         "trace_sha256",
         "profraws",
     }
-    if evidence_version in (FD_ATTRIBUTION_SCHEMA_VERSION, ATTRIBUTION_SCHEMA_VERSION):
+    if evidence_version in (
+        FD_ATTRIBUTION_SCHEMA_VERSION,
+        VECTOR_ATTRIBUTION_SCHEMA_VERSION,
+        ATTRIBUTION_SCHEMA_VERSION,
+    ):
         evidence_keys.add("target_set_id")
     require_exact_keys(coverage, evidence_keys, replay)
     if evidence_version not in (
         LEGACY_ATTRIBUTION_SCHEMA_VERSION,
         FD_ATTRIBUTION_SCHEMA_VERSION,
+        VECTOR_ATTRIBUTION_SCHEMA_VERSION,
         ATTRIBUTION_SCHEMA_VERSION,
     ):
         raise CorpusValidationError(replay, "unsupported replay evidence schema")
     if evidence_version != job_metadata.get("schema_version"):
         raise CorpusValidationError(replay, "replay evidence schema mismatch")
     if (
-        evidence_version in (FD_ATTRIBUTION_SCHEMA_VERSION, ATTRIBUTION_SCHEMA_VERSION)
+        evidence_version
+        in (
+            FD_ATTRIBUTION_SCHEMA_VERSION,
+            VECTOR_ATTRIBUTION_SCHEMA_VERSION,
+            ATTRIBUTION_SCHEMA_VERSION,
+        )
         and coverage["target_set_id"] != job_target_set_id(job_metadata)
     ):
         raise CorpusValidationError(replay, "replay evidence target set mismatch")
@@ -258,6 +287,8 @@ def job_target_set_id(metadata: Dict[str, Any]) -> str:
         return LEGACY_TARGET_SET_ID
     if metadata["schema_version"] == FD_ATTRIBUTION_SCHEMA_VERSION:
         return FD_TARGET_SET_ID
+    if metadata["schema_version"] == VECTOR_ATTRIBUTION_SCHEMA_VERSION:
+        return VECTOR_TARGET_SET_ID
     return metadata["target_set_id"]
 
 
@@ -447,6 +478,7 @@ __all__ = [
     "ATTRIBUTION_JOBS_NAME",
     "ATTRIBUTION_SCHEMA_VERSION",
     "FD_ATTRIBUTION_SCHEMA_VERSION",
+    "VECTOR_ATTRIBUTION_SCHEMA_VERSION",
     "ELFS_NAME",
     "FAILURES_NAME",
     "HOST_ORACLE_NAME",

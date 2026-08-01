@@ -7,8 +7,10 @@ persistent canonical coverage corpus, resumable exact coverage attribution,
 and persistent coverage/mismatch minimization on 2026-07-31. Stage 3.2a added
 pipe fd/status flags and `dup2`/`dup3` coverage on 2026-07-31. Stage 3.2b-1
 added bounded `readv`/`writev`, vector-aware reduction, and the Starry access
-capability fix on 2026-08-01. This document records the design and
-implementation of the script-driven pipe differential oracle.
+capability fix on 2026-08-01. Stage 3.2b-2 added bounded timeout-zero multi-fd
+`poll`, per-entry result vectors, and the shared Starry `poll`/`ppoll` scan fix
+on 2026-08-01. This document records the design and implementation of the
+script-driven pipe differential oracle.
 
 Base: `dev-cov2` at `fb399d055`.
 
@@ -72,9 +74,9 @@ The implementation is complete when all of the following hold:
   host Linux and generates a fresh expected trace;
 - fuzz and replay runs inject their exact saved/generated ELF, corpus, and trace
   into the guest instead of re-recording or substituting checked-in artifacts;
-- Starry compares return values, exact errno, poll events, capacity/query
-  values, queued byte counts, bytes returned by reads, normalized
-  `O_NONBLOCK`, and per-fd `FD_CLOEXEC`;
+- Starry compares return values, exact errno, scalar poll events, ordered
+  multi-fd `revents` vectors, capacity/query values, queued byte counts, bytes
+  returned by reads, normalized `O_NONBLOCK`, and per-fd `FD_CLOEXEC`;
 - a mismatch identifies the scenario, operation index, operation text, expected
   result, actual result, and recorded host environment;
 - malformed corpus or trace input fails closed and returns a nonzero status;
@@ -119,6 +121,9 @@ The first implementation deliberately excludes:
   `vmsplice`;
 - `preadv`/`pwritev`, multi-fd `poll`, `select`/`epoll`, exec-time fd lifecycle,
   and blocking fd/pipe semantics in stage 3.2b-1;
+- `ppoll` differential input, bad `pollfd *`, excessive `nfds`, nonzero or
+  infinite poll timeouts, signal masks, thread-close races, and blocking poll
+  semantics in stage 3.2b-2;
 - a general syscall differential framework or a stable public corpus/trace
   protocol;
 - a Linux VM pinned to a specific kernel release;
@@ -143,6 +148,8 @@ The first implementation deliberately excludes:
 | Structured hierarchical delta debugging | Preserves operation/resource structure and gives deterministic checkpoints | Does not guarantee a global minimum | Select with a bounded candidate budget |
 | Encode vector I/O as one flat byte count | Reuses scalar operations | Cannot compare segment boundaries, short-transfer placement, or untouched memory | Reject; use typed bounded segments |
 | Fix vector errno ordering with pipe-specific syscall branches | Small local patch | Duplicates access policy and leaves regular files/directories/memfd inconsistent | Reject; add a `FileLike` capability boundary |
+| Encode multiple poll entries as repeated scalar `poll` operations | Reuses version-1 result fields | Loses array order, duplicate-fd counting, mixed invalid/ready behavior, and one-call semantics | Reject; add a typed bounded poll array |
+| Fix only `sys_poll` | Narrows the immediate patch | Leaves `ppoll` inconsistent even though both enter the shared implementation | Reject; fix shared `do_poll` and add direct regressions for both syscalls |
 
 ## Architecture
 
@@ -264,6 +271,47 @@ cross-segment transfer, a 5000-byte nonblocking partial write into a 4096-byte
 pipe, invalid vector/base pointers, `iovcnt` boundaries, and bad descriptors.
 It contains 142 operations and records/compares self-consistently on the host.
 
+### Version-4 multi-fd poll
+
+`pipe.ops` version 4 preserves every version-1 through version-3 spelling and
+canonical digest and adds one bounded form:
+
+```
+poll-many COUNT [FD_MODE FD_ARG EVENTS]...
+```
+
+`COUNT` is `0..4`, followed by exactly that many triples. `FD_MODE=0` resolves
+`FD_ARG` as a logical slot in `0..15`; `FD_MODE=1` uses a literal fd and only
+accepts `-2`, `-1`, or `2147483647`. `EVENTS` is a decimal value in
+`0..32767`. The syscall timeout is always zero. This represents an empty
+array, different descriptors, repeated slots, dup aliases, ignored negative
+fds, invalid positive fds, and mixed invalid/ready entries without admitting a
+bad array pointer, unbounded `nfds`, or a blocking execution path.
+
+Trace version 4 appends operation kind 20 without renumbering older kinds.
+`result` and `errno` retain the exact syscall outcome, `value` is the entry
+count, and `data` stores every `revents` value in array order as an unsigned
+two-byte little-endian value. Thus `data_len` is exactly `2 * COUNT`. Before
+the syscall, the harness fills every `revents` with `0x5a5a`; ignored and
+unready entries must therefore be visibly cleared by the kernel rather than
+passing because the harness initialized them to zero. Version-4 corpora
+require a version-4 trace, while older corpus/trace pairs remain readable.
+
+The immutable IR uses `PollMany`, `PollFdEntry`, and a typed slot/literal fd
+mode; the older scalar `Poll` remains unchanged. Generator version 5 emits new
+version-4 entries and strictly restores corpus created by generator versions
+2, 3, 4, and 5. Mutation changes entry count, insertion/deletion/duplication,
+order, fd mode/argument, and event masks. Repair preserves valid mode/argument
+combinations and may construct executable nonblocking resource setup; the
+reducer never constructs setup, deduplicates candidates, preserves operation
+origins, and accepts only a strictly lower well-founded complexity key.
+
+The checked-in version-4 corpus covers an empty array, multiple slots, repeated
+slots, dup aliases, both negative literals, an invalid positive literal,
+invalid/ready mixtures in both orders, different masks, and closed-peer
+`HUP`/`ERR`. It contains 162 operations and records/compares
+self-consistently on the host.
+
 ### Linux ordering evidence and Starry boundary
 
 The production ordering reference is Linux commit
@@ -317,6 +365,37 @@ failure before this fix and passed all 76 checks afterward.
 The separate invalid-count `readv` conflict already returned `EBADF` before
 the fix. Keeping it in the regression guards the complete fd-before-count
 contract even though it did not expose the original bug.
+
+For multi-fd poll, the authoritative production reference is upstream Linux
+`v6.12.37` commit
+[`fbad404f04d758c52bae79ca20d0e7fe5fef91d3`](https://github.com/torvalds/linux/blob/fbad404f04d758c52bae79ca20d0e7fe5fef91d3/fs/select.c#L854-L1122).
+The local comparison tree at `~/gitStudy/linux-6.12.37` had HEAD
+`1f2a63ab718d6a052a3afd2516db319b9b317b63` on 2026-08-01. In the fixed
+upstream source, `do_pollfd` ignores every `fd < 0` and writes zero to
+`revents`; an invalid positive fd produces `POLLNVAL`. `do_poll` still scans
+every array element, counts each nonzero `revents` entry separately, and
+therefore counts duplicate descriptors independently. Both `poll` and `ppoll`
+enter the same `do_sys_poll`/`do_poll` path.
+
+Before the fix, Starry ignored only `fd == -1`, so `fd=-2` produced
+`POLLNVAL` instead of zero and retained the wrong result count. It also
+returned immediately after finding an invalid positive fd, leaving a later
+ready pipe entry unobserved. The new raw-syscall module mirrors both cases
+through timeout-zero `poll` and zero-timespec/null-sigmask `ppoll`; before the
+production change it necessarily reported 8 passes and 8 failures.
+
+The shared Starry `do_poll` now clears every entry first, skips all negative
+fds, records invalid positive entries, and builds the valid entry set without
+returning early. When any invalid entry exists, it collects one immediate
+readiness snapshot from every valid array entry and returns without registering
+a waiter or blocking. The return count is the number of array elements with a
+nonzero `revents`, including repeated fds. There is no pipe-specific branch.
+The same raw regression then passed all 16 checks, and the complete select/poll
+family passed all 45 modules for both affected syscall entry points.
+
+`poll` is the only new differential ABI in version 4. `ppoll` is documented and
+directly regression-tested because it shares the repaired implementation, but
+signal-mask, timeout, and `ppoll` corpus encoding remain non-goals.
 
 ### Coverage capture and deferred fail
 
@@ -378,15 +457,17 @@ does not exist and the production kernel carries no coverage-related code.
   exact-attribution admission.
 - `campaign_lock.py` and `corpus_errors.py`: Process-lock ownership and shared
   persistent-state error types.
-- `attribution.py` and `attribution_schema.py`: Atomic schema-v4 attribution
-  jobs (plus strict schema-v2/v3 recovery), target-set-aware evidence validation,
-  deterministic representative selection, and resumable state transitions.
+- `attribution.py` and `attribution_schema.py`: Atomic schema-v5 attribution
+  jobs (plus strict schema-v2/v3/v4 recovery), target-set-aware evidence
+  validation, deterministic representative selection, and resumable state
+  transitions.
 - `attribution_campaign.py`: Fresh host-trace and QEMU replay orchestration,
   cross-campaign ELF restart, final representative proof, and baseline commit.
-- `scenario.py`: Immutable scenario/operation IR plus the version-1/version-2/version-3
-  `pipe.ops` parser, canonical serializer, digest, typed codec errors, shared
-  open-file-description state, per-fd flags, typed vector segments, and campaign limits.
-- `generator.py`: Version-4 deterministic operation generation using a
+- `scenario.py`: Immutable scenario/operation IR plus the version-1 through
+  version-4 `pipe.ops` parser, canonical serializer, digest, typed codec errors,
+  shared open-file-description state, per-fd flags, typed vector segments,
+  typed poll arrays, and campaign limits.
+- `generator.py`: Version-5 deterministic operation generation using a
   versioned SHA-256 counter stream and rejection sampling. It maintains only
   logical fd resource state and never predicts return values, errno, poll
   readiness, or any semantic result. The version-1 LCG remains only for the five
@@ -403,9 +484,9 @@ does not exist and the production kernel carries no coverage-related code.
 - `reducer.py` and `minimization.py`: Pure deterministic hierarchical reduction,
   operation-origin tracking, coverage responsibility assignment, mismatch
   predicate checks, digest deduplication, and shared candidate-QEMU budgets.
-- `minimization_schema.py` and `minimization_store.py`: Strict schema-v3 job and
-  evidence validation (plus schema-v1/v2 recovery), atomic checkpoints, reducer
-  cursor persistence, target-set pinning, and stale/unstable failure
+- `minimization_schema.py` and `minimization_store.py`: Strict schema-v4 job and
+  evidence validation (plus schema-v1/v2/v3 recovery), atomic checkpoints,
+  reducer cursor persistence, target-set pinning, and stale/unstable failure
   preservation.
 - `minimization_source.py`, `minimization_campaign.py`, and `minimize.py`:
   failure/attribution source import, fresh trace/profraw predicate execution,
@@ -484,10 +565,10 @@ region union and minimization lineage are merged instead of creating a duplicate
 directory.
 
 The current generator strictly reads corpus entries created by generator v2,
-v3, or v4. Existing metadata and provenance are not rewritten merely because
-the entry is loaded; a newly generated or mutated child records generator v4
-and uses `pipe.ops` v3. Loading fails closed on an unknown schema or generator
-version, a directory or
+v3, v4, or v5. Existing metadata and provenance are not rewritten merely
+because the entry is loaded; a newly generated or mutated child records
+generator v5 and uses `pipe.ops` v4. Loading fails closed on an unknown schema
+or generator version, a directory or
 file digest mismatch, noncanonical UTF-8 encoding, codec/resource-limit error,
 invalid metadata, symlink, or unexpected finalized file. The only implicit
 transition is the contributor-triggered v1-to-v2 atomic upgrade described
@@ -501,13 +582,14 @@ replace. Run directories use the same temporary-directory/rename protocol.
 Only finalized 64-hex digest directories are loaded, so a process killed during
 its initial write cannot expose a half entry.
 
-Coverage state schema v3 is keyed by both the SHA-256 of the instrumented
-StarryOS ELF and a fixed target-set ID. New campaigns use `pipe-vector-v3`,
-which contains exactly `kernel/src/file/pipe.rs`, `kernel/src/syscall/fs/pipe.rs`,
-`kernel/src/syscall/fs/fd_ops.rs`, `kernel/src/syscall/fs/io.rs`, and
-`kernel/src/mm/io.rs`. Schema-v1 state is read only as the implicit `pipe-v1`
-target; schema-v2 state is restricted to `pipe-fd-v2`. Neither seeds a
-`pipe-vector-v3` baseline. A nonproductive batch
+Coverage state schema v4 is keyed by both the SHA-256 of the instrumented
+StarryOS ELF and a fixed target-set ID. New campaigns use `pipe-poll-v4`, which
+contains the five `pipe-vector-v3` files plus
+`kernel/src/syscall/io_mpx/poll.rs` and
+`kernel/src/syscall/io_mpx/mod.rs`. Schema-v1 state is read only as the
+implicit `pipe-v1` target; schema-v2 state is restricted to `pipe-fd-v2`, and
+schema-v3 state is restricted to `pipe-vector-v3`. None seeds a `pipe-poll-v4`
+baseline. A nonproductive batch
 saves the same baseline; a productive batch must finish exact attribution and
 the final representative replay before the enlarged baseline is atomically
 committed. Different ELFs and target sets therefore have independent
@@ -515,12 +597,13 @@ baselines.
 
 Persistent target ownership is schema-bound and fail-closed: attribution v2
 and minimization v1 imply `pipe-v1`; attribution v3 and minimization v2 require
-`pipe-fd-v2`; attribution v4 and minimization v3 require `pipe-vector-v3`.
-Replay evidence must use the same schema and target as its owning job. Unknown
-schemas, target mismatches, symlinks, and digest corruption are rejected rather
-than migrated. Corpus schema v3 and failure schema v2 remain unchanged.
+`pipe-fd-v2`; attribution v4 and minimization v3 require `pipe-vector-v3`;
+attribution v5 and minimization v4 require `pipe-poll-v4`. Replay evidence must
+use the same schema and target as its owning job. Unknown schemas, target
+mismatches, symlinks, and digest corruption are rejected rather than migrated.
+Corpus schema v3 and failure schema v2 remain unchanged.
 
-Run metadata schema v5 stores the fixed `target_set_id`, seed, exact command,
+Run metadata schema v6 stores the fixed `target_set_id`, seed, exact command,
 measured duration,
 candidate/executable/malformed/unique counts, sources and ancestry, new regions,
 admitted digests, Starry ELF digest, result category, attribution job ID, every
@@ -534,7 +617,7 @@ for selection.
 
 Exact attribution is enabled by default for every productive batch. After the
 initial batch QEMU reports regions outside the active ELF baseline, the
-orchestrator atomically creates a schema-v4 job containing the canonical input
+orchestrator atomically creates a schema-v5 job containing the canonical input
 set and the initial batch evidence. It then:
 
 1. re-records a fresh Linux trace and starts a fresh QEMU for each of the `N`
@@ -621,8 +704,9 @@ canonical, strictly lower-complexity candidates in this order:
 5. compress `dup`/`dup2`/`dup3` chains, redirect compatible resource
    references, and
    rename live slots densely; and
-6. reduce scalar/vector length, vector count/base/byte, pipe size, poll masks,
-   pipe/status/fd flags, and `dup3` flags through fixed simple values.
+6. reduce scalar/vector length, vector count/base/byte, pipe size, scalar poll
+   masks, multi-fd poll entry count/order/mode/argument/masks, pipe/status/fd
+   flags, and `dup3` flags through fixed simple values.
 
 It neither consumes campaign RNG nor synthesizes initialization operations.
 Every candidate passes the canonical codec and must lower a well-founded
@@ -646,7 +730,7 @@ side. A mismatch candidate is accepted only when the observed difference maps
 back to that same origin and produces the identical fingerprint. A pass or a
 different fingerprint is an ordinary rejection, not a new failure.
 
-Each strict schema-v3 minimization job owns its fixed target set, source
+Each strict schema-v4 minimization job owns its fixed target set, source
 identity, original
 inputs, fixed host and Starry ELFs, current-best checkpoints with operation
 origins, reducer cursors and seen digests, shared budget/cursor, compact attempt
@@ -712,6 +796,28 @@ fresh final proofs preserved all assigned regions. The run metadata uses schema
 v5, attribution schema v4, minimization schema v3, and target set
 `pipe-vector-v3`.
 
+The stage-3.2b-2 acceptance used the version-4 checked-in corpus for 162
+host/Starry operations. Host record/compare and the x86_64 QEMU oracle both
+passed and exported a fresh coverage profile. The direct shared-path regression
+passed 16 checks inside the complete 45-module select/poll family. The fixed
+`seed=0`, two-candidate campaign generated 11 `poll-many` operations, admitted
+both executable inputs, and added 1205 `pipe-poll-v4` regions: 353 in
+`file/pipe.rs`, 33 in `syscall/fs/pipe.rs`, 342 in `syscall/fs/fd_ops.rs`, 169
+in `syscall/fs/io.rs`, 121 in `mm/io.rs`, 179 in `syscall/io_mpx/poll.rs`, and
+8 in `syscall/io_mpx/mod.rs`. Exact attribution used three additional QEMU
+replays, mapped 1187 and 1078 regions to the two entries, and retained two
+representatives. Coverage minimization used one validation, four candidates,
+and two final proofs. The responsibility sets required both inputs to remain at
+1653 and 555 bytes; the job completed `budget-limited` only after both fresh
+proofs preserved all assigned regions. The persistent formats are run schema
+v6, coverage-state schema v4, attribution schema v5, minimization schema v4,
+corpus schema v3, and failure schema v2.
+
+Before implementation, the previous Python codec and saved version-3 C harness
+both rejected the version-4 checked-in corpus. After implementation, all 120
+Python/host-harness regressions, `py_compile`, all 23 `starry-kernel` clippy
+configurations, workspace rustfmt, and `git diff --check` passed.
+
 The retained schema-v1 poll-mismatch artifact also passed strict lazy import:
 its old log yielded a fingerprint at original operation 16 with
 `result`/`errno`/`value` differences. The active fixed ELF now passes all 397
@@ -767,7 +873,7 @@ monitor-socket, or other infrastructure errors therefore cannot be imported or
 reported as semantic mismatches.
 
 Saves use a temp-directory + atomic rename to prevent half-written artifacts.
-Attribution instability uses the separate schema-v4 job layout described above
+Attribution instability uses the separate schema-v5 job layout described above
 under `failures/attribution-<job-id>/`; moving the complete job preserves all
 initial, per-entry, representative, and ELF-transition evidence.
 
@@ -834,9 +940,12 @@ The fd semantics follow the public Linux contracts in
 [`dup(2)`](https://man7.org/linux/man-pages/man2/dup.2.html). Vector contracts
 follow [`readv(2)`](https://man7.org/linux/man-pages/man2/readv.2.html), with
 fd/access/iovec ordering checked against the fixed Linux source commit linked
-in the version-3 section. The execution
+in the version-3 section. Poll contracts follow
+[`poll(2)`](https://man7.org/linux/man-pages/man2/poll.2.html), with negative-fd,
+invalid-fd, array-scan, and shared `poll`/`ppoll` ordering checked against the
+fixed Linux 6.12.37 source commit linked in the version-4 section. The execution
 oracle, rather than a hard-coded kernel version, determines the exact result
-and errno for the recorded host release. Where an older host disagrees with the
+and errno for the recorded host release. Where an older host disagrees with a
 fixed source ordering, the discrepancy is documented and the production
 regression remains strict.
 
@@ -853,7 +962,8 @@ regression remains strict.
 | `dup` | Success/error; shared description state and cleared destination `FD_CLOEXEC` |
 | `dup2` | Same-fd behavior, invalid source, occupied-destination replacement, cleared destination `FD_CLOEXEC`, normalized success |
 | `dup3` | Same-fd/invalid-flag `EINVAL`, replacement, optional destination `FD_CLOEXEC`, normalized success |
-| `poll` | Timeout-zero return count and `revents` (slot-based writer readiness, closed-peer events) |
+| `poll` | Timeout-zero scalar and bounded arrays; ordered per-entry `revents`, ignored negative fds, invalid positive fds, duplicates/aliases, mixed readiness, and element return count |
+| `ppoll` | Direct zero-timespec/null-sigmask regression for the shared `do_poll` behavior; not part of the differential corpus protocol |
 | `fcntl` | `F_SETPIPE_SZ`/`F_GETPIPE_SZ`; normalized `F_GETFL`/`F_GETFD`; shared `F_SETFL(O_NONBLOCK)` and per-fd `F_SETFD(FD_CLOEXEC)` |
 | `ioctl(FIONREAD)` | Return/errno, exact unread-byte count |
 

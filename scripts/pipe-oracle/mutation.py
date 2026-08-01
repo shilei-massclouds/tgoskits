@@ -23,12 +23,17 @@ from scenario import (
     MAX_LOGICAL_SLOTS,
     MAX_OPS_PER_SCENARIO,
     MAX_PIPE_SIZE,
+    MAX_POLL_FDS,
     MAX_POLL_MASK,
     O_CLOEXEC,
     O_NONBLOCK,
     PIPE2_ALLOWED_FLAGS,
     Pipe2,
     Poll,
+    PollFdEntry,
+    PollFdMode,
+    PollMany,
+    POLL_LITERAL_FDS,
     Read,
     ReadNull,
     Readv,
@@ -347,11 +352,19 @@ def _parameter_locations(document):
         "base-mode": [],
         "pipe-size": [],
         "poll-mask": [],
+        "poll-entry-add": [],
+        "poll-entry-delete": [],
+        "poll-entry-duplicate": [],
+        "poll-entry-swap": [],
+        "poll-fd-mode": [],
+        "poll-fd-arg": [],
+        "poll-many-mask": [],
         "flags": [],
     }
     for scenario_index, scenario in enumerate(document.scenarios):
         for operation_index, operation in enumerate(scenario.operations):
-            locations["slot"].append((scenario_index, operation_index))
+            if not isinstance(operation, PollMany):
+                locations["slot"].append((scenario_index, operation_index))
             if isinstance(operation, (Read, Write)):
                 locations["length"].append((scenario_index, operation_index))
             if isinstance(operation, Write):
@@ -369,6 +382,20 @@ def _parameter_locations(document):
                 locations["pipe-size"].append((scenario_index, operation_index))
             if isinstance(operation, Poll):
                 locations["poll-mask"].append((scenario_index, operation_index))
+            if isinstance(operation, PollMany):
+                location = (scenario_index, operation_index)
+                if len(operation.entries) < MAX_POLL_FDS:
+                    locations["poll-entry-add"].append(location)
+                if operation.entries:
+                    locations["poll-entry-delete"].append(location)
+                    locations["poll-entry-duplicate"].append(location)
+                if len(operation.entries) > 1:
+                    locations["poll-entry-swap"].append(location)
+                for entry_index, _entry in enumerate(operation.entries):
+                    entry_location = (*location, entry_index)
+                    locations["poll-fd-mode"].append(entry_location)
+                    locations["poll-fd-arg"].append(entry_location)
+                    locations["poll-many-mask"].append(entry_location)
             if isinstance(
                 operation,
                 (Pipe2, SetStatusFlags, SetFdFlags, Dup3),
@@ -433,6 +460,75 @@ def _mutate_operation_parameter(rng, operation, family, segment_index=None):
             ),
         )
         return replace(operation, segments=tuple(segments))
+    if family == "poll-entry-add":
+        entries = list(operation.entries)
+        entries.insert(
+            rng.range(0, len(entries) + 1),
+            _random_poll_entry(rng),
+        )
+        return replace(operation, entries=tuple(entries))
+    if family == "poll-entry-delete":
+        entries = list(operation.entries)
+        del entries[rng.range(0, len(entries))]
+        return replace(operation, entries=tuple(entries))
+    if family == "poll-entry-duplicate":
+        entries = list(operation.entries)
+        entry = _choose(rng, entries)
+        entries.insert(rng.range(0, len(entries) + 1), entry)
+        return replace(operation, entries=tuple(entries[:MAX_POLL_FDS]))
+    if family == "poll-entry-swap":
+        entries = list(operation.entries)
+        first = rng.range(0, len(entries) - 1)
+        entries[first], entries[first + 1] = entries[first + 1], entries[first]
+        return replace(operation, entries=tuple(entries))
+    if family == "poll-fd-mode":
+        entries = list(operation.entries)
+        entry = entries[segment_index]
+        if entry.fd_mode == PollFdMode.SLOT:
+            entries[segment_index] = replace(
+                entry,
+                fd_mode=PollFdMode.LITERAL,
+                fd_arg=_choose(rng, POLL_LITERAL_FDS),
+            )
+        else:
+            entries[segment_index] = replace(
+                entry,
+                fd_mode=PollFdMode.SLOT,
+                fd_arg=rng.range(0, MAX_LOGICAL_SLOTS),
+            )
+        return replace(operation, entries=tuple(entries))
+    if family == "poll-fd-arg":
+        entries = list(operation.entries)
+        entry = entries[segment_index]
+        if entry.fd_mode == PollFdMode.SLOT:
+            fd_arg = _mutated_number(
+                rng,
+                entry.fd_arg,
+                SLOT_BOUNDARIES,
+                0,
+                MAX_LOGICAL_SLOTS - 1,
+            )
+        else:
+            fd_arg = _choose(
+                rng,
+                tuple(value for value in POLL_LITERAL_FDS if value != entry.fd_arg),
+            )
+        entries[segment_index] = replace(entry, fd_arg=fd_arg)
+        return replace(operation, entries=tuple(entries))
+    if family == "poll-many-mask":
+        entries = list(operation.entries)
+        entry = entries[segment_index]
+        entries[segment_index] = replace(
+            entry,
+            events=_mutated_number(
+                rng,
+                entry.events,
+                POLL_MASK_BOUNDARIES,
+                0,
+                MAX_POLL_MASK,
+            ),
+        )
+        return replace(operation, entries=tuple(entries))
     if family == "pipe-size":
         value = _mutated_number(
             rng,
@@ -623,6 +719,28 @@ def _repair_scenario(scenario: Scenario) -> Scenario:
                 logical_mapping[operation.destination_slot] = destination
             continue
 
+        if isinstance(operation, PollMany):
+            entries = []
+            for entry in operation.entries:
+                if entry.fd_mode == PollFdMode.LITERAL:
+                    entries.append(entry)
+                    continue
+                slot = _resolve_endpoint(
+                    entry.fd_arg,
+                    (READER, WRITER),
+                    logical_mapping,
+                    slots,
+                    repaired,
+                )
+                entries.append(
+                    replace(entry, fd_arg=slot)
+                    if slot is not None
+                    else PollFdEntry(PollFdMode.LITERAL, -1, entry.events)
+                )
+            if len(repaired) < MAX_OPS_PER_SCENARIO:
+                repaired.append(PollMany(entries))
+            continue
+
         required_states = _required_states(operation)
         slot = _resolve_endpoint(
             operation.slot,
@@ -698,6 +816,20 @@ def _random_template_operation(rng):
     document = generator.generate_document(rng)
     scenario = _choose(rng, document.scenarios)
     return _choose(rng, scenario.operations)
+
+
+def _random_poll_entry(rng) -> PollFdEntry:
+    if rng.range(0, 2) == 0:
+        return PollFdEntry(
+            PollFdMode.SLOT,
+            rng.range(0, MAX_LOGICAL_SLOTS),
+            _choose(rng, POLL_MASK_BOUNDARIES[:-1]),
+        )
+    return PollFdEntry(
+        PollFdMode.LITERAL,
+        _choose(rng, POLL_LITERAL_FDS),
+        _choose(rng, POLL_MASK_BOUNDARIES[:-1]),
+    )
 
 
 def _random_fragment(rng, length: int) -> Tuple[int, int]:

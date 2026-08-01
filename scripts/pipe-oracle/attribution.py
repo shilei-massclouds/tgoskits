@@ -19,6 +19,7 @@ from attribution_schema import (
     ATTRIBUTION_JOBS_NAME,
     ATTRIBUTION_SCHEMA_VERSION,
     FD_ATTRIBUTION_SCHEMA_VERSION,
+    VECTOR_ATTRIBUTION_SCHEMA_VERSION,
     ELFS_NAME,
     FAILURES_NAME,
     HOST_ORACLE_NAME,
@@ -580,6 +581,7 @@ class AttributionStore:
             }
             if evidence_schema_version in (
                 FD_ATTRIBUTION_SCHEMA_VERSION,
+                VECTOR_ATTRIBUTION_SCHEMA_VERSION,
                 ATTRIBUTION_SCHEMA_VERSION,
             ):
                 coverage["target_set_id"] = target_set_id

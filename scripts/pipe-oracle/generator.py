@@ -1,4 +1,4 @@
-"""Deterministic legacy migration and version-3 structured generation."""
+"""Deterministic legacy migration and version-4 structured generation."""
 
 import hashlib
 import struct
@@ -26,6 +26,7 @@ from scenario import (
     MAX_LOGICAL_SLOTS,
     MAX_OPS_PER_SCENARIO,
     MAX_PIPE_SIZE,
+    MAX_POLL_FDS,
     MAX_POLL_MASK,
     O_CLOEXEC,
     O_NONBLOCK,
@@ -33,6 +34,10 @@ from scenario import (
     PIPE2_FLAG_VALUES,
     Pipe2,
     Poll,
+    PollFdEntry,
+    PollFdMode,
+    PollMany,
+    POLL_LITERAL_FDS,
     Read,
     ReadNull,
     Readv,
@@ -52,12 +57,14 @@ from scenario import (
 )
 
 
-GENERATOR_VERSION = "4"
-PREVIOUS_GENERATOR_VERSION = "3"
+GENERATOR_VERSION = "5"
+PREVIOUS_GENERATOR_VERSION = "4"
+VECTOR_GENERATOR_VERSION = "3"
 FD_GENERATOR_VERSION = "2"
 LEGACY_GENERATOR_VERSION = "1"
 SUPPORTED_CORPUS_GENERATOR_VERSIONS = (
     FD_GENERATOR_VERSION,
+    VECTOR_GENERATOR_VERSION,
     PREVIOUS_GENERATOR_VERSION,
     GENERATOR_VERSION,
 )
@@ -196,7 +203,7 @@ class LegacyLcgRng:
 
 
 def generate_document(rng) -> ScenarioDocument:
-    """Generate one bounded generator-v4 corpus entry directly as scenario IR."""
+    """Generate one bounded generator-v5 corpus entry directly as scenario IR."""
 
     scenario_count = rng.range(1, 5)
     scenarios = []
@@ -258,7 +265,7 @@ def _structured_operation_families(state: _GenerationState):
     open_slots = _slots_with_states(state.slots, READER, WRITER)
     available_slots = _slots_with_states(state.slots, FREE, CLOSED)
     if not open_slots:
-        return ("pipe2",)
+        return ("pipe2", "poll-many")
 
     families = [
         "read",
@@ -269,6 +276,7 @@ def _structured_operation_families(state: _GenerationState):
         "writev",
         "close",
         "poll",
+        "poll-many",
         "set-size",
         "get-size",
         "fionread",
@@ -332,6 +340,8 @@ def _emit_structured_operation(rng, family: str, state: _GenerationState):
         return Close(slot)
     if family == "poll":
         return Poll(_choose(rng, open_slots), _generation_poll_mask(rng))
+    if family == "poll-many":
+        return _generate_poll_many(rng, state)
     if family == "set-size":
         return SetSize(_choose(rng, open_slots), _generation_pipe_size(rng))
     if family == "get-size":
@@ -487,6 +497,21 @@ def _generation_poll_mask(rng) -> int:
     if rng.range(0, 2) == 0:
         return _choose(rng, _GENERATION_POLL_BOUNDARIES)
     return rng.range(0, MAX_POLL_MASK + 1)
+
+
+def _generate_poll_many(rng, state: _GenerationState) -> PollMany:
+    count = rng.range(0, MAX_POLL_FDS + 1)
+    open_slots = _slots_with_states(state.slots, READER, WRITER)
+    entries = []
+    for _ in range(count):
+        if open_slots and rng.range(0, 2) == 0:
+            fd_mode = PollFdMode.SLOT
+            fd_arg = _choose(rng, open_slots)
+        else:
+            fd_mode = PollFdMode.LITERAL
+            fd_arg = _choose(rng, POLL_LITERAL_FDS)
+        entries.append(PollFdEntry(fd_mode, fd_arg, _generation_poll_mask(rng)))
+    return PollMany(entries)
 
 
 def _generate_legacy_scenario(rng: LegacyLcgRng, operation_count: int) -> Scenario:

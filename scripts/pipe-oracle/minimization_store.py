@@ -27,6 +27,7 @@ from minimization_schema import (
     INPUTS_NAME,
     JOB_ID_PATTERN,
     FD_MINIMIZATION_SCHEMA_VERSION,
+    VECTOR_MINIMIZATION_SCHEMA_VERSION,
     job_target_set_id,
     METADATA_NAME,
     MINIMIZATION_JOBS_NAME,
@@ -456,6 +457,7 @@ class MinimizationStore:
             }
             if job.metadata["schema_version"] in (
                 FD_MINIMIZATION_SCHEMA_VERSION,
+                VECTOR_MINIMIZATION_SCHEMA_VERSION,
                 MINIMIZATION_SCHEMA_VERSION,
             ):
                 result["target_set_id"] = job_target_set_id(job.metadata)

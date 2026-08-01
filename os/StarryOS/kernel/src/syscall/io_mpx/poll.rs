@@ -104,8 +104,8 @@ fn do_poll(
     let mut revent_indices = Vec::with_capacity(poll_fds.len());
     for (index, fd) in poll_fds.iter_mut().enumerate() {
         fd.revents = 0;
-        if fd.fd == -1 {
-            // Skip -1
+        if fd.fd < 0 {
+            // Linux ignores every negative fd and clears its revents field.
             continue;
         }
         match get_file_like(fd.fd) {
@@ -124,10 +124,13 @@ fn do_poll(
             }
         }
     }
+    let fds = FdPollSet(fds);
     if res > 0 {
+        // POLLNVAL makes poll return immediately, but readiness from every
+        // valid entry in the same array must still be observed once.
+        res += collect_ready_poll_events(&fds, &revent_indices, poll_fds) as isize;
         return Ok(res);
     }
-    let fds = FdPollSet(fds);
 
     with_blocked_signals(sigmask, || {
         let wait = poll_fn(|cx| {

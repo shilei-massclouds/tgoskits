@@ -29,6 +29,8 @@ from scenario import (
     PIPE2_ALLOWED_FLAGS,
     Pipe2,
     Poll,
+    PollFdMode,
+    PollMany,
     Read,
     ReadNull,
     Readv,
@@ -60,6 +62,7 @@ OPERATION_NAMES = (
     "dup",
     "close",
     "poll",
+    "poll-many",
     "set-size",
     "get-size",
     "fionread",
@@ -397,6 +400,9 @@ def _record_parameters(operation, distributions):
         distributions["pipe_size_buckets"][_pipe_size_bucket(operation.size)] += 1
     elif isinstance(operation, Poll):
         distributions["poll_mask_buckets"][_poll_mask_bucket(operation.events)] += 1
+    elif isinstance(operation, PollMany):
+        for entry in operation.entries:
+            distributions["poll_mask_buckets"][_poll_mask_bucket(entry.events)] += 1
     elif isinstance(operation, (Pipe2, SetStatusFlags, SetFdFlags, Dup3)):
         distributions["flag_buckets"][str(operation.flags)] += 1
 
@@ -408,6 +414,15 @@ def _record_resource_category(operation, slots, distributions):
     if isinstance(operation, WriteNull):
         categories["write-null"] += 1
     if isinstance(operation, Pipe2):
+        return
+    if isinstance(operation, PollMany):
+        for entry in operation.entries:
+            if entry.fd_mode != PollFdMode.SLOT:
+                continue
+            if slots[entry.fd_arg] == FREE:
+                categories["idle-slot"] += 1
+            elif slots[entry.fd_arg] == CLOSED:
+                categories["closed-slot"] += 1
         return
 
     slot = (

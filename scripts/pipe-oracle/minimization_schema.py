@@ -8,7 +8,12 @@ from typing import Any, Dict, Set
 
 from corpus_errors import CorpusValidationError
 from corpus import CorpusProvenance
-from coverage import FD_TARGET_SET_ID, LEGACY_TARGET_SET_ID, TARGET_SET_ID
+from coverage import (
+    FD_TARGET_SET_ID,
+    LEGACY_TARGET_SET_ID,
+    TARGET_SET_ID,
+    VECTOR_TARGET_SET_ID,
+)
 from generator import SUPPORTED_CORPUS_GENERATOR_VERSIONS
 from fingerprint import MismatchFingerprint
 from guest_result import GuestResultCategory
@@ -18,7 +23,8 @@ from scenario import ScenarioDocument, parse_document, serialize_document
 
 LEGACY_MINIMIZATION_SCHEMA_VERSION = 1
 FD_MINIMIZATION_SCHEMA_VERSION = 2
-MINIMIZATION_SCHEMA_VERSION = 3
+VECTOR_MINIMIZATION_SCHEMA_VERSION = 3
+MINIMIZATION_SCHEMA_VERSION = 4
 MINIMIZATION_JOBS_NAME = "minimization-jobs"
 JOB_STATES = {
     "validating",
@@ -73,12 +79,17 @@ def validate_job_metadata(
         "failure_reason",
     }
     schema_version = metadata.get("schema_version")
-    if schema_version in (FD_MINIMIZATION_SCHEMA_VERSION, MINIMIZATION_SCHEMA_VERSION):
+    if schema_version in (
+        FD_MINIMIZATION_SCHEMA_VERSION,
+        VECTOR_MINIMIZATION_SCHEMA_VERSION,
+        MINIMIZATION_SCHEMA_VERSION,
+    ):
         expected_keys.add("target_set_id")
     require_exact_keys(metadata, expected_keys, path)
     if schema_version not in (
         LEGACY_MINIMIZATION_SCHEMA_VERSION,
         FD_MINIMIZATION_SCHEMA_VERSION,
+        VECTOR_MINIMIZATION_SCHEMA_VERSION,
         MINIMIZATION_SCHEMA_VERSION,
     ):
         raise CorpusValidationError(path, "unsupported minimization schema")
@@ -89,11 +100,19 @@ def validate_job_metadata(
     )
     if metadata["generator_version"] not in compatible_generator_versions:
         raise CorpusValidationError(path, "incompatible generator version")
-    if schema_version in (FD_MINIMIZATION_SCHEMA_VERSION, MINIMIZATION_SCHEMA_VERSION):
+    if schema_version in (
+        FD_MINIMIZATION_SCHEMA_VERSION,
+        VECTOR_MINIMIZATION_SCHEMA_VERSION,
+        MINIMIZATION_SCHEMA_VERSION,
+    ):
         expected_target_set_id = (
             FD_TARGET_SET_ID
             if schema_version == FD_MINIMIZATION_SCHEMA_VERSION
-            else TARGET_SET_ID
+            else (
+                VECTOR_TARGET_SET_ID
+                if schema_version == VECTOR_MINIMIZATION_SCHEMA_VERSION
+                else TARGET_SET_ID
+            )
         )
         if metadata["target_set_id"] != expected_target_set_id:
             raise CorpusValidationError(path, "unsupported minimization target set")
@@ -230,6 +249,8 @@ def job_target_set_id(metadata: Dict[str, Any]) -> str:
         return LEGACY_TARGET_SET_ID
     if metadata["schema_version"] == FD_MINIMIZATION_SCHEMA_VERSION:
         return FD_TARGET_SET_ID
+    if metadata["schema_version"] == VECTOR_MINIMIZATION_SCHEMA_VERSION:
+        return VECTOR_TARGET_SET_ID
     return metadata["target_set_id"]
 
 
@@ -487,19 +508,29 @@ def _validate_evidence(path: Path, job_metadata: Dict[str, Any]) -> None:
         "guest_log_sha256",
         "profraws",
     }
-    if evidence_version in (FD_MINIMIZATION_SCHEMA_VERSION, MINIMIZATION_SCHEMA_VERSION):
+    if evidence_version in (
+        FD_MINIMIZATION_SCHEMA_VERSION,
+        VECTOR_MINIMIZATION_SCHEMA_VERSION,
+        MINIMIZATION_SCHEMA_VERSION,
+    ):
         expected_keys.add("target_set_id")
     require_exact_keys(result, expected_keys, path)
     if evidence_version not in (
         LEGACY_MINIMIZATION_SCHEMA_VERSION,
         FD_MINIMIZATION_SCHEMA_VERSION,
+        VECTOR_MINIMIZATION_SCHEMA_VERSION,
         MINIMIZATION_SCHEMA_VERSION,
     ):
         raise CorpusValidationError(path, "unsupported minimization evidence schema")
     if evidence_version != job_metadata["schema_version"]:
         raise CorpusValidationError(path, "minimization evidence schema mismatch")
     if (
-        evidence_version in (FD_MINIMIZATION_SCHEMA_VERSION, MINIMIZATION_SCHEMA_VERSION)
+        evidence_version
+        in (
+            FD_MINIMIZATION_SCHEMA_VERSION,
+            VECTOR_MINIMIZATION_SCHEMA_VERSION,
+            MINIMIZATION_SCHEMA_VERSION,
+        )
         and result["target_set_id"] != job_target_set_id(job_metadata)
     ):
         raise CorpusValidationError(path, "minimization evidence target set mismatch")
@@ -663,6 +694,7 @@ __all__ = [
     "METADATA_NAME",
     "MINIMIZATION_JOBS_NAME",
     "MINIMIZATION_SCHEMA_VERSION",
+    "VECTOR_MINIMIZATION_SCHEMA_VERSION",
     "STARRY_ELF_NAME",
     "TEMP_PATTERN",
     "is_digest",

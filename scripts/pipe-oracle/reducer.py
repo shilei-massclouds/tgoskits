@@ -20,6 +20,10 @@ from scenario import (
     O_NONBLOCK,
     Pipe2,
     Poll,
+    PollFdEntry,
+    PollFdMode,
+    PollMany,
+    POLL_LITERAL_FDS,
     Read,
     ReadNull,
     Readv,
@@ -504,6 +508,8 @@ def _operation_parameter_replacements(
     if isinstance(operation, Poll):
         for value in _smaller_simple_values(operation.events, (0, 1, 2, 4, 8, 16, 32, 64)):
             replacements.append(("poll-mask", value, replace(operation, events=value)))
+    if isinstance(operation, PollMany):
+        replacements.extend(_poll_many_parameter_replacements(operation))
     if isinstance(operation, SetSize):
         for value in _smaller_simple_values(
             operation.size,
@@ -600,6 +606,77 @@ def _vector_parameter_replacements(operation):
     return tuple(replacements)
 
 
+def _poll_many_parameter_replacements(operation):
+    replacements = []
+    for entry_index, entry in enumerate(operation.entries):
+        entries = list(operation.entries)
+        del entries[entry_index]
+        replacements.append(
+            (
+                f"poll-entry-delete-{entry_index}",
+                entry_index,
+                replace(operation, entries=tuple(entries)),
+            )
+        )
+        if entry.fd_mode == PollFdMode.LITERAL:
+            entries = list(operation.entries)
+            entries[entry_index] = PollFdEntry(PollFdMode.SLOT, 0, entry.events)
+            replacements.append(
+                (
+                    f"poll-fd-mode-{entry_index}",
+                    int(PollFdMode.SLOT),
+                    replace(operation, entries=tuple(entries)),
+                )
+            )
+            for value in POLL_LITERAL_FDS:
+                if abs(value) >= abs(entry.fd_arg):
+                    continue
+                entries = list(operation.entries)
+                entries[entry_index] = replace(entry, fd_arg=value)
+                replacements.append(
+                    (
+                        f"poll-fd-arg-{entry_index}",
+                        value,
+                        replace(operation, entries=tuple(entries)),
+                    )
+                )
+        else:
+            for value in _smaller_simple_values(entry.fd_arg, (0, 1, 2, 3)):
+                entries = list(operation.entries)
+                entries[entry_index] = replace(entry, fd_arg=value)
+                replacements.append(
+                    (
+                        f"poll-fd-arg-{entry_index}",
+                        value,
+                        replace(operation, entries=tuple(entries)),
+                    )
+                )
+        for value in _smaller_simple_values(
+            entry.events,
+            (0, 1, 2, 4, 8, 16, 32, 64),
+        ):
+            entries = list(operation.entries)
+            entries[entry_index] = replace(entry, events=value)
+            replacements.append(
+                (
+                    f"poll-mask-{entry_index}",
+                    value,
+                    replace(operation, entries=tuple(entries)),
+                )
+            )
+
+    ordered_entries = tuple(sorted(operation.entries, key=_poll_entry_sort_key))
+    if ordered_entries != operation.entries:
+        replacements.append(
+            (
+                "poll-entry-order",
+                0,
+                replace(operation, entries=ordered_entries),
+            )
+        )
+    return replacements
+
+
 def _delete_operations(
     reduction_input: ReductionInput,
     scenario_index: int,
@@ -665,6 +742,16 @@ def _replace_operation_slots(
         ),
     ):
         return replace(operation, slot=rename(operation.slot))
+    if isinstance(operation, PollMany):
+        return replace(
+            operation,
+            entries=tuple(
+                replace(entry, fd_arg=rename(entry.fd_arg))
+                if entry.fd_mode == PollFdMode.SLOT
+                else entry
+                for entry in operation.entries
+            ),
+        )
     if isinstance(operation, (Dup, Dup2, Dup3)):
         return replace(
             operation,
@@ -700,6 +787,12 @@ def _operation_slots(operation: Operation) -> Tuple[int, ...]:
         ),
     ):
         return (operation.slot,)
+    if isinstance(operation, PollMany):
+        return tuple(
+            entry.fd_arg
+            for entry in operation.entries
+            if entry.fd_mode == PollFdMode.SLOT
+        )
     raise TypeError(f"unsupported operation type: {type(operation).__name__}")
 
 
@@ -723,11 +816,33 @@ def _operation_parameter_cost(operation: Operation) -> int:
         )
     if isinstance(operation, Poll):
         return operation.events
+    if isinstance(operation, PollMany):
+        return (
+            sum(_poll_entry_cost(entry) for entry in operation.entries)
+            + _poll_entry_order_cost(operation.entries)
+        )
     if isinstance(operation, SetSize):
         return operation.size
     if isinstance(operation, (Pipe2, SetStatusFlags, SetFdFlags, Dup3)):
         return operation.flags
     return 0
+
+
+def _poll_entry_cost(entry: PollFdEntry) -> int:
+    return 1 + int(entry.fd_mode) + abs(entry.fd_arg) + entry.events
+
+
+def _poll_entry_sort_key(entry: PollFdEntry) -> Tuple[int, int, int]:
+    return int(entry.fd_mode), entry.fd_arg, entry.events
+
+
+def _poll_entry_order_cost(entries: Sequence[PollFdEntry]) -> int:
+    keys = tuple(_poll_entry_sort_key(entry) for entry in entries)
+    return sum(
+        left > right
+        for left_index, left in enumerate(keys)
+        for right in keys[left_index + 1 :]
+    )
 
 
 def _uses_slot_as_destination(operation: Operation, slot: int) -> bool:

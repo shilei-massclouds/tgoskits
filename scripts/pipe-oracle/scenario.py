@@ -9,10 +9,12 @@ from typing import Dict, Iterable, Optional, Tuple, Union
 
 LEGACY_CORPUS_VERSION = 1
 FD_CORPUS_VERSION = 2
-CORPUS_VERSION = 3
+VECTOR_CORPUS_VERSION = 3
+CORPUS_VERSION = 4
 MAX_LOGICAL_SLOTS = 16
 MAX_IO_BYTES = 8192
 MAX_IOV_SEGMENTS = 4
+MAX_POLL_FDS = 4
 MAX_POLL_MASK = 32767
 MAX_PIPE_SIZE = 2147483647
 MAX_FLAG_VALUE = 2147483647
@@ -42,6 +44,7 @@ DUP3_FLAG_VALUES = (
     UNKNOWN_FLAG,
 )
 IOVCNT_VALUES = (-1, 0, 1, 2, 3, 4, 1025)
+POLL_LITERAL_FDS = (-2, -1, 2147483647)
 
 
 class IovMode(IntEnum):
@@ -52,6 +55,11 @@ class IovMode(IntEnum):
 class IovBaseMode(IntEnum):
     VALID = 0
     INVALID = 1
+
+
+class PollFdMode(IntEnum):
+    SLOT = 0
+    LITERAL = 1
 
 
 @dataclass(frozen=True)
@@ -190,6 +198,21 @@ class Poll:
 
 
 @dataclass(frozen=True)
+class PollFdEntry:
+    fd_mode: PollFdMode
+    fd_arg: int
+    events: int
+
+
+@dataclass(frozen=True)
+class PollMany:
+    entries: Tuple[PollFdEntry, ...]
+
+    def __init__(self, entries: Iterable[PollFdEntry]):
+        object.__setattr__(self, "entries", tuple(entries))
+
+
+@dataclass(frozen=True)
 class SetSize:
     slot: int
     size: int
@@ -222,6 +245,7 @@ Operation = Union[
     Dup3,
     Close,
     Poll,
+    PollMany,
     SetSize,
     GetSize,
     Fionread,
@@ -297,6 +321,7 @@ class ScenarioEntryLimitError(ValueError):
         super().__init__(f"{category.value}: {detail}")
 
 
+_DECIMAL = re.compile(r"^[+-]?[0-9]+$")
 _DECIMAL_OR_HEX = re.compile(r"^[+-]?(?:[0-9]+|0[xX][0-9a-fA-F]+)$")
 
 
@@ -329,6 +354,7 @@ def parse_document(encoded: Union[str, bytes]) -> ScenarioDocument:
             if version not in (
                 LEGACY_CORPUS_VERSION,
                 FD_CORPUS_VERSION,
+                VECTOR_CORPUS_VERSION,
                 CORPUS_VERSION,
             ):
                 _raise(line_number, CodecErrorCategory.INVALID_VERSION, line)
@@ -499,6 +525,17 @@ def format_operation(operation: Operation, version: int = CORPUS_VERSION) -> str
         return f"close {operation.slot}"
     if isinstance(operation, Poll):
         return f"poll {operation.slot} {operation.events}"
+    if isinstance(operation, PollMany):
+        fields = ["poll-many", str(len(operation.entries))]
+        for entry in operation.entries:
+            fields.extend(
+                (
+                    str(int(entry.fd_mode)),
+                    str(entry.fd_arg),
+                    str(entry.events),
+                )
+            )
+        return " ".join(fields)
     if isinstance(operation, SetSize):
         return f"set-size {operation.slot} {operation.size}"
     if isinstance(operation, GetSize):
@@ -525,9 +562,13 @@ def _decode_text(encoded: Union[str, bytes]) -> str:
 def _parse_operation(fields, line_number: int, version: int) -> Operation:
     keyword = fields[0]
     if keyword in ("readv", "writev"):
-        if version != CORPUS_VERSION:
+        if version < VECTOR_CORPUS_VERSION:
             _raise(line_number, CodecErrorCategory.UNKNOWN_OPERATION, keyword)
         return _parse_vector_operation(fields, line_number, keyword == "writev")
+    if keyword == "poll-many":
+        if version != CORPUS_VERSION:
+            _raise(line_number, CodecErrorCategory.UNKNOWN_OPERATION, keyword)
+        return _parse_poll_many(fields, line_number)
     arities = {
         "pipe2": 3 if version == LEGACY_CORPUS_VERSION else 4,
         "read": 3,
@@ -693,6 +734,50 @@ def _parse_vector_operation(fields, line_number: int, write_side: bool) -> Opera
     return Readv(slot, iov_mode, iovcnt, segments)
 
 
+def _parse_poll_many(fields, line_number: int) -> PollMany:
+    if len(fields) < 2:
+        _raise(line_number, CodecErrorCategory.INVALID_ARITY, " ".join(fields))
+    count = _range(
+        _parse_decimal_integer(fields[1], line_number),
+        0,
+        MAX_POLL_FDS,
+        line_number,
+        "poll entry count",
+    )
+    if len(fields) != 2 + count * 3:
+        _raise(line_number, CodecErrorCategory.INVALID_ARITY, " ".join(fields))
+
+    entries = []
+    for entry_index in range(count):
+        start = 2 + entry_index * 3
+        fd_mode = _poll_fd_mode(
+            _parse_decimal_integer(fields[start], line_number), line_number
+        )
+        fd_arg = _poll_fd_arg(
+            fd_mode,
+            _parse_decimal_integer(fields[start + 1], line_number),
+            line_number,
+        )
+        events = _range(
+            _parse_decimal_integer(fields[start + 2], line_number),
+            0,
+            MAX_POLL_MASK,
+            line_number,
+            "poll mask",
+        )
+        entries.append(PollFdEntry(fd_mode, fd_arg, events))
+    return PollMany(entries)
+
+
+def _parse_decimal_integer(text: str, line_number: int) -> int:
+    if not _DECIMAL.fullmatch(text):
+        _raise(line_number, CodecErrorCategory.INVALID_NUMBER, text)
+    try:
+        return int(text, 10)
+    except ValueError:
+        _raise(line_number, CodecErrorCategory.INVALID_NUMBER, text)
+
+
 def _parse_integer(text: str, line_number: int) -> int:
     if not _DECIMAL_OR_HEX.fullmatch(text):
         _raise(line_number, CodecErrorCategory.INVALID_NUMBER, text)
@@ -756,6 +841,29 @@ def _iovcnt(value: int, line_number: int) -> int:
             line_number,
             CodecErrorCategory.OUT_OF_RANGE,
             f"unsupported iovcnt {value}",
+        )
+    return value
+
+
+def _poll_fd_mode(value: int, line_number: int) -> PollFdMode:
+    try:
+        return PollFdMode(value)
+    except ValueError:
+        _raise(
+            line_number,
+            CodecErrorCategory.OUT_OF_RANGE,
+            f"unsupported poll fd mode {value}",
+        )
+
+
+def _poll_fd_arg(mode: PollFdMode, value: int, line_number: int) -> int:
+    if mode == PollFdMode.SLOT:
+        return _slot(value, line_number)
+    if value not in POLL_LITERAL_FDS:
+        _raise(
+            line_number,
+            CodecErrorCategory.OUT_OF_RANGE,
+            f"unsupported literal poll fd {value}",
         )
     return value
 

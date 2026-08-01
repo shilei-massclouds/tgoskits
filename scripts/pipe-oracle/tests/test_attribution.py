@@ -426,6 +426,59 @@ class ExactAttributionRegressionTests(unittest.TestCase):
             with self.assertRaisesRegex(Exception, "unsupported attribution target set"):
                 attribution.AttributionStore(workspace).load_job(job.job_id)
 
+    def test_vector_schema_v4_job_loads_only_with_pipe_vector_target(self):
+        import attribution_schema
+
+        document = scenario.parse_document(
+            "version 3\nscenario vector\npipe2 0 1 2048\nreadv 0 0 0 0\n"
+        )
+        entry = attribution.AttributionInput.from_document(
+            document,
+            corpus.CorpusProvenance.generated(),
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            store = attribution.AttributionStore(workspace)
+            with self._evidence(
+                workspace,
+                "vector-v4",
+                {"vector-region"},
+                b"vector elf",
+            ) as evidence:
+                job = store.create_job(
+                    "vector-attribution",
+                    fuzz_seed=3,
+                    batch_index=0,
+                    entries=(entry,),
+                    baseline_regions=set(),
+                    target_regions={"vector-region"},
+                    initial_evidence=evidence,
+                    duration_seconds=0.1,
+                )
+
+            metadata_path = job.path / "metadata.json"
+            metadata = json.loads(metadata_path.read_text())
+            metadata["schema_version"] = 4
+            metadata["generator_version"] = "4"
+            metadata["target_set_id"] = "pipe-vector-v3"
+            metadata_path.write_text(json.dumps(metadata))
+            result_path = job.path / "replays/attempt-0001-batch/coverage.json"
+            result = json.loads(result_path.read_text())
+            result["schema_version"] = 4
+            result["target_set_id"] = "pipe-vector-v3"
+            result_path.write_text(json.dumps(result))
+
+            loaded = attribution.AttributionStore(workspace).load_job(job.job_id)
+            self.assertEqual(
+                attribution_schema.job_target_set_id(loaded.metadata),
+                "pipe-vector-v3",
+            )
+
+            metadata["target_set_id"] = "pipe-poll-v4"
+            metadata_path.write_text(json.dumps(metadata))
+            with self.assertRaisesRegex(Exception, "unsupported attribution target set"):
+                attribution.AttributionStore(workspace).load_job(job.job_id)
+
     def test_job_preserves_host_oracle_executable_mode(self):
         document = scenario.parse_document(
             "version 1\nscenario only\npipe2 0 1\n"

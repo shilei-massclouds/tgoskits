@@ -250,6 +250,74 @@ class PipeOracleRegressionTests(unittest.TestCase):
         self.assertEqual(scenario.parse_document(canonical), document)
         self._assert_host_record_compare(canonical)
 
+    def test_v4_poll_many_round_trip_and_trace_preserves_order_and_revents(self):
+        encoded = (
+            "version 4\n"
+            "scenario poll-array\n"
+            "pipe2 0 1 526336\n"
+            "write 1 1 65\n"
+            "poll-many 0\n"
+            "poll-many 4 1 -2 1 1 -1 4 1 2147483647 4 0 0 1\n"
+            "poll-many 4 0 0 1 0 0 1 0 1 4 0 0 0\n"
+        )
+
+        document = scenario.parse_document(encoded)
+        canonical = scenario.serialize_document(document)
+        poll_many = document.scenarios[0].operations[2:]
+
+        self.assertEqual(
+            canonical,
+            encoded.replace("scenario poll-array", "scenario generated-0001"),
+        )
+        self.assertTrue(all(isinstance(operation, scenario.PollMany) for operation in poll_many))
+        self.assertEqual([len(operation.entries) for operation in poll_many], [0, 4, 4])
+        self.assertEqual(scenario.parse_document(canonical), document)
+        records = self._record_host_records(canonical)
+
+        self.assertEqual((records[2].kind, records[2].result, records[2].value), (20, 0, 0))
+        self.assertEqual(records[2].data_len, 0)
+        self.assertEqual((records[3].kind, records[3].result, records[3].value), (20, 2, 4))
+        self.assertEqual(records[3].data_len, 8)
+        self.assertEqual(bytes(records[3].data[:8]), b"\x00\x00\x00\x00\x20\x00\x01\x00")
+        self.assertEqual((records[4].kind, records[4].result, records[4].value), (20, 3, 4))
+        self.assertEqual(bytes(records[4].data[:8]), b"\x01\x00\x01\x00\x04\x00\x00\x00")
+        self._assert_host_record_compare(canonical)
+
+    def test_poll_many_codec_rejects_versions_counts_modes_args_masks_and_arity(self):
+        invalid_documents = (
+            "version 3\nscenario x\npoll-many 0\n",
+            "version 4\nscenario x\npoll-many -1\n",
+            "version 4\nscenario x\npoll-many 5\n",
+            "version 4\nscenario x\npoll-many 1\n",
+            "version 4\nscenario x\npoll-many 0 0 0 1\n",
+            "version 4\nscenario x\npoll-many 1 2 0 1\n",
+            "version 4\nscenario x\npoll-many 1 0 -1 1\n",
+            "version 4\nscenario x\npoll-many 1 0 16 1\n",
+            "version 4\nscenario x\npoll-many 1 1 0 1\n",
+            "version 4\nscenario x\npoll-many 1 1 -3 1\n",
+            "version 4\nscenario x\npoll-many 1 1 -2 32768\n",
+            "version 4\nscenario x\npoll-many 0x0\n",
+            "version 4\nscenario x\npoll-many 1 0x0 0 1\n",
+            "version 4\nscenario x\npoll-many 1 0 0x0 1\n",
+            "version 4\nscenario x\npoll-many 1 0 0 0x1\n",
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary = Path(temporary_directory)
+            ops = temporary / "pipe.ops"
+            trace = temporary / "linux.trace"
+            for encoded in invalid_documents:
+                with self.subTest(encoded=encoded):
+                    with self.assertRaises(scenario.ScenarioCodecError):
+                        scenario.parse_document(encoded)
+                    ops.write_text(encoded)
+                    recorded = subprocess.run(
+                        [str(self.oracle), "--record", str(ops), str(trace)],
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertNotEqual(recorded.returncode, 0)
+
     def test_vector_codec_rejects_versions_fields_modes_counts_and_shapes(self):
         invalid_documents = (
             "version 1\nscenario x\nreadv 0 0 0 0\n",
@@ -515,7 +583,7 @@ class PipeOracleRegressionTests(unittest.TestCase):
                 2,
             ),
             (
-                "version 4\nscenario x\npipe2 0 1\n",
+                "version 5\nscenario x\npipe2 0 1\n",
                 scenario.CodecErrorCategory.INVALID_VERSION,
                 1,
             ),
@@ -670,10 +738,11 @@ class PipeOracleRegressionTests(unittest.TestCase):
         )
         self.assertEqual(compared.returncode, 0, compared.stderr)
 
-    def test_v2_trace_remains_compatible_but_v3_requires_trace_v3(self):
+    def test_old_trace_versions_remain_compatible_and_v4_requires_trace_v4(self):
         corpora = {
             2: "version 2\nscenario fd\npipe2 0 1 2048\nget-fd-flags 0\n",
             3: "version 3\nscenario vector\npipe2 0 1 2048\nreadv 0 0 0 0\n",
+            4: "version 4\nscenario poll\npoll-many 0\n",
         }
         for corpus_version, corpus_text in corpora.items():
             with self.subTest(corpus_version=corpus_version), tempfile.TemporaryDirectory() as temporary_directory:
@@ -688,8 +757,11 @@ class PipeOracleRegressionTests(unittest.TestCase):
                 )
                 self.assertEqual(recorded.returncode, 0, recorded.stderr)
                 encoded = trace.read_bytes()
+                old_trace_version = corpus_version if corpus_version < 4 else 3
                 trace.write_bytes(
-                    encoded[:8] + (2).to_bytes(4, "little") + encoded[12:]
+                    encoded[:8]
+                    + old_trace_version.to_bytes(4, "little")
+                    + encoded[12:]
                 )
                 compared = subprocess.run(
                     [str(self.oracle), "--compare", str(ops), str(trace)],
@@ -697,14 +769,11 @@ class PipeOracleRegressionTests(unittest.TestCase):
                     text=True,
                 )
 
-                if corpus_version == 2:
+                if corpus_version < 4:
                     self.assertEqual(compared.returncode, 0, compared.stderr)
                 else:
                     self.assertNotEqual(compared.returncode, 0)
-                    self.assertIn(
-                        "version-3 corpus requires a version-3 trace",
-                        compared.stderr,
-                    )
+                    self.assertIn(f"version-{corpus_version} corpus requires", compared.stderr)
 
     def test_multi_entry_batch_is_one_canonical_corpus_accepted_by_the_oracle(self):
         documents = [
@@ -713,7 +782,7 @@ class PipeOracleRegressionTests(unittest.TestCase):
         ]
         corpus = scenario.serialize_document(scenario.combine_documents(documents))
 
-        self.assertEqual(corpus.count("version 3\n"), 1)
+        self.assertEqual(corpus.count("version 4\n"), 1)
         scenario_names = [
             line.split(maxsplit=1)[1]
             for line in corpus.splitlines()
@@ -778,7 +847,7 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
         compact = json.dumps(selected, separators=(",", ":"))
         self.assertEqual(
             hashlib.sha256(compact.encode()).hexdigest(),
-            "c83784cc832311f19d9df4218de263521d12a2d639442c242e4e55760c012d09",
+            "7c8b3c9ae49cf6bf4766b6e3881b13c83a9b88c803ef117343ee3022f3675b92",
         )
 
     def test_every_structural_mutation_changes_digest_and_stays_within_limits(self):
@@ -902,8 +971,8 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
             store = corpus.CorpusStore(Path(temporary_directory))
             run_path = store.save_run("run-0001", metadata)
             saved = json.loads((run_path / "metadata.json").read_text())
-        self.assertEqual(saved["schema_version"], 5)
-        self.assertEqual(saved["target_set_id"], "pipe-vector-v3")
+        self.assertEqual(saved["schema_version"], 6)
+        self.assertEqual(saved["target_set_id"], "pipe-poll-v4")
         self.assertEqual(saved["generator_version"], generator.GENERATOR_VERSION)
         self.assertEqual(saved["result"], "passed")
 
@@ -1152,7 +1221,89 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
             )
         )
 
-    def test_mutation_repair_upgrades_to_v3_and_synthesizes_only_nonblocking_setup(self):
+        poll_many = [
+            operation
+            for operation in operations
+            if isinstance(operation, scenario.PollMany)
+        ]
+        self.assertEqual(
+            {len(operation.entries) for operation in poll_many},
+            set(range(scenario.MAX_POLL_FDS + 1)),
+        )
+        self.assertEqual(
+            {
+                entry.fd_arg
+                for operation in poll_many
+                for entry in operation.entries
+                if entry.fd_mode == scenario.PollFdMode.LITERAL
+            },
+            set(scenario.POLL_LITERAL_FDS),
+        )
+        slot_lists = [
+            [
+                entry.fd_arg
+                for entry in operation.entries
+                if entry.fd_mode == scenario.PollFdMode.SLOT
+            ]
+            for operation in poll_many
+        ]
+        self.assertTrue(any(len(slots) != len(set(slots)) for slots in slot_lists))
+        self.assertTrue(any(len(set(slots)) >= 2 for slots in slot_lists))
+        self.assertTrue(self._generated_poll_many_reaches_alias_and_closed_peer(first))
+
+    def test_poll_many_parameter_mutation_changes_shape_fd_reference_order_and_mask(self):
+        operation = scenario.PollMany(
+            (
+                scenario.PollFdEntry(scenario.PollFdMode.SLOT, 3, 1),
+                scenario.PollFdEntry(scenario.PollFdMode.LITERAL, -2, 4),
+            )
+        )
+
+        mutations = {
+            family: mutation._mutate_operation_parameter(
+                generator.CampaignRng(seed),
+                operation,
+                family,
+                entry_index,
+            )
+            for seed, (family, entry_index) in enumerate(
+                (
+                    ("poll-entry-add", None),
+                    ("poll-entry-delete", None),
+                    ("poll-entry-duplicate", None),
+                    ("poll-entry-swap", None),
+                    ("poll-fd-mode", 0),
+                    ("poll-fd-arg", 0),
+                    ("poll-many-mask", 0),
+                ),
+                start=1,
+            )
+        }
+
+        self.assertEqual(len(mutations["poll-entry-add"].entries), 3)
+        self.assertEqual(len(mutations["poll-entry-delete"].entries), 1)
+        self.assertEqual(len(mutations["poll-entry-duplicate"].entries), 3)
+        self.assertEqual(
+            mutations["poll-entry-swap"].entries,
+            tuple(reversed(operation.entries)),
+        )
+        self.assertNotEqual(
+            mutations["poll-fd-mode"].entries[0].fd_mode,
+            operation.entries[0].fd_mode,
+        )
+        self.assertNotEqual(
+            mutations["poll-fd-arg"].entries[0].fd_arg,
+            operation.entries[0].fd_arg,
+        )
+        self.assertNotEqual(
+            mutations["poll-many-mask"].entries[0].events,
+            operation.entries[0].events,
+        )
+        for mutated in mutations.values():
+            document = scenario.ScenarioDocument([scenario.Scenario([mutated])])
+            scenario.parse_document(scenario.serialize_document(document))
+
+    def test_mutation_repair_upgrades_to_v4_and_synthesizes_only_nonblocking_setup(self):
         unsafe_document = scenario.ScenarioDocument(
             [
                 scenario.Scenario(
@@ -1168,7 +1319,7 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
         encoded = scenario.serialize_document(repaired)
         operations = repaired.scenarios[0].operations
 
-        self.assertTrue(encoded.startswith("version 3\n"))
+        self.assertTrue(encoded.startswith("version 4\n"))
         self.assertEqual(
             operations,
             (
@@ -1590,6 +1741,14 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
                             "filename": "/checkout/os/StarryOS/kernel/src/mm/io.rs",
                             "segments": [[50, 9, 5, True, True, False]],
                         },
+                        {
+                            "filename": "/checkout/os/StarryOS/kernel/src/syscall/io_mpx/poll.rs",
+                            "segments": [[60, 10, 7, True, True, False]],
+                        },
+                        {
+                            "filename": "/checkout/os/StarryOS/kernel/src/syscall/io_mpx/mod.rs",
+                            "segments": [[70, 11, 8, True, True, False]],
+                        },
                     ]
                 }
             ]
@@ -1597,6 +1756,18 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
         region_ids = coverage.covered_pipe_region_ids(export)
         self.assertEqual(
             region_ids,
+            {
+                "os/StarryOS/kernel/src/file/pipe.rs:10:2",
+                "os/StarryOS/kernel/src/syscall/fs/pipe.rs:20:4",
+                "os/StarryOS/kernel/src/syscall/fs/fd_ops.rs:30:6",
+                "os/StarryOS/kernel/src/syscall/fs/io.rs:40:8",
+                "os/StarryOS/kernel/src/mm/io.rs:50:9",
+                "os/StarryOS/kernel/src/syscall/io_mpx/poll.rs:60:10",
+                "os/StarryOS/kernel/src/syscall/io_mpx/mod.rs:70:11",
+            },
+        )
+        self.assertEqual(
+            coverage.covered_pipe_region_ids(export, coverage.VECTOR_TARGET_SET_ID),
             {
                 "os/StarryOS/kernel/src/file/pipe.rs:10:2",
                 "os/StarryOS/kernel/src/syscall/fs/pipe.rs:20:4",
@@ -1715,7 +1886,7 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
             encoded = trace.read_bytes()
 
         header = TraceHeader.from_buffer_copy(encoded)
-        self.assertEqual(header.version, 3)
+        self.assertEqual(header.version, 4)
         offset = ctypes.sizeof(TraceHeader)
         record_size = ctypes.sizeof(OperationResult)
         self.assertEqual(len(encoded), offset + header.record_count * record_size)
@@ -1743,6 +1914,48 @@ print(json.dumps([(item.kind, item.classification.value, item.digest) for item i
             "write 4 8192 255\n"
             "read 3 4095\n"
         )
+
+    @staticmethod
+    def _generated_poll_many_reaches_alias_and_closed_peer(documents):
+        alias_reached = False
+        closed_peer_reached = False
+        for document in documents:
+            for item in document.scenarios:
+                descriptions = {}
+                peer_slots = {}
+                closed_slots = set()
+                next_description = 0
+                for operation in item.operations:
+                    if isinstance(operation, scenario.Pipe2) and (
+                        operation.flags & ~scenario.PIPE2_ALLOWED_FLAGS == 0
+                    ):
+                        descriptions[operation.read_slot] = next_description
+                        descriptions[operation.write_slot] = next_description + 1
+                        next_description += 2
+                        peer_slots[operation.read_slot] = operation.write_slot
+                        peer_slots[operation.write_slot] = operation.read_slot
+                    elif isinstance(operation, (scenario.Dup, scenario.Dup2, scenario.Dup3)):
+                        if operation.source_slot in descriptions:
+                            descriptions[operation.destination_slot] = descriptions[
+                                operation.source_slot
+                            ]
+                    elif isinstance(operation, scenario.Close):
+                        descriptions.pop(operation.slot, None)
+                        closed_slots.add(operation.slot)
+                    elif isinstance(operation, scenario.PollMany):
+                        slots = [
+                            entry.fd_arg
+                            for entry in operation.entries
+                            if entry.fd_mode == scenario.PollFdMode.SLOT
+                        ]
+                        description_ids = [
+                            descriptions[slot] for slot in slots if slot in descriptions
+                        ]
+                        alias_reached |= len(description_ids) != len(set(description_ids))
+                        closed_peer_reached |= any(
+                            peer_slots.get(slot) in closed_slots for slot in slots
+                        )
+        return alias_reached and closed_peer_reached
 
 
 if __name__ == "__main__":
