@@ -12,7 +12,10 @@ capability fix on 2026-08-01. Stage 3.2b-2 added bounded timeout-zero multi-fd
 on 2026-08-01. This document records the design and implementation of the
 script-driven pipe differential oracle. Stage 4.1 added the restricted
 syzkaller program importer, external-source provenance, and opt-in stable-input
-admission on 2026-08-01.
+admission on 2026-08-01. Stage 4.2 added lossless pinned `readv`/`writev`
+conversion, report schema v2, and deterministic admission selection on
+2026-08-01 without changing the oracle IR, trace, harness, coverage target, or
+Starry syscall ABI.
 
 Base: `dev-cov2` at `fb399d055`.
 
@@ -114,6 +117,11 @@ The implementation is complete when all of the following hold:
 - explicit `import_syz.py --admit` requires three byte-identical host traces,
   persists every QEMU result before attribution, and admits only exactly
   attributed new coverage;
+- importer v2 losslessly maps the bounded pinned `readv`/`writev` syntax into
+  the existing v4 vector operations;
+- `--max-admit-unique N` selects the lexicographically first `N` accepted
+  canonical digests before any host or QEMU execution while retaining every
+  source for each selected digest;
 - imported corpus and failure artifacts retain the original `.syz`, pinned
   syzkaller revision, importer version, and conversion-log digest;
 - failure artifacts include `input.bin`, `pipe.ops`, `linux.trace`,
@@ -144,8 +152,8 @@ The first implementation deliberately excludes:
 - building or running `syz-manager`, `syz-executor`, or another syzkaller
   runtime as part of import;
 - accepting arbitrary syzkaller calls, threaded/async/repeat properties,
-  blocking I/O, memory aliases, nonzero poll timeouts, or vector I/O in the
-  Stage 4.1 importer;
+  blocking I/O, memory aliases, nonzero poll timeouts, or vector calls other
+  than bounded `readv`/`writev` in the Stage 4.2 importer;
 - changing `pipe.ops` v4, trace v4, the C harness operation set, or the
   `pipe-poll-v4` coverage target for imported programs.
 
@@ -168,6 +176,9 @@ The first implementation deliberately excludes:
 | Fix only `sys_poll` | Narrows the immediate patch | Leaves `ppoll` inconsistent even though both enter the shared implementation | Reject; fix shared `do_poll` and add direct regressions for both syscalls |
 | Run the syzkaller runtime during import | Reuses upstream execution and scheduling | Adds Go/runtime dependencies, a second executor, and non-deterministic features outside the oracle ABI | Reject; parse a pinned syntax subset in Python |
 | Treat accepted `.syz` files as corpus immediately | Simple ingestion | Admits host-unstable inputs and entries with no new, attributable coverage | Reject; require explicit stable admission |
+| Add new importer-only vector operations | Can mirror arbitrary syzkaller vectors | Forks the v4 codec, C harness, trace, reducer, and comparator contracts | Reject; accept exactly the vector boundary already represented by v4 |
+| Stop after the first `N` host-stable or QEMU-tested inputs | Avoids some later execution | Selection depends on host results, batching, and interruption point | Reject; select a canonical-digest prefix before execution |
+| Select the first `N` source paths | Simple to explain | Duplicate canonical inputs consume the limit and path renames change execution | Reject; bound unique canonical digests and retain all selected sources |
 
 ## Architecture
 
@@ -555,7 +566,7 @@ Constraints:
 
 ### Restricted syzkaller import
 
-Stage 4.1 accepts external programs only through the pinned syzkaller revision
+Stage 4.2 accepts external programs only through the pinned syzkaller revision
 `e611ffe1caa28a0228c8f3642cc768f0dba3dd0c`. The importer is pure Python: it
 does not build or invoke Go code, `syz-manager`, `syz-executor`, or
 `syz-prog2c`. The pinned checkout is optional and is used only for a one-time
@@ -579,12 +590,16 @@ reported as rejections, and an individual file is limited to 64 KiB.
 Classification returns zero even when some programs are rejected. Discovery,
 I/O, revision, persistent-state, host-build, QEMU, and semantic failures return
 nonzero. The optional report is atomically replaced. Check-only mode never
-creates or changes `coverage/pipe-oracle-fuzz/`.
+creates or changes `coverage/pipe-oracle-fuzz/`. Report schema v2 retains every
+classification and adds `admission_selection`: policy `canonical-digest`, the
+optional unique limit, eligible/selected/deferred unique counts, and sorted
+selected/deferred digest lists. With no admission limit, every eligible digest
+is selected.
 
-The Stage 4.1 call allowlist is:
+The Stage 4.2 call allowlist is:
 
 - `pipe` and `pipe2`;
-- `read`, `write`, `close`, `dup`, `dup2`, and `dup3`;
+- `read`, `write`, `readv`, `writev`, `close`, `dup`, `dup2`, and `dup3`;
 - `fcntl$getflags`, `fcntl$setflags`, `fcntl$setstatus`, and `fcntl$setpipe`
   only for the commands represented by the v4 IR;
 - `ioctl$int_out` only for `FIONREAD`; and
@@ -602,20 +617,53 @@ preserve entry order, duplicate resources, literal fds, events, and zero input
 `revents`. The existing IR validator remains authoritative for nonblocking
 proofs and entry, operation, slot, and encoding limits.
 
+Importer version 2 accepts assignment-free, three-argument `readv` and
+`writev` calls only. The fd follows the same live-resource and close-generation
+rules as scalar I/O. The outer iovec pointer remains either valid or invalid;
+supported `iovcnt` values are `-1`, `0..4`, and `1025`. A valid pointer has
+exactly `iovcnt` entries for counts `0..4` and no entries for the two invalid
+count boundaries. Each entry is the pinned two-field iovec struct. The sum of
+at most four segment lengths is at most 8192 bytes. Each base independently
+preserves valid/invalid pointer state, including at length zero. Valid buffers
+must be initialized ordinary strings of at least the segment length; every
+positive `writev` segment prefix must repeat one byte, while different segments
+may use different bytes. Positive executable vector I/O still requires the v4
+validator's static `O_NONBLOCK` proof.
+
+The stable `vector-shape` rejection covers invalid array/count relationships,
+more than four segments, invalid or complex nested buffer shapes, and per-
+segment or total sizes outside the v4 boundary. Existing stable categories
+continue to distinguish nonuniform payloads, anchored overlap within a call or
+across calls, blocking I/O, and entry limits. `preadv`, `pwritev`, `preadv2`,
+`pwritev2`, and `vmsplice` remain `unsupported-call`. Anchored x86_64 iovec
+descriptors use their 16-byte ABI extent for overlap checks; `&AUTO` regions are
+independent allocations under the pinned serializer contract.
+
 Admission is explicit:
 
 ```sh
 ./scripts/pipe-oracle/import_syz.py \
   --syzkaller-revision e611ffe1caa28a0228c8f3642cc768f0dba3dd0c \
   --workspace . \
-  --admit --host-repetitions 3 --batch-size 8 --max-qemu 64 \
+  --admit --max-admit-unique 8 \
+  --host-repetitions 3 --batch-size 8 --max-qemu 64 \
   PATH...
 ```
+
+`--max-admit-unique` is optional, requires `--admit`, and must be positive.
+Before persistence or execution, accepted canonical digests are sorted and the
+first `N` are selected. Every original source that maps to a selected digest is
+retained, while rejected and deferred sources remain only in the top-level
+report. Deferred digests perform zero host records and zero QEMU launches. The
+import-job schema remains v1 and therefore records the selected set implicitly
+through its canonical inputs; no persistent schema migration is required.
 
 The command holds the campaign lock for recovery and new work. It first
 resumes import jobs, including their child attribution and minimization jobs,
 then resumes unrelated global attribution and minimization work. This ordering
 keeps every resumed child launch inside its import job's total QEMU budget.
+Saved jobs, including importer-v1 jobs, are always resumed before applying the
+new report's selection. A v1 job cannot match or suppress an importer-v2 report.
 Every unique canonical input is recorded on the host three times by default,
 and the normalized trace bytes must be identical. Stable inputs are grouped in
 canonical-digest order. Each group gets one fresh host trace and one Starry
@@ -638,6 +686,33 @@ contains `source.syz`, `conversion-log.json`, their digests, the full revision,
 importer version, combined `pipe.ops`, trace, guest log, ELFs, and profraws.
 Mismatch minimization preserves that v3 source evidence. No importer-specific
 operation or comparator exception is added to the C harness.
+
+The version bump changes only new conversion provenance and report matching.
+Strict readers continue to accept existing importer-v1 jobs, external-source
+provenance, imported failures, and corpus entries because importer version is a
+nonempty provenance identifier rather than a persistent schema discriminator.
+Rollback can stop creating importer-v2 jobs without rewriting existing state;
+active saved jobs must still be resumed or archived under the normal campaign
+ownership rules.
+
+#### Stage 4.2 pinned-corpus acceptance gate
+
+The aggregate external acceptance remains blocked until a user supplies a
+corpus directory known to come from the pinned revision. The raw external
+corpus is never committed. Acceptance will recursively inspect ordinary `.syz`
+files, reject symlinks, deduplicate by raw SHA-256, and retain only programs
+whose AST contains both `pipe`/`pipe2` and `readv`/`writev`. Candidates are
+ordered by `(program SHA-256, path)` and the first 100 are used. Fewer than 100
+eligible programs blocks acceptance; handwritten samples do not fill the gap.
+
+The 100 inputs first run check-only classification. Admission then uses
+`--max-admit-unique 8 --max-qemu 64 --batch-size 8 --host-repetitions 3`.
+The acceptance-only documentation commit will record the SHA-256 of the whole
+ordered input manifest, accepted/rejected/unique counts, rejection categories,
+host stability, QEMU counts, coverage across the seven target files, exact
+attribution rate, and sizes before/after minimization. Until that evidence
+exists, fixed fixtures and local regression/host/QEMU validation prove the
+implementation boundary but do not claim pinned-corpus aggregate acceptance.
 
 ### Persistent corpus ownership and schema
 
@@ -1160,6 +1235,10 @@ independently.
   bounded timeout-zero multi-fd poll.
 - Stage 4.1 is complete: pinned restricted syzkaller parsing, durable external
   provenance, check-only reporting, and opt-in stable admission.
+- Stage 4.2 implementation is complete: importer-v2 vector conversion and
+  bounded canonical-digest admission preserve the existing v4/runtime
+  contracts. Aggregate acceptance remains gated on a user-supplied 100-program
+  corpus from the pinned revision.
 - A later stage may evaluate blocking/concurrent scenarios, cross-architecture
   differential coverage, or automatic CI regression detection. It must receive
   separate design evidence, must not silently expand the Stage 4.1 allowlist,

@@ -36,8 +36,17 @@ class InputDiscoveryError(RuntimeError):
 def build_check_report(
     paths: Iterable[Path],
     syzkaller_revision: str,
+    *,
+    max_admit_unique: Optional[int] = None,
 ) -> Tuple[Dict[str, object], bool]:
     """Discover and classify inputs; return the report and infrastructure status."""
+
+    if max_admit_unique is not None and (
+        not isinstance(max_admit_unique, int)
+        or isinstance(max_admit_unique, bool)
+        or max_admit_unique <= 0
+    ):
+        raise ValueError("max_admit_unique must be positive")
 
     inputs = discover_inputs(paths)
     reports = []
@@ -56,9 +65,18 @@ def build_check_report(
         if report["status"] == "rejected"
     )
     accepted = [report for report in reports if report["status"] == "accepted"]
+    eligible_digests = sorted(
+        {str(report["canonical_digest"]) for report in accepted}
+    )
+    selected_digests = (
+        eligible_digests
+        if max_admit_unique is None
+        else eligible_digests[:max_admit_unique]
+    )
+    deferred_digests = eligible_digests[len(selected_digests) :]
     return (
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "mode": "check-only",
             "syzkaller_revision": syzkaller_revision,
             "supported_syzkaller_revision": SUPPORTED_SYZKALLER_REVISION,
@@ -72,9 +90,75 @@ def build_check_report(
                 ),
                 "rejection_categories": dict(sorted(rejection_counts.items())),
             },
+            "admission_selection": {
+                "policy": "canonical-digest",
+                "max_unique": max_admit_unique,
+                "eligible_unique": len(eligible_digests),
+                "selected_unique": len(selected_digests),
+                "deferred_unique": len(deferred_digests),
+                "selected_digests": selected_digests,
+                "deferred_digests": deferred_digests,
+            },
             "inputs": reports,
         },
         infrastructure_failed,
+    )
+
+
+def selected_admission_reports(
+    report: Dict[str, object],
+) -> Tuple[Dict[str, object], ...]:
+    """Return every accepted source for the report's selected canonical inputs."""
+
+    if report.get("schema_version") != 2:
+        raise ValueError("admission requires check report schema 2")
+    inputs = report.get("inputs")
+    if not isinstance(inputs, list) or any(
+        not isinstance(input_report, dict) for input_report in inputs
+    ):
+        raise ValueError("check report inputs are invalid")
+    eligible_values = [
+        input_report.get("canonical_digest")
+        for input_report in inputs
+        if input_report.get("status") == "accepted"
+    ]
+    if any(
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+        for digest in eligible_values
+    ):
+        raise ValueError("eligible admission digests are invalid")
+    eligible = sorted(set(eligible_values))
+    selection = report["admission_selection"]
+    if not isinstance(selection, dict):
+        raise ValueError("admission selection is not an object")
+    maximum = selection.get("max_unique")
+    if maximum is not None and (
+        not isinstance(maximum, int)
+        or isinstance(maximum, bool)
+        or maximum <= 0
+    ):
+        raise ValueError("admission selection maximum is invalid")
+    selected = eligible if maximum is None else eligible[:maximum]
+    deferred = eligible[len(selected) :]
+    expected = {
+        "policy": "canonical-digest",
+        "max_unique": maximum,
+        "eligible_unique": len(eligible),
+        "selected_unique": len(selected),
+        "deferred_unique": len(deferred),
+        "selected_digests": selected,
+        "deferred_digests": deferred,
+    }
+    if selection != expected:
+        raise ValueError("admission selection does not match classified inputs")
+    selected_set = set(selected)
+    return tuple(
+        input_report
+        for input_report in inputs
+        if input_report.get("status") == "accepted"
+        and input_report.get("canonical_digest") in selected_set
     )
 
 
@@ -252,5 +336,6 @@ __all__ = [
     "classify_input",
     "conversion_log_bytes",
     "discover_inputs",
+    "selected_admission_reports",
     "write_json_report",
 ]

@@ -26,6 +26,7 @@ from reducer import ReductionInput
 from runner import coverage_object, run_guest_compare
 from scenario import parse_document
 from syz_converter import IMPORTER_VERSION
+from syz_import import selected_admission_reports
 
 
 @dataclass(frozen=True)
@@ -191,7 +192,7 @@ def run_admission(
 
     job = import_store.create_job(
         _import_job_id(),
-        reports=check_report["inputs"],
+        reports=selected_admission_reports(check_report),
         syzkaller_revision=str(check_report["syzkaller_revision"]),
         importer_version=IMPORTER_VERSION,
         host_repetitions=host_repetitions,
@@ -1024,7 +1025,10 @@ def _job_matches_report(job: ImportJob, report: Dict[str, object]) -> bool:
         or job.metadata["importer_version"] != report["importer_version"]
     ):
         return False
-    reports = sorted(report["inputs"], key=lambda item: str(item["path"]))
+    reports = sorted(
+        selected_admission_reports(report),
+        key=lambda item: str(item["path"]),
+    )
     sources = job.metadata["sources"]
     if len(reports) != len(sources):
         return False

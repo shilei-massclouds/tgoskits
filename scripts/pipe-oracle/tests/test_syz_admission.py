@@ -163,6 +163,100 @@ class SyzAdmissionTests(unittest.TestCase):
             self.assertEqual(harness.find_calls, 0)
             self.assertEqual(harness.record_calls, 0)
             self.assertEqual(harness.guest_calls, 0)
+            job = ImportStore(workspace).load_jobs()[0]
+            self.assertEqual(job.metadata["sources"], [])
+            self.assertEqual(job.metadata["canonical_inputs"], [])
+
+    def test_default_admission_selects_every_unique_digest(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            report = _unique_report(workspace, 9)
+            harness = AdmissionHarness(workspace)
+
+            admission = _admit(workspace, report, harness)
+
+            self.assertEqual(report["admission_selection"]["max_unique"], None)
+            self.assertEqual(report["admission_selection"]["selected_unique"], 9)
+            self.assertEqual(report["admission_selection"]["deferred_unique"], 0)
+            self.assertEqual(admission["summary"]["host_stable"], 9)
+            self.assertEqual(admission["summary"]["qemu_runs"], 2)
+            self.assertEqual(harness.record_calls, 29)
+            self.assertEqual(harness.guest_calls, 2)
+
+    def test_admission_limit_keeps_duplicate_sources_and_never_executes_deferred(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            report = _unique_report(workspace, 10, max_admit_unique=8)
+            selected_digest = report["admission_selection"]["selected_digests"][0]
+            selected_source = next(
+                Path(item["path"])
+                for item in report["inputs"]
+                if item["canonical_digest"] == selected_digest
+            )
+            (workspace / "duplicate.syz").write_bytes(selected_source.read_bytes())
+            report, failed = build_check_report(
+                (workspace,),
+                SUPPORTED_SYZKALLER_REVISION,
+                max_admit_unique=8,
+            )
+            self.assertFalse(failed)
+            harness = AdmissionHarness(workspace)
+
+            admission = _admit(workspace, report, harness)
+
+            selection = report["admission_selection"]
+            self.assertEqual(selection["eligible_unique"], 10)
+            self.assertEqual(selection["selected_unique"], 8)
+            self.assertEqual(selection["deferred_unique"], 2)
+            self.assertEqual(admission["summary"]["host_stable"], 8)
+            self.assertEqual(admission["summary"]["qemu_runs"], 1)
+            self.assertEqual(harness.record_calls, 25)
+            self.assertEqual(harness.guest_calls, 1)
+            job = ImportStore(workspace).load_jobs()[0]
+            self.assertEqual(len(job.metadata["canonical_inputs"]), 8)
+            self.assertEqual(len(job.metadata["sources"]), 9)
+            self.assertTrue(
+                all(source["status"] == "accepted" for source in job.metadata["sources"])
+            )
+            persisted = {
+                item["digest"] for item in job.metadata["canonical_inputs"]
+            }
+            self.assertEqual(persisted, set(selection["selected_digests"]))
+            self.assertTrue(persisted.isdisjoint(selection["deferred_digests"]))
+
+    def test_v1_job_resumes_before_v2_selection_and_is_not_reused(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            report = _unique_report(workspace, 2, max_admit_unique=1)
+            selected_digest = report["admission_selection"]["selected_digests"][0]
+            selected_report = next(
+                item
+                for item in report["inputs"]
+                if item["canonical_digest"] == selected_digest
+            )
+            store = ImportStore(workspace)
+            store.create_job(
+                "import-v1",
+                reports=(selected_report,),
+                syzkaller_revision=SUPPORTED_SYZKALLER_REVISION,
+                importer_version="1",
+                host_repetitions=3,
+                batch_size=8,
+                max_qemu=64,
+            )
+            harness = AdmissionHarness(workspace)
+
+            admission = _admit(workspace, report, harness)
+
+            self.assertEqual(len(admission["jobs"]), 2)
+            self.assertEqual(admission["jobs"][0]["job_id"], "import-v1")
+            self.assertEqual(harness.record_calls, 8)
+            self.assertEqual(harness.guest_calls, 2)
+            jobs = store.load_jobs()
+            self.assertEqual(
+                sorted(job.metadata["importer_version"] for job in jobs),
+                ["1", "2"],
+            )
 
     def test_saved_batch_evidence_prevents_duplicate_qemu_after_interruption(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -449,6 +543,29 @@ def _accepted_report(workspace: Path):
     report, failed = build_check_report(
         (source,),
         SUPPORTED_SYZKALLER_REVISION,
+    )
+    if failed:
+        raise AssertionError("test classification unexpectedly failed")
+    return report
+
+
+def _unique_report(
+    workspace: Path,
+    count: int,
+    *,
+    max_admit_unique=None,
+):
+    for index in range(count):
+        length = index + 1
+        payload = chr(ord("A") + index) * length
+        (workspace / f"accepted-{index:02d}.syz").write_text(
+            "pipe2(&AUTO={<r0=>0, <r1=>0}, 0x800)\n"
+            f"write(r1, &AUTO='{payload}', {length})\n"
+        )
+    report, failed = build_check_report(
+        (workspace,),
+        SUPPORTED_SYZKALLER_REVISION,
+        max_admit_unique=max_admit_unique,
     )
     if failed:
         raise AssertionError("test classification unexpectedly failed")

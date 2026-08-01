@@ -36,6 +36,12 @@ def main() -> int:
     parser.add_argument("--host-repetitions", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--max-qemu", type=int, default=64)
+    parser.add_argument(
+        "--max-admit-unique",
+        type=int,
+        metavar="N",
+        help="Admit only the first N unique canonical digests",
+    )
     parser.add_argument("paths", metavar="PATH", type=Path, nargs="+")
     args = parser.parse_args()
     if not re.fullmatch(r"[0-9a-f]{40}", args.syzkaller_revision):
@@ -51,11 +57,16 @@ def main() -> int:
         parser.error("--batch-size must be positive")
     if args.max_qemu < 0:
         parser.error("--max-qemu must be nonnegative")
+    if args.max_admit_unique is not None and not args.admit:
+        parser.error("--max-admit-unique requires --admit")
+    if args.max_admit_unique is not None and args.max_admit_unique <= 0:
+        parser.error("--max-admit-unique must be positive")
 
     try:
         report, infrastructure_failed = build_check_report(
             args.paths,
             args.syzkaller_revision,
+            max_admit_unique=args.max_admit_unique,
         )
         admission_failed = False
         if args.admit and not infrastructure_failed:
