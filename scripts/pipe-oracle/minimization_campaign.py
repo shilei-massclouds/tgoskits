@@ -10,8 +10,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Set, Tuple
 
-from corpus import CorpusStore
-from artifact import build_failure_metadata_v2, validate_failure
+from corpus import CorpusStore, ExternalSource
+from artifact import (
+    build_failure_metadata_v2,
+    build_failure_metadata_v3,
+    validate_failure,
+)
 from common import atomic_save, save_metadata
 from generator import GENERATOR_VERSION
 from fingerprint import MismatchFingerprint
@@ -368,19 +372,36 @@ def _save_minimized_mismatch(corpus_store: CorpusStore, job: MinimizationJob) ->
         profraws.mkdir()
         for item in sorted((final_evidence / "profraws").iterdir(), key=lambda path: path.name):
             shutil.copy2(item, profraws / item.name)
-        metadata = build_failure_metadata_v2(
-            temporary,
-            generator_version=source_metadata.get(
+        metadata_arguments = {
+            "generator_version": source_metadata.get(
                 "generator_version",
                 GENERATOR_VERSION,
             ),
-            fuzz_seed=source_metadata.get("fuzz_seed"),
-            batch_index=max(0, source_metadata.get("batch_index", 0)),
-            command=f"minimization job {job.job_id}",
-            result_category=GuestResultCategory.SEMANTIC_MISMATCH,
-            mismatch_fingerprint=fingerprint,
-            failure_category="minimized-semantic-mismatch",
-        )
+            "fuzz_seed": source_metadata.get("fuzz_seed"),
+            "batch_index": max(0, source_metadata.get("batch_index", 0)),
+            "command": f"minimization job {job.job_id}",
+            "result_category": GuestResultCategory.SEMANTIC_MISMATCH,
+            "mismatch_fingerprint": fingerprint,
+            "failure_category": "minimized-semantic-mismatch",
+        }
+        if source_metadata["schema_version"] == 3:
+            shutil.copy2(source / "source.syz", temporary / "source.syz")
+            shutil.copy2(
+                source / "conversion-log.json",
+                temporary / "conversion-log.json",
+            )
+            metadata = build_failure_metadata_v3(
+                temporary,
+                external_source=ExternalSource.from_metadata(
+                    source_metadata["external_source"]
+                ),
+                **metadata_arguments,
+            )
+        else:
+            metadata = build_failure_metadata_v2(
+                temporary,
+                **metadata_arguments,
+            )
         save_metadata(temporary, metadata)
 
     atomic_save(destination, write)

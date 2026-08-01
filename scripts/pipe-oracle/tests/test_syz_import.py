@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -5,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent.parent.parent
@@ -55,6 +58,7 @@ from syz_import import (
     write_json_report,
 )
 from syz_parser import SyzSyntaxCategory, SyzSyntaxError, parse_syz_program
+import import_syz
 
 
 class SyzParserTests(unittest.TestCase):
@@ -352,6 +356,74 @@ class SyzCheckCliTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["summary"]["rejected"], 1)
+
+    def test_check_only_cli_does_not_create_workspace_corpus(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            source = workspace / "accepted.syz"
+            source.write_bytes(
+                (FIXTURES / "accepted/anchored_and_auto.syz").read_bytes()
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT_DIR / "import_syz.py"),
+                    "--syzkaller-revision",
+                    SUPPORTED_SYZKALLER_REVISION,
+                    "--workspace",
+                    str(workspace),
+                    str(source),
+                ],
+                cwd=WORKSPACE_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((workspace / "coverage/pipe-oracle-fuzz").exists())
+
+    def test_admit_cli_reports_terminal_failure_with_nonzero_status(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            source = workspace / "accepted.syz"
+            source.write_bytes(
+                (FIXTURES / "accepted/anchored_and_auto.syz").read_bytes()
+            )
+            admission = {
+                "schema_version": 1,
+                "jobs": [],
+                "summary": {
+                    "jobs": 1,
+                    "failed": 1,
+                    "host_stable": 1,
+                    "host_unstable": 0,
+                    "qemu_runs": 1,
+                    "new_regions": [],
+                    "admitted_digests": [],
+                },
+            }
+            arguments = [
+                "import_syz.py",
+                "--syzkaller-revision",
+                SUPPORTED_SYZKALLER_REVISION,
+                "--workspace",
+                str(workspace),
+                "--admit",
+                str(source),
+            ]
+            output = io.StringIO()
+            with (
+                mock.patch.object(sys, "argv", arguments),
+                mock.patch.object(import_syz, "run_admission", return_value=admission),
+                contextlib.redirect_stdout(output),
+            ):
+                status = import_syz.main()
+
+            self.assertEqual(status, 1)
+            report = json.loads(output.getvalue())
+            self.assertEqual(report["mode"], "admit")
+            self.assertEqual(report["admission"], admission)
 
     @unittest.skipUnless(
         os.environ.get("SYZKALLER_CHECKOUT"),

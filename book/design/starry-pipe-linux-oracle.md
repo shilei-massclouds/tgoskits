@@ -10,7 +10,9 @@ added bounded `readv`/`writev`, vector-aware reduction, and the Starry access
 capability fix on 2026-08-01. Stage 3.2b-2 added bounded timeout-zero multi-fd
 `poll`, per-entry result vectors, and the shared Starry `poll`/`ppoll` scan fix
 on 2026-08-01. This document records the design and implementation of the
-script-driven pipe differential oracle.
+script-driven pipe differential oracle. Stage 4.1 added the restricted
+syzkaller program importer, external-source provenance, and opt-in stable-input
+admission on 2026-08-01.
 
 Base: `dev-cov2` at `fb399d055`.
 
@@ -107,6 +109,13 @@ The implementation is complete when all of the following hold:
   while mismatch minimization preserves the original operation and complete
   semantic fingerprint;
 - `scripts/pipe-oracle/replay.py` replays saved failure artifacts;
+- `scripts/pipe-oracle/import_syz.py` classifies a pinned, restricted
+  syzkaller program subset without mutating persistent state by default;
+- explicit `import_syz.py --admit` requires three byte-identical host traces,
+  persists every QEMU result before attribution, and admits only exactly
+  attributed new coverage;
+- imported corpus and failure artifacts retain the original `.syz`, pinned
+  syzkaller revision, importer version, and conversion-log digest;
 - failure artifacts include `input.bin`, `pipe.ops`, `linux.trace`,
   `pipe-linux-oracle` ELF, `guest.log`, profraw files, and `metadata.json`;
 - Starry's production pipe fixes are retained.
@@ -132,6 +141,13 @@ The first implementation deliberately excludes:
 - using output from `strace` as expected data;
 - dynamic `axbuild` subcommands for fuzzing (all host orchestration is in
   Python scripts outside `cargo xtask`).
+- building or running `syz-manager`, `syz-executor`, or another syzkaller
+  runtime as part of import;
+- accepting arbitrary syzkaller calls, threaded/async/repeat properties,
+  blocking I/O, memory aliases, nonzero poll timeouts, or vector I/O in the
+  Stage 4.1 importer;
+- changing `pipe.ops` v4, trace v4, the C harness operation set, or the
+  `pipe-poll-v4` coverage target for imported programs.
 
 ## Alternatives considered
 
@@ -150,6 +166,8 @@ The first implementation deliberately excludes:
 | Fix vector errno ordering with pipe-specific syscall branches | Small local patch | Duplicates access policy and leaves regular files/directories/memfd inconsistent | Reject; add a `FileLike` capability boundary |
 | Encode multiple poll entries as repeated scalar `poll` operations | Reuses version-1 result fields | Loses array order, duplicate-fd counting, mixed invalid/ready behavior, and one-call semantics | Reject; add a typed bounded poll array |
 | Fix only `sys_poll` | Narrows the immediate patch | Leaves `ppoll` inconsistent even though both enter the shared implementation | Reject; fix shared `do_poll` and add direct regressions for both syscalls |
+| Run the syzkaller runtime during import | Reuses upstream execution and scheduling | Adds Go/runtime dependencies, a second executor, and non-deterministic features outside the oracle ABI | Reject; parse a pinned syntax subset in Python |
+| Treat accepted `.syz` files as corpus immediately | Simple ingestion | Admits host-unstable inputs and entries with no new, attributable coverage | Reject; require explicit stable admission |
 
 ## Architecture
 
@@ -451,14 +469,14 @@ does not exist and the production kernel carries no coverage-related code.
 
 - `common.py`: SHA-256 hashing, atomic directory save, `build_metadata()` that
   captures git commit, dirty state, host uname, page size, and file digests.
-- `corpus.py`: Canonical digest map, strict schema-v1/v2/v3 persistent entry
+- `corpus.py`: Canonical digest map, strict schema-v1/v2/v3/v4 persistent entry
   validation, active/superseded lifecycle, minimization lineage, atomic
-  entry/run/coverage-state saves, ELF-scoped region baselines, and
-  exact-attribution admission.
+  entry/run/coverage-state saves, typed external source provenance, ELF-scoped
+  region baselines, and exact-attribution admission.
 - `campaign_lock.py` and `corpus_errors.py`: Process-lock ownership and shared
   persistent-state error types.
-- `attribution.py` and `attribution_schema.py`: Atomic schema-v5 attribution
-  jobs (plus strict schema-v2/v3/v4 recovery), target-set-aware evidence
+- `attribution.py` and `attribution_schema.py`: Atomic schema-v6 attribution
+  jobs (plus strict schema-v2/v3/v4/v5 recovery), target-set-aware evidence
   validation, deterministic representative selection, and resumable state
   transitions.
 - `attribution_campaign.py`: Fresh host-trace and QEMU replay orchestration,
@@ -479,13 +497,14 @@ does not exist and the production kernel carries no coverage-related code.
 - `guest_result.py` and `fingerprint.py`: Typed guest result classification,
   stable harness-difference parsing, and mismatch fingerprints anchored to an
   original operation identity.
-- `artifact.py`: Strict failure schema-v1/v2 replay validation, fixed Starry and
-  host ELF digests, typed result/fingerprint metadata, and atomic save.
+- `artifact.py`: Strict failure schema-v1/v2/v3 replay validation, fixed Starry
+  and host ELF digests, typed result/fingerprint metadata, imported source
+  evidence, and atomic save.
 - `reducer.py` and `minimization.py`: Pure deterministic hierarchical reduction,
   operation-origin tracking, coverage responsibility assignment, mismatch
   predicate checks, digest deduplication, and shared candidate-QEMU budgets.
-- `minimization_schema.py` and `minimization_store.py`: Strict schema-v4 job and
-  evidence validation (plus schema-v1/v2/v3 recovery), atomic checkpoints,
+- `minimization_schema.py` and `minimization_store.py`: Strict schema-v5 job and
+  evidence validation (plus schema-v1/v2/v3/v4 recovery), atomic checkpoints,
   reducer cursor persistence, target-set pinning, and stale/unstable failure
   preservation.
 - `minimization_source.py`, `minimization_campaign.py`, and `minimize.py`:
@@ -509,19 +528,116 @@ does not exist and the production kernel carries no coverage-related code.
   execution. Each executable batch runs one QEMU; mismatch/panic/timeout/
   coverage failure stops immediately and saves a complete failure artifact to
   `coverage/pipe-oracle-fuzz/failures/`.
+- `batch_execution.py` and `host_runtime.py`: Scenario-independent shared batch
+  preparation, host recording, and Starry comparison used by both `fuzz.py`
+  and the importer.
+- `syz_parser.py`, `syz_ast.py`, and `syz_converter.py`: Strict parser and
+  typed conversion for the pinned syzkaller syntax subset, with stable syntax
+  and semantic rejection categories.
+- `syz_import.py` and `import_syz.py`: Deterministic discovery, check-only JSON
+  reporting, and the opt-in admission CLI.
+- `import_schema.py`, `import_store.py`, and `syz_admission.py`: Atomic
+  source/conversion evidence, resumable host/QEMU progress, exact attribution,
+  minimization, and imported run/failure recording.
 - `replay.py`: Replays a saved failure. Validates schema, digests, ELF type.
   Runs the same guest QEMU with the saved artifacts. `--refresh-host`
   re-records the host trace without overwriting original evidence.
 
 Constraints:
 - A canonical corpus entry is UTF-8 `pipe.ops` and is at most 4096
-  bytes; `input.bin` and `inputs/*.bin` store those exact bytes.
+  bytes; failure `input.bin` and `inputs/*.{bin,ops}` store those exact bytes.
 - One entry contains at most four scenarios and one scenario contains at most
   32 operations.
 - A fixed seed and generator version produce byte-identical corpus selection,
   batch serialization, and mutations across processes.
 - Codec failures carry a stable category and line number. Malformed mutation
   candidates never enter host or StarryOS execution batches.
+
+### Restricted syzkaller import
+
+Stage 4.1 accepts external programs only through the pinned syzkaller revision
+`e611ffe1caa28a0228c8f3642cc768f0dba3dd0c`. The importer is pure Python: it
+does not build or invoke Go code, `syz-manager`, `syz-executor`, or
+`syz-prog2c`. The pinned checkout is optional and is used only for a one-time
+fixture compatibility check. The accepted grammar is based on the pinned
+[program syntax](https://github.com/google/syzkaller/blob/e611ffe1caa28a0228c8f3642cc768f0dba3dd0c/docs/program_syntax.md)
+and Linux descriptions in pinned
+[`sys/linux/sys.txt`](https://github.com/google/syzkaller/blob/e611ffe1caa28a0228c8f3642cc768f0dba3dd0c/sys/linux/sys.txt).
+
+The default command only discovers, parses, converts, and reports:
+
+```sh
+./scripts/pipe-oracle/import_syz.py \
+  --syzkaller-revision e611ffe1caa28a0228c8f3642cc768f0dba3dd0c \
+  --report /tmp/pipe-syz-report.json \
+  PATH...
+```
+
+`PATH` is an ordinary `.syz` file or a recursively scanned directory. Results
+are sorted by absolute path, duplicate paths are collapsed, symlinks are
+reported as rejections, and an individual file is limited to 64 KiB.
+Classification returns zero even when some programs are rejected. Discovery,
+I/O, revision, persistent-state, host-build, QEMU, and semantic failures return
+nonzero. The optional report is atomically replaced. Check-only mode never
+creates or changes `coverage/pipe-oracle-fuzz/`.
+
+The Stage 4.1 call allowlist is:
+
+- `pipe` and `pipe2`;
+- `read`, `write`, `close`, `dup`, `dup2`, and `dup3`;
+- `fcntl$getflags`, `fcntl$setflags`, `fcntl$setstatus`, and `fcntl$setpipe`
+  only for the commands represented by the v4 IR;
+- `ioctl$int_out` only for `FIONREAD`; and
+- `poll` only with timeout zero and `nfds` from zero through four.
+
+Result captures are assigned deterministic logical slots `0..15`. Conversion
+rejects undefined or duplicate resources, resource arithmetic, use after
+close, positive blocking I/O, nonuniform positive write payloads, unsupported
+buffers or vectors, overlapping anchored memory, nonzero `poll` timeout,
+nonzero input `revents`, array/`nfds` disagreement, call properties,
+pseudo-syscalls, and every call outside the allowlist. `&AUTO` denotes an
+independent valid region. Positive writes preserve only a uniform effective
+prefix; zero-length I/O preserves whether the pointer is valid. Poll arrays
+preserve entry order, duplicate resources, literal fds, events, and zero input
+`revents`. The existing IR validator remains authoritative for nonblocking
+proofs and entry, operation, slot, and encoding limits.
+
+Admission is explicit:
+
+```sh
+./scripts/pipe-oracle/import_syz.py \
+  --syzkaller-revision e611ffe1caa28a0228c8f3642cc768f0dba3dd0c \
+  --workspace . \
+  --admit --host-repetitions 3 --batch-size 8 --max-qemu 64 \
+  PATH...
+```
+
+The command holds the campaign lock for recovery and new work. It first
+resumes import jobs, including their child attribution and minimization jobs,
+then resumes unrelated global attribution and minimization work. This ordering
+keeps every resumed child launch inside its import job's total QEMU budget.
+Every unique canonical input is recorded on the host three times by default,
+and the normalized trace bytes must be identical. Stable inputs are grouped in
+canonical-digest order. Each group gets one fresh host trace and one Starry
+comparison. The complete batch evidence is atomically saved before its
+progress record, so a restart does not repeat that QEMU execution.
+
+A passing batch with no regions outside the active ELF baseline completes as
+`passed-no-new-coverage` and does not enter canonical corpus. A productive
+batch continues through the existing exact attribution and structured
+minimization state machines. Only proved representatives are admitted; their
+corpus provenance contains every sorted, deduplicated `ExternalSource` that
+converted to that canonical digest. The total import QEMU budget includes the
+initial batch, attribution replays, minimization validation, candidates, and
+two final proofs. Insufficient budget is a terminal
+`qemu-budget-exhausted` result rather than an implicit overrun.
+
+Guest mismatch, panic, lockdep, timeout, oracle failure, missing coverage, or
+infrastructure failure stops admission. An imported failure uses schema v3 and
+contains `source.syz`, `conversion-log.json`, their digests, the full revision,
+importer version, combined `pipe.ops`, trace, guest log, ELFs, and profraws.
+Mismatch minimization preserves that v3 source evidence. No importer-specific
+operation or comparator exception is added to the C harness.
 
 ### Persistent corpus ownership and schema
 
@@ -534,6 +650,7 @@ coverage/pipe-oracle-fuzz/
   coverage-state/<starry-elf-sha256>-<target-set-id>.json
   attribution-jobs/<job-id>/...
   minimization-jobs/<job-id>/...
+  import-jobs/<job-id>/{sources,conversions,inputs,batch-evidence,metadata.json}
   failures/...
   .campaign.lock
 ```
@@ -555,14 +672,22 @@ and a successful-attribution verification count. Schema v3 adds an
 upgraded atomically and lazily only when exact attribution or minimization
 changes it; merely loading or selecting it does not rewrite metadata.
 
-A proved minimized entry is activated as schema v3 before any original entry is
-marked superseded. The supersede update is a separate atomic metadata replace,
-so a crash can expose both active entries but can never leave only an
-uncommitted replacement. Historical directories are never deleted. Corpus
-loading validates every finalized v1/v2/v3 entry, then exposes only active
-entries to mutation. If a minimized digest already exists, its historical
-region union and minimization lineage are merged instead of creating a duplicate
-directory.
+Schema v4 retains the schema-v3 lifecycle and adds a sorted, deduplicated
+`external_sources` list to provenance. Each `ExternalSource` contains the raw
+program SHA-256, complete 40-character syzkaller revision, importer version,
+and conversion-log SHA-256. When multiple `.syz` files produce one canonical
+digest, corpus admission merges all sources atomically. Existing schema-v1/v2/
+v3 entries remain readable and gain v4 metadata only when imported provenance
+is materially merged.
+
+A proved minimized entry is activated as schema v3, or schema v4 when it owns
+external-source provenance, before any original entry is marked superseded.
+The supersede update is a separate atomic metadata replace, so a crash can
+expose both active entries but can never leave only an uncommitted replacement.
+Historical directories are never deleted. Corpus loading validates every
+finalized v1/v2/v3/v4 entry, then exposes only active entries to mutation. If a
+minimized digest already exists, its historical region union and minimization
+lineage are merged instead of creating a duplicate directory.
 
 The current generator strictly reads corpus entries created by generator v2,
 v3, v4, or v5. Existing metadata and provenance are not rewritten merely
@@ -598,12 +723,14 @@ baselines.
 Persistent target ownership is schema-bound and fail-closed: attribution v2
 and minimization v1 imply `pipe-v1`; attribution v3 and minimization v2 require
 `pipe-fd-v2`; attribution v4 and minimization v3 require `pipe-vector-v3`;
-attribution v5 and minimization v4 require `pipe-poll-v4`. Replay evidence must
-use the same schema and target as its owning job. Unknown schemas, target
-mismatches, symlinks, and digest corruption are rejected rather than migrated.
-Corpus schema v3 and failure schema v2 remain unchanged.
+attribution v5/v6 and minimization v4/v5 require `pipe-poll-v4`. Schema v6
+attribution and schema v5 minimization add external-source provenance without
+changing target ownership. Replay evidence must use the same schema and target
+as its owning job. Unknown schemas, target mismatches, symlinks, and digest
+corruption are rejected rather than migrated. Imported raw and minimized
+failures use schema v3; legacy failure schemas v1/v2 remain strict and readable.
 
-Run metadata schema v6 stores the fixed `target_set_id`, seed, exact command,
+Run metadata schema v7 stores the fixed `target_set_id`, seed, exact command,
 measured duration,
 candidate/executable/malformed/unique counts, sources and ancestry, new regions,
 admitted digests, Starry ELF digest, result category, attribution job ID, every
@@ -613,11 +740,19 @@ candidate/proof QEMU counts, completion mode, and size changes. Run records are
 observational; corpus entry directories remain the authoritative identity used
 for selection.
 
+Import-job schema v1 owns the classification report, exact raw source bytes,
+path-independent conversion logs, canonical v4 inputs, host-stability status,
+deterministic batch partition, durable batch evidence, QEMU count, child
+attribution/minimization job IDs, and terminal result. Every file and metadata
+transition is digest-checked and atomically saved. Finished batch metadata also
+stores admitted digests and new regions so a restart can reconstruct the same
+run report without replaying QEMU.
+
 ### Exact attribution state machine
 
 Exact attribution is enabled by default for every productive batch. After the
 initial batch QEMU reports regions outside the active ELF baseline, the
-orchestrator atomically creates a schema-v5 job containing the canonical input
+orchestrator atomically creates a schema-v6 job containing the canonical input
 set and the initial batch evidence. It then:
 
 1. re-records a fresh Linux trace and starts a fresh QEMU for each of the `N`
@@ -687,10 +822,10 @@ scripts/pipe-oracle/minimize.py SOURCE --max-qemu 64
 ```
 
 `SOURCE` is either a completed attribution job or a failure artifact. Failure
-schema v2 provides its fixed Starry ELF and fingerprint directly. A schema-v1
-failure remains replayable, but is imported for minimization only when its old
-guest log contains exactly one strict semantic difference. The importer derives
-the fingerprint, pins the active Starry ELF, and the normal original-validation
+schema v2 or v3 provides its fixed Starry ELF and fingerprint directly. A
+schema-v1 failure remains replayable, but is imported for minimization only
+when its old guest log contains exactly one strict semantic difference. The
+importer derives the fingerprint, pins the active Starry ELF, and the normal original-validation
 replay must reproduce it before reduction begins. Source artifacts are never
 rewritten.
 
@@ -730,7 +865,7 @@ side. A mismatch candidate is accepted only when the observed difference maps
 back to that same origin and produces the identical fingerprint. A pass or a
 different fingerprint is an ordinary rejection, not a new failure.
 
-Each strict schema-v4 minimization job owns its fixed target set, source
+Each strict schema-v5 minimization job owns its fixed target set, source
 identity, original
 inputs, fixed host and Starry ELFs, current-best checkpoints with operation
 origins, reducer cursors and seen digests, shared budget/cursor, compact attempt
@@ -758,7 +893,8 @@ coverage reduction, or a failed final proof retains full abnormal evidence,
 marks the job `unstable`, and stops the campaign without changing source corpus,
 failure artifacts, or coverage baseline. Successful coverage minimization may
 continue the campaign. Mismatch minimization always stops it and retains both
-the original and minimized schema-v2 failure artifacts.
+the original and minimized failure artifacts. Imported mismatch artifacts stay
+on schema v3 and retain their raw program and conversion evidence.
 
 The stage-2.3 acceptance run used the completed exact-attribution job for Starry
 ELF `de330f7778459ac401f5891dab69f130812b2064a9845657db5687051f5b7c3d`.
@@ -813,6 +949,30 @@ proofs preserved all assigned regions. The persistent formats are run schema
 v6, coverage-state schema v4, attribution schema v5, minimization schema v4,
 corpus schema v3, and failure schema v2.
 
+The Stage 4.1 acceptance imported one real restricted `.syz` program. It
+classified one input as accepted, zero as rejected, and produced one unique
+canonical scenario. All three host records were byte-identical. Admission used
+six QEMU launches: one initial batch comparison, two exact-attribution replays,
+one minimization validation, and two final proofs. The input added 965
+`pipe-poll-v4` regions: 240 in `file/pipe.rs`, 33 in
+`syscall/fs/pipe.rs`, 279 in `syscall/fs/fd_ops.rs`, 144 in
+`syscall/fs/io.rs`, 84 in `mm/io.rs`, 177 in
+`syscall/io_mpx/poll.rs`, and 8 in `syscall/io_mpx/mod.rs`. Exact attribution
+mapped all 965 regions to the input. The zero-candidate minimization budget
+kept the scenario at 127 bytes and completed `budget-limited` only after the
+validation and both proofs. An ENOSPC interruption during attribution resumed
+the same durable import job without repeating its initial batch QEMU launch.
+The resulting corpus entry records the pinned syzkaller source provenance.
+The persistent formats are run schema v7, coverage-state schema v4,
+attribution schema v6, minimization schema v5, corpus schema v4, import-job
+schema v1, and imported-failure schema v3; generator v5 and target set
+`pipe-poll-v4` remain unchanged. No Starry syscall or comparator change was
+required. All 156 Python regressions, `py_compile`, all 23 `starry-kernel`
+clippy configurations, workspace rustfmt, host record/compare for 162
+operations, the checked-in x86_64 QEMU case, and `git diff --check` passed. The
+optional upstream compatibility test was skipped because no pinned syzkaller
+checkout was configured.
+
 Before implementation, the previous Python codec and saved version-3 C harness
 both rejected the version-4 checked-in corpus. After implementation, all 120
 Python/host-harness regressions, `py_compile`, all 23 `starry-kernel` clippy
@@ -860,6 +1020,8 @@ coverage/pipe-oracle-fuzz/failures/<case-id>/
   starryos               (fixed instrumented ELF for schema-v2 mismatch)
   guest.log
   profraws/*.profraw
+  source.syz             (schema-v3 imported failure only)
+  conversion-log.json    (schema-v3 imported failure only)
   metadata.json
 ```
 
@@ -872,8 +1034,15 @@ requires its fixed Starry ELF and stable mismatch fingerprint. QEMU startup,
 monitor-socket, or other infrastructure errors therefore cannot be imported or
 reported as semantic mismatches.
 
+Schema v3 extends schema v2 only for imported failures. It requires the raw
+syzkaller program, path-independent conversion log, their sizes and SHA-256
+digests, the complete pinned revision, and importer version. Strict validation
+binds both files to the typed `ExternalSource`. Automatic mismatch
+minimization copies that source evidence into the minimized schema-v3 artifact;
+it never rewrites or replaces the original failure.
+
 Saves use a temp-directory + atomic rename to prevent half-written artifacts.
-Attribution instability uses the separate schema-v5 job layout described above
+Attribution instability uses the separate schema-v6 job layout described above
 under `failures/attribution-<job-id>/`; moving the complete job preserves all
 initial, per-entry, representative, and ELF-transition evidence.
 
@@ -984,7 +1153,14 @@ remove the `pipe-linux-oracle` case directory and the `default_run` field from
 axbuild. Production pipe fixes and existing axtest coverage remain valid
 independently.
 
-Future work may add blocking/concurrent scenarios, cross-architecture
-differential coverage, or automatic CI regression detection. Those changes
-require their own design evidence and must continue to keep the default test
-path clean.
+## Roadmap
+
+- Stages 1 through 3.2b-2 are complete: executable Linux oracle, persistent
+  coverage campaign, exact attribution/minimization, fd flags, vector I/O, and
+  bounded timeout-zero multi-fd poll.
+- Stage 4.1 is complete: pinned restricted syzkaller parsing, durable external
+  provenance, check-only reporting, and opt-in stable admission.
+- A later stage may evaluate blocking/concurrent scenarios, cross-architecture
+  differential coverage, or automatic CI regression detection. It must receive
+  separate design evidence, must not silently expand the Stage 4.1 allowlist,
+  and must keep the default test path clean.

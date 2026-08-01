@@ -2,7 +2,6 @@
 """Coverage-guided pipe campaign over canonical structured corpus entries."""
 
 import argparse
-import hashlib
 import os
 import shlex
 import shutil
@@ -20,6 +19,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from artifact import build_failure_metadata_v2
+from batch_execution import BatchInput, HostRecordResult, execute_batch
 from common import save_metadata
 from attribution import (
     AttributionInput,
@@ -55,24 +55,20 @@ from minimization_campaign import (
 )
 from minimization_source import create_or_load_job_from_source
 from minimization_store import MinimizationStore
-from guest_result import GuestExecutionResult, GuestResultCategory, normalize_guest_execution
+from guest_result import GuestExecutionResult, GuestResultCategory
+from host_runtime import (
+    find_or_build_host_oracle as _find_or_build_host_oracle,
+    record_host as _record_host,
+)
 from fingerprint import MismatchFingerprint
 from reducer import ReductionInput
 from runner import coverage_object, run_guest_compare
-from scenario import combine_documents, parse_document, serialize_document
 
 
 DEFAULT_SEED = 42
 DEFAULT_BATCHES = 4
 DEFAULT_BATCH_SIZE = 32
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent.parent
-
-
-@dataclass(frozen=True)
-class HostRecordResult:
-    passed: bool
-    parser_rejection: bool
-    log: str
 
 
 @dataclass(frozen=True)
@@ -588,32 +584,36 @@ def _run_batch(
         digest: candidate_map[digest].encoded
         for digest in sorted(candidate_map)
     }
-    documents = [
-        parse_document(input_map[digest])
-        for digest in sorted(input_map)
-    ]
-    batch_document = combine_documents(documents)
-    ops_text = serialize_document(batch_document)
-    ops_digest = hashlib.sha256(ops_text.encode("utf-8")).hexdigest()
-    scenario_count = sum(len(document.scenarios) for document in documents)
+    elf_path = _find_or_build_host_oracle(workspace)
+    if elf_path is None:
+        print("ERROR: cannot build pipe-linux-oracle ELF", flush=True)
+        return BatchResult(True, "host-oracle-build-failure")
 
-    print(
-        f"  Prepared {scenario_count} scenario groups from {len(input_map)} "
-        f"canonical entries; filtered {malformed_count} malformed candidates",
-        flush=True,
+    batch_inputs = tuple(
+        BatchInput(digest, input_map[digest]) for digest in sorted(input_map)
     )
+    with execute_batch(
+        workspace,
+        batch_inputs,
+        elf_path,
+        _record_host,
+        _run_guest_compare,
+    ) as execution:
+        prepared = execution.prepared
+        batch_document = prepared.document
+        ops_text = prepared.ops_text
+        ops_digest = prepared.ops_digest
+        ops_path = execution.ops_path
+        trace_path = execution.trace_path
+        artifact_elf = execution.host_oracle_path
+        print(
+            f"  Prepared {prepared.scenario_count} scenario groups from "
+            f"{len(input_map)} canonical entries; filtered {malformed_count} "
+            "malformed candidates",
+            flush=True,
+        )
 
-    with tempfile.TemporaryDirectory() as temporary_directory:
-        temporary = Path(temporary_directory)
-        ops_path = temporary / "pipe.ops"
-        ops_path.write_text(ops_text)
-        elf_path = _find_or_build_host_oracle(workspace)
-        if elf_path is None:
-            print("ERROR: cannot build pipe-linux-oracle ELF", flush=True)
-            return BatchResult(True, "host-oracle-build-failure")
-
-        trace_path = temporary / "linux.trace"
-        host_record = _record_host(elf_path, ops_path, trace_path)
+        host_record = execution.host_record
         if not host_record.passed:
             if host_record.parser_rejection:
                 if stats is not None:
@@ -627,11 +627,8 @@ def _run_batch(
             print(f"ERROR: host record failed\n{host_record.log}", flush=True)
             return BatchResult(True, "host-record-failure")
 
-        artifact_elf = temporary / "pipe-linux-oracle"
-        shutil.copy2(elf_path, artifact_elf)
-        guest_result = normalize_guest_execution(
-            _run_guest_compare(workspace, temporary)
-        )
+        guest_result = execution.guest_result
+        assert guest_result is not None
         guest_log = guest_result.log
         profraws = list(guest_result.profraw_paths)
 
@@ -866,61 +863,6 @@ def _run_source_minimization(
     if outcome.failed:
         return outcome, job
     return outcome, minimization_store.load_job(job.job_id)
-
-
-def _find_or_build_host_oracle(workspace: Path) -> Optional[Path]:
-    source_dir = workspace / "test-suit/starryos/qemu/pipe-linux-oracle/c"
-    build_dir = workspace / "target/pipe-oracle-host"
-    elf_path = build_dir / "pipe-linux-oracle"
-
-    build_environment = os.environ.copy()
-    build_environment.pop("STARRY_PIPE_ORACLE_ARTIFACT_DIR", None)
-    try:
-        subprocess.run(
-            ["cmake", "-S", str(source_dir), "-B", str(build_dir)],
-            cwd=str(workspace),
-            env=build_environment,
-            check=True,
-        )
-        subprocess.run(
-            ["cmake", "--build", str(build_dir), "--target", "pipe-linux-oracle"],
-            cwd=str(workspace),
-            env=build_environment,
-            check=True,
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return None
-    return elf_path if elf_path.is_file() else None
-
-
-def _record_host(elf: Path, ops: Path, trace: Path) -> HostRecordResult:
-    try:
-        result = subprocess.run(
-            [str(elf), "--record", str(ops), str(trace)],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        return HostRecordResult(False, False, str(error))
-    log = result.stdout + "\n" + result.stderr
-    return HostRecordResult(
-        result.returncode == 0,
-        result.returncode != 0 and _is_host_parser_rejection(result.stderr),
-        log,
-    )
-
-
-def _is_host_parser_rejection(stderr: str) -> bool:
-    parser_messages = (
-        "corpus line is too long",
-        "invalid corpus version",
-        "invalid scenario",
-        "invalid operation",
-        "operation appears before first scenario",
-        "operation corpus is incomplete",
-    )
-    return any(message in stderr for message in parser_messages)
 
 
 def _run_guest_compare(

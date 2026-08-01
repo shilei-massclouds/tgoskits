@@ -1378,6 +1378,7 @@ class MinimizationPersistenceRegressionTests(unittest.TestCase):
         import fingerprint
         import generator
         import guest_result
+        import hashlib
         import minimization
         import minimization_campaign
         import minimization_store
@@ -1416,7 +1417,17 @@ class MinimizationPersistenceRegressionTests(unittest.TestCase):
             (source / "guest.log").write_text("original semantic mismatch")
             (source / "pipe-linux-oracle").write_bytes(executable.read_bytes())
             (source / "starryos").write_bytes(executable.read_bytes())
-            metadata = artifact.build_failure_metadata_v2(
+            syz_program = b"pipe(&(0x7f0000000000)={<r0=>0, <r1=>0})\n"
+            conversion_log = b'{"schema_version":1}\n'
+            (source / "source.syz").write_bytes(syz_program)
+            (source / "conversion-log.json").write_bytes(conversion_log)
+            external_source = corpus.ExternalSource(
+                hashlib.sha256(syz_program).hexdigest(),
+                "e611ffe1caa28a0228c8f3642cc768f0dba3dd0c",
+                "syz-pipe-v1",
+                hashlib.sha256(conversion_log).hexdigest(),
+            )
+            metadata = artifact.build_failure_metadata_v3(
                 source,
                 generator_version=generator.GENERATOR_VERSION,
                 fuzz_seed=42,
@@ -1424,6 +1435,7 @@ class MinimizationPersistenceRegressionTests(unittest.TestCase):
                 command="fuzz.py",
                 result_category=guest_result.GuestResultCategory.SEMANTIC_MISMATCH,
                 mismatch_fingerprint=expected,
+                external_source=external_source,
             )
             common.save_metadata(source, metadata)
 
@@ -1506,6 +1518,10 @@ class MinimizationPersistenceRegressionTests(unittest.TestCase):
             )
             minimized_metadata = artifact.validate_failure(minimized)
             original_retained = source.is_dir()
+            minimized_source_retained = (minimized / "source.syz").is_file()
+            minimized_conversion_retained = (
+                minimized / "conversion-log.json"
+            ).is_file()
 
         self.assertFalse(outcome.failed)
         self.assertEqual(outcome.completion, "budget-limited")
@@ -1519,6 +1535,13 @@ class MinimizationPersistenceRegressionTests(unittest.TestCase):
             minimized_metadata["mismatch_fingerprint"],
             expected.as_metadata(),
         )
+        self.assertEqual(minimized_metadata["schema_version"], 3)
+        self.assertEqual(
+            minimized_metadata["external_source"],
+            external_source.as_metadata(),
+        )
+        self.assertTrue(minimized_source_retained)
+        self.assertTrue(minimized_conversion_retained)
 
 
 if __name__ == "__main__":

@@ -83,6 +83,18 @@ class ImportJobPersistenceTests(unittest.TestCase):
             self.assertEqual(resumed.metadata["qemu_runs"], 1)
             self.assertEqual(resumed.metadata["duration_seconds"], 0.75)
 
+            metadata_path = job.path / "metadata.json"
+            saved_metadata = metadata_path.read_text()
+            corrupted = json.loads(saved_metadata)
+            corrupted["next_batch_index"] = 0
+            metadata_path.write_text(json.dumps(corrupted))
+            with self.assertRaisesRegex(
+                CorpusValidationError,
+                "batch progress is inconsistent",
+            ):
+                store.load_job(job.job_id)
+            metadata_path.write_text(saved_metadata)
+
             orphan = store.jobs_dir / ".interrupted.tmp-orphan"
             orphan.mkdir()
             self.assertEqual(

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Set, Tuple
 
 from corpus_errors import CorpusValidationError
-from scenario import parse_document, serialize_document
+from scenario import combine_documents, parse_document, serialize_document
 
 
 IMPORT_JOB_SCHEMA_VERSION = 1
@@ -16,6 +16,7 @@ METADATA_NAME = "metadata.json"
 SOURCES_NAME = "sources"
 CONVERSIONS_NAME = "conversions"
 INPUTS_NAME = "inputs"
+BATCH_EVIDENCE_NAME = "batch-evidence"
 
 JOB_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -104,6 +105,7 @@ def validate_job_metadata(metadata: Dict[str, Any], path: Path) -> None:
     for key in ("attribution_job_ids", "minimization_job_ids"):
         if not is_sorted_unique_strings(metadata[key]):
             raise CorpusValidationError(path, f"{key} must be sorted unique strings")
+    _validate_batch_progress(metadata, path)
     result_category = metadata["result_category"]
     failure_reason = metadata["failure_reason"]
     if state in {"completed", "failed"}:
@@ -119,13 +121,24 @@ def validate_job_metadata(metadata: Dict[str, Any], path: Path) -> None:
 
 
 def validate_job_files(path: Path, metadata: Dict[str, Any]) -> None:
-    expected_names = {METADATA_NAME, SOURCES_NAME, CONVERSIONS_NAME, INPUTS_NAME}
+    expected_names = {
+        METADATA_NAME,
+        SOURCES_NAME,
+        CONVERSIONS_NAME,
+        INPUTS_NAME,
+        BATCH_EVIDENCE_NAME,
+    }
     names = {
         item.name for item in path.iterdir() if not TEMP_PATTERN.fullmatch(item.name)
     }
     if names != expected_names:
         raise CorpusValidationError(path, "import job files mismatch")
-    for name in (SOURCES_NAME, CONVERSIONS_NAME, INPUTS_NAME):
+    for name in (
+        SOURCES_NAME,
+        CONVERSIONS_NAME,
+        INPUTS_NAME,
+        BATCH_EVIDENCE_NAME,
+    ):
         directory = path / name
         if directory.is_symlink() or not directory.is_dir():
             raise CorpusValidationError(directory, "expected a regular directory")
@@ -180,6 +193,7 @@ def validate_job_files(path: Path, metadata: Dict[str, Any]) -> None:
             raise CorpusValidationError(input_path, str(error)) from error
         if encoded != canonical or sha256_bytes(encoded) != item["digest"]:
             raise CorpusValidationError(input_path, "import input is not canonical")
+    _validate_batch_evidence(path / BATCH_EVIDENCE_NAME, metadata)
 
 
 def read_json(path: Path) -> Dict[str, Any]:
@@ -380,6 +394,8 @@ def _validate_batches(batches: Any, canonical_digests: Set[str], path: Path) -> 
                 "state",
                 "result_category",
                 "qemu_runs",
+                "new_regions",
+                "admitted_digests",
                 "attribution_job_id",
                 "minimization_job_ids",
             },
@@ -407,6 +423,8 @@ def _validate_batches(batches: Any, canonical_digests: Set[str], path: Path) -> 
                     batch["attribution_job_id"],
                     batch["minimization_job_ids"],
                     batch["qemu_runs"],
+                    batch["new_regions"],
+                    batch["admitted_digests"],
                 )
             ):
                 raise CorpusValidationError(path, "pending batch retains progress")
@@ -421,9 +439,163 @@ def _validate_batches(batches: Any, canonical_digests: Set[str], path: Path) -> 
             raise CorpusValidationError(path, "invalid attribution job id")
         if not is_sorted_unique_strings(batch["minimization_job_ids"]):
             raise CorpusValidationError(path, "invalid minimization job ids")
+        if not is_sorted_unique_strings(batch["new_regions"]):
+            raise CorpusValidationError(path, "invalid batch coverage regions")
+        if not is_sorted_unique_strings(batch["admitted_digests"]) or any(
+            not is_digest(digest) for digest in batch["admitted_digests"]
+        ):
+            raise CorpusValidationError(path, "invalid admitted import digests")
+
+
+def _validate_batch_progress(metadata: Dict[str, Any], path: Path) -> None:
+    batches = metadata["batches"]
+    finished_prefix = 0
+    while (
+        finished_prefix < len(batches)
+        and batches[finished_prefix]["state"] != "pending"
+    ):
+        finished_prefix += 1
+    if (
+        metadata["next_batch_index"] != finished_prefix
+        or any(batch["state"] != "pending" for batch in batches[finished_prefix:])
+    ):
+        raise CorpusValidationError(path, "batch progress is inconsistent")
+    if metadata["qemu_runs"] != sum(batch["qemu_runs"] for batch in batches):
+        raise CorpusValidationError(path, "batch QEMU total is inconsistent")
+    attribution_job_ids = sorted(
+        batch["attribution_job_id"]
+        for batch in batches
+        if batch["attribution_job_id"] is not None
+    )
+    minimization_job_ids = sorted(
+        {
+            job_id
+            for batch in batches
+            for job_id in batch["minimization_job_ids"]
+        }
+    )
+    if metadata["attribution_job_ids"] != attribution_job_ids:
+        raise CorpusValidationError(path, "attribution job index is inconsistent")
+    if metadata["minimization_job_ids"] != minimization_job_ids:
+        raise CorpusValidationError(path, "minimization job index is inconsistent")
+
+
+def _validate_batch_evidence(path: Path, metadata: Dict[str, Any]) -> None:
+    valid_names = {f"{batch['index']:06d}" for batch in metadata["batches"]}
+    evidence_directories = [
+        item for item in path.iterdir() if not TEMP_PATTERN.fullmatch(item.name)
+    ]
+    if any(item.name not in valid_names for item in evidence_directories):
+        raise CorpusValidationError(path, "batch evidence index is invalid")
+    for evidence in evidence_directories:
+        if evidence.is_symlink() or not evidence.is_dir():
+            raise CorpusValidationError(evidence, "batch evidence is not a directory")
+        expected = {
+            "pipe.ops",
+            "linux.trace",
+            "guest.log",
+            "pipe-linux-oracle",
+            "starryos",
+            "profraws",
+            "result.json",
+        }
+        if {item.name for item in evidence.iterdir()} != expected:
+            raise CorpusValidationError(evidence, "batch evidence files mismatch")
+        for name in (
+            "pipe.ops",
+            "linux.trace",
+            "guest.log",
+            "pipe-linux-oracle",
+            "starryos",
+            "result.json",
+        ):
+            require_regular_file(evidence / name)
+        profraws_dir = evidence / "profraws"
+        if profraws_dir.is_symlink() or not profraws_dir.is_dir():
+            raise CorpusValidationError(profraws_dir, "batch profraws are invalid")
+        result = read_json(evidence / "result.json")
+        require_exact_keys(
+            result,
+            {
+                "schema_version",
+                "batch_index",
+                "result_category",
+                "returncode",
+                "ops_sha256",
+                "trace_sha256",
+                "guest_log_sha256",
+                "host_oracle_sha256",
+                "starry_elf_sha256",
+                "profraws",
+            },
+            evidence,
+        )
+        batch_index = int(evidence.name)
+        if result["schema_version"] != 1 or result["batch_index"] != batch_index:
+            raise CorpusValidationError(evidence, "batch evidence metadata mismatch")
+        batch = metadata["batches"][batch_index]
+        expected_document = combine_documents(
+            [
+                parse_document(
+                    (path.parent / INPUTS_NAME / f"{digest}.ops").read_bytes()
+                )
+                for digest in batch["digests"]
+            ]
+        )
+        if (evidence / "pipe.ops").read_bytes() != serialize_document(
+            expected_document
+        ).encode("utf-8"):
+            raise CorpusValidationError(
+                evidence / "pipe.ops",
+                "batch evidence does not match its canonical inputs",
+            )
+        if not isinstance(result["result_category"], str) or not result[
+            "result_category"
+        ]:
+            raise CorpusValidationError(evidence, "batch evidence category is invalid")
+        if result["returncode"] is not None and (
+            not isinstance(result["returncode"], int)
+            or isinstance(result["returncode"], bool)
+        ):
+            raise CorpusValidationError(evidence, "batch return code is invalid")
+        for name, key in (
+            ("pipe.ops", "ops_sha256"),
+            ("linux.trace", "trace_sha256"),
+            ("guest.log", "guest_log_sha256"),
+            ("pipe-linux-oracle", "host_oracle_sha256"),
+            ("starryos", "starry_elf_sha256"),
+        ):
+            if not is_digest(result[key]) or sha256_file(evidence / name) != result[key]:
+                raise CorpusValidationError(evidence / name, "batch evidence digest mismatch")
+        profraws = result["profraws"]
+        if not isinstance(profraws, list):
+            raise CorpusValidationError(profraws_dir, "batch profraw metadata is invalid")
+        expected_profraws = []
+        for item in profraws:
+            require_exact_keys(item, {"name", "sha256", "size"}, evidence)
+            if (
+                not isinstance(item["name"], str)
+                or not item["name"]
+                or "/" in item["name"]
+                or not is_digest(item["sha256"])
+                or not is_nonnegative_integer(item["size"])
+            ):
+                raise CorpusValidationError(evidence, "batch profraw metadata is invalid")
+            profraw = profraws_dir / item["name"]
+            require_regular_file(profraw)
+            if profraw.stat().st_size != item["size"] or sha256_file(profraw) != item[
+                "sha256"
+            ]:
+                raise CorpusValidationError(profraw, "batch profraw digest mismatch")
+            expected_profraws.append(item["name"])
+        if expected_profraws != sorted(set(expected_profraws)) or {
+            item.name for item in profraws_dir.iterdir()
+        } != set(expected_profraws):
+            raise CorpusValidationError(profraws_dir, "batch profraw files mismatch")
 
 
 __all__ = [
+    "BATCH_EVIDENCE_NAME",
     "CONVERSIONS_NAME",
     "IMPORT_JOBS_NAME",
     "IMPORT_JOB_SCHEMA_VERSION",
