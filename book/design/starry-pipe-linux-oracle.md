@@ -1322,6 +1322,59 @@ explicit x86_64 QEMU oracle case was rerun serially and passed all 162
 operations with fresh coverage. No importer, comparator, Starry syscall, test
 configuration, or build-input change was required.
 
+The Stage 4.3 acceptance reused that exact 100-program manifest and pinned
+syzkaller revision. Opt-in check-only classified 23 sources as accepted and 77
+as rejected, producing 12 unique canonical documents and exceeding the 20/10
+gate. One accepted source used unchanged lossless conversion and 22 used
+projection. Source rejections were 75 `projection-no-accepted-target` and two
+`file-too-large`. Across all 100 vector targets, projection accepted 22 and
+rejected 78, with target rejections comprising 59 `unrelated-vector`, 10
+`unsupported-resource-call`, five `vector-shape`, and four
+`non-uniform-payload`. The transformation audit recorded 95 retained calls,
+1428 dropped calls, and no synthesized restore in this sample; deterministic
+regressions separately exercise restoration, target deduplication, and the
+four-scenario limit.
+
+Bounded admission selected the first eight of 12 canonical digests and deferred
+four. Job `import-20260802T153254724852Z-pid-25344` completed
+`passed-new-coverage`: all eight inputs produced three byte-identical host
+traces, with zero unstable inputs. Its 29 QEMU launches comprised one initial
+batch comparison, nine exact-attribution replays, one minimization validation,
+16 minimization candidates, and two final proofs; the 64-launch and
+51-candidate budgets were not exhausted. There was no mismatch, panic,
+timeout, coverage inconsistency, failed child, or failed final proof.
+
+The batch added 1013 `pipe-poll-v4` regions: 255 in `file/pipe.rs`, 33 in
+`syscall/fs/pipe.rs`, 279 in `syscall/fs/fd_ops.rs`, 161 in
+`syscall/fs/io.rs`, 107 in `mm/io.rs`, 170 in
+`syscall/io_mpx/poll.rs`, and 8 in `syscall/io_mpx/mod.rs`. Exact attribution
+replayed all eight entries, attributed 1013/1013 regions, and retained three
+representatives whose union also covered 1013/1013. Coverage minimization
+completed as `minimized`; its three representatives changed from 69 to 67, 64
+to 64, and 60 to 60 bytes, respectively, and admitted corpus digests
+`e8049f8472ac73c028cfd02ba7a8398b102aa8cbb2d57f9c01c4efef33f54d7f`,
+`6cd8781e7fc370015652ce54a9fab33a6004fd2eaca75a8faafde8c227d234d3`,
+and `b2168a1c49679305472341a7608ddcebfcbb4cab73df4f1eaec0c1d30e14f058`.
+
+One retained environment attempt,
+`import-20260802T151522878111Z-pid-4`, charged one QEMU launch before guest boot
+and failed when the restricted child process could not bind its Unix monitor
+socket. It recorded no coverage and started no attribution or minimization
+child. The successful job ran unchanged inputs and settings in an execution
+environment that permitted that socket; the earlier failure remains preserved
+as infrastructure evidence and is excluded from the successful job's metrics.
+
+The exercised implementation was committed as `435f6cb1c`
+(`feat(pipe-oracle): project repaired vector slices`) after adding one
+post-run fail-closed check that rejects a projected-call/conversion-log length
+mismatch; every accepted mapping in the run already satisfied that invariant.
+All 186 Python regressions then passed, with only the optional pinned-upstream
+parser check skipped because `SYZKALLER_CHECKOUT` was not configured.
+`py_compile`, all 23 `starry-kernel` clippy configurations, workspace rustfmt,
+host record/compare for 162 operations, and the explicit x86_64 QEMU oracle
+also passed. No comparator, `pipe.ops` format, C harness, Starry syscall, test
+configuration, or default CI path changed.
+
 Before implementation, the previous Python codec and saved version-3 C harness
 both rejected the version-4 checked-in corpus. After implementation, all 120
 Python/host-harness regressions, `py_compile`, all 23 `starry-kernel` clippy
@@ -1512,10 +1565,11 @@ independently.
 - Stage 4.2 is complete: importer-v2 vector conversion and bounded
   canonical-digest admission preserve the existing v4/runtime contracts, and
   the pinned 100-program aggregate acceptance passed.
-- Stage 4.3 design is complete: an explicit importer-v3 mode will project
-  resource-closed vector slices, repair only synchronous execution state, and
-  persist auditable transformation diagnostics. Implementation and acceptance
-  evidence remain pending.
+- Stage 4.3 is complete: explicit importer-v3 projection derives
+  resource-closed vector slices, repairs only synchronous execution state,
+  persists auditable transformation diagnostics, and passed the pinned
+  100-program and bounded-admission gates while the default importer-v2 path
+  remained byte-compatible.
 - A later stage may evaluate blocking/concurrent scenarios, cross-architecture
   differential coverage, or automatic CI regression detection. It must receive
   separate design evidence, must not silently expand the Stage 4.1 allowlist,
