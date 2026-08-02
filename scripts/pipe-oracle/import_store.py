@@ -88,6 +88,7 @@ class ImportStore:
         source_metadata, raw_sources, conversion_logs = _prepare_sources(
             ordered_reports,
             syzkaller_revision,
+            importer_version,
         )
         canonical_inputs, canonical_ops = _prepare_canonical_inputs(
             ordered_reports,
@@ -533,13 +534,18 @@ class ImportStore:
 def _prepare_sources(
     reports: Sequence[Dict[str, object]],
     syzkaller_revision: str,
+    importer_version: str,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, bytes], Dict[str, bytes]]:
     metadata = []
     raw_sources = {}
     conversion_logs = {}
     for index, report in enumerate(reports):
         evidence_id = f"{index:06d}"
-        conversion = conversion_log_bytes(report, syzkaller_revision)
+        conversion = conversion_log_bytes(
+            report,
+            syzkaller_revision,
+            importer_version="3" if importer_version == "3" else "2",
+        )
         conversion_digest = sha256_bytes(conversion)
         if conversion_digest != report.get("conversion_log_sha256"):
             raise CorpusStorageError("classification conversion log digest mismatch")

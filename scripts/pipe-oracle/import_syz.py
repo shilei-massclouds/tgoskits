@@ -33,6 +33,11 @@ def main() -> int:
         action="store_true",
         help="Run host stability, Starry comparison, attribution, and minimization",
     )
+    parser.add_argument(
+        "--project-vector-slices",
+        action="store_true",
+        help="Project audited pipe/vector scenarios after lossless conversion fails",
+    )
     parser.add_argument("--host-repetitions", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--max-qemu", type=int, default=64)
@@ -67,6 +72,7 @@ def main() -> int:
             args.paths,
             args.syzkaller_revision,
             max_admit_unique=args.max_admit_unique,
+            project_vector_slices=args.project_vector_slices,
         )
         admission_failed = False
         if args.admit and not infrastructure_failed:

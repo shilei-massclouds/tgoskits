@@ -25,7 +25,6 @@ from fingerprint import MismatchFingerprint
 from reducer import ReductionInput
 from runner import coverage_object, run_guest_compare
 from scenario import parse_document
-from syz_converter import IMPORTER_VERSION
 from syz_import import selected_admission_reports
 
 
@@ -194,7 +193,7 @@ def run_admission(
         _import_job_id(),
         reports=selected_admission_reports(check_report),
         syzkaller_revision=str(check_report["syzkaller_revision"]),
-        importer_version=IMPORTER_VERSION,
+        importer_version=str(check_report["importer_version"]),
         host_repetitions=host_repetitions,
         batch_size=batch_size,
         max_qemu=max_qemu,

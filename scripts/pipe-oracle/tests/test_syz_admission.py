@@ -258,6 +258,36 @@ class SyzAdmissionTests(unittest.TestCase):
                 ["1", "2"],
             )
 
+    def test_v3_job_resumes_and_matches_projected_report(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            report = _projected_report(workspace)
+            store = ImportStore(workspace)
+            store.create_job(
+                "import-v3",
+                reports=tuple(
+                    item for item in report["inputs"] if item["status"] == "accepted"
+                ),
+                syzkaller_revision=SUPPORTED_SYZKALLER_REVISION,
+                importer_version="3",
+                host_repetitions=3,
+                batch_size=8,
+                max_qemu=64,
+            )
+            harness = AdmissionHarness(workspace)
+
+            admission = _admit(workspace, report, harness)
+
+            self.assertEqual(len(admission["jobs"]), 1)
+            self.assertEqual(admission["jobs"][0]["job_id"], "import-v3")
+            self.assertEqual(admission["summary"]["failed"], 0)
+            self.assertEqual(harness.record_calls, 4)
+            self.assertEqual(harness.guest_calls, 1)
+            repeated = _admit(workspace, report, harness)
+            self.assertEqual(repeated["jobs"][0]["job_id"], "import-v3")
+            self.assertEqual(harness.record_calls, 4)
+            self.assertEqual(harness.guest_calls, 1)
+
     def test_saved_batch_evidence_prevents_duplicate_qemu_after_interruption(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             workspace = Path(temporary_directory)
@@ -569,6 +599,23 @@ def _unique_report(
     )
     if failed:
         raise AssertionError("test classification unexpectedly failed")
+    return report
+
+
+def _projected_report(workspace: Path):
+    source = workspace / "mixed.syz"
+    source.write_text(
+        "socket(0, 0, 0)\n"
+        "pipe(&AUTO={<r0=>7, <r1=>9})\n"
+        "writev(r1, &AUTO=[{&AUTO='A', 1}], 1)\n"
+    )
+    report, failed = build_check_report(
+        (source,),
+        SUPPORTED_SYZKALLER_REVISION,
+        project_vector_slices=True,
+    )
+    if failed:
+        raise AssertionError("test projection unexpectedly failed")
     return report
 
 

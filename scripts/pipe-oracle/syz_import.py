@@ -18,6 +18,12 @@ from syz_converter import (
     convert_syz_program,
 )
 from syz_parser import SyzSyntaxError, parse_syz_program
+from syz_projection import (
+    PROJECTED_IMPORTER_VERSION,
+    empty_projection_diagnostics,
+    project_vector_slices as convert_projected_vector_slices,
+    projection_summary,
+)
 
 
 MAX_SYZ_FILE_BYTES = 64 * 1024
@@ -38,6 +44,7 @@ def build_check_report(
     syzkaller_revision: str,
     *,
     max_admit_unique: Optional[int] = None,
+    project_vector_slices: bool = False,
 ) -> Tuple[Dict[str, object], bool]:
     """Discover and classify inputs; return the report and infrastructure status."""
 
@@ -48,6 +55,9 @@ def build_check_report(
     ):
         raise ValueError("max_admit_unique must be positive")
 
+    importer_version = (
+        PROJECTED_IMPORTER_VERSION if project_vector_slices else IMPORTER_VERSION
+    )
     inputs = discover_inputs(paths)
     reports = []
     infrastructure_failed = False
@@ -55,6 +65,7 @@ def build_check_report(
         report, input_infrastructure_failed = classify_input(
             discovered,
             syzkaller_revision,
+            project_vector_slices=project_vector_slices,
         )
         reports.append(report)
         infrastructure_failed |= input_infrastructure_failed
@@ -74,35 +85,35 @@ def build_check_report(
         else eligible_digests[:max_admit_unique]
     )
     deferred_digests = eligible_digests[len(selected_digests) :]
-    return (
-        {
-            "schema_version": 2,
-            "mode": "check-only",
-            "syzkaller_revision": syzkaller_revision,
-            "supported_syzkaller_revision": SUPPORTED_SYZKALLER_REVISION,
-            "importer_version": IMPORTER_VERSION,
-            "summary": {
-                "total_inputs": len(reports),
-                "accepted": len(accepted),
-                "rejected": len(reports) - len(accepted),
-                "unique_canonical": len(
-                    {report["canonical_digest"] for report in accepted}
-                ),
-                "rejection_categories": dict(sorted(rejection_counts.items())),
-            },
-            "admission_selection": {
-                "policy": "canonical-digest",
-                "max_unique": max_admit_unique,
-                "eligible_unique": len(eligible_digests),
-                "selected_unique": len(selected_digests),
-                "deferred_unique": len(deferred_digests),
-                "selected_digests": selected_digests,
-                "deferred_digests": deferred_digests,
-            },
-            "inputs": reports,
+    report = {
+        "schema_version": 3 if project_vector_slices else 2,
+        "mode": "check-only",
+        "syzkaller_revision": syzkaller_revision,
+        "supported_syzkaller_revision": SUPPORTED_SYZKALLER_REVISION,
+        "importer_version": importer_version,
+        "summary": {
+            "total_inputs": len(reports),
+            "accepted": len(accepted),
+            "rejected": len(reports) - len(accepted),
+            "unique_canonical": len(
+                {report["canonical_digest"] for report in accepted}
+            ),
+            "rejection_categories": dict(sorted(rejection_counts.items())),
         },
-        infrastructure_failed,
-    )
+        "admission_selection": {
+            "policy": "canonical-digest",
+            "max_unique": max_admit_unique,
+            "eligible_unique": len(eligible_digests),
+            "selected_unique": len(selected_digests),
+            "deferred_unique": len(deferred_digests),
+            "selected_digests": selected_digests,
+            "deferred_digests": deferred_digests,
+        },
+        "inputs": reports,
+    }
+    if project_vector_slices:
+        report["summary"].update(projection_summary(reports))
+    return report, infrastructure_failed
 
 
 def selected_admission_reports(
@@ -110,8 +121,12 @@ def selected_admission_reports(
 ) -> Tuple[Dict[str, object], ...]:
     """Return every accepted source for the report's selected canonical inputs."""
 
-    if report.get("schema_version") != 2:
-        raise ValueError("admission requires check report schema 2")
+    schema_version = report.get("schema_version")
+    if schema_version not in {2, 3}:
+        raise ValueError("admission requires check report schema 2 or 3")
+    expected_importer = "2" if schema_version == 2 else PROJECTED_IMPORTER_VERSION
+    if report.get("importer_version") != expected_importer:
+        raise ValueError("check report schema/importer version mismatch")
     inputs = report.get("inputs")
     if not isinstance(inputs, list) or any(
         not isinstance(input_report, dict) for input_report in inputs
@@ -186,6 +201,8 @@ def discover_inputs(paths: Iterable[Path]) -> Tuple[DiscoveredInput, ...]:
 def classify_input(
     discovered: DiscoveredInput,
     syzkaller_revision: str,
+    *,
+    project_vector_slices: bool = False,
 ) -> Tuple[Dict[str, object], bool]:
     path = discovered.path
     base: Dict[str, object] = {
@@ -200,64 +217,126 @@ def classify_input(
         "rejection_category": None,
         "rejection_detail": None,
     }
+    importer_version = (
+        PROJECTED_IMPORTER_VERSION if project_vector_slices else IMPORTER_VERSION
+    )
+    if project_vector_slices:
+        base.update(
+            {
+                "conversion_kind": None,
+                "projection": empty_projection_diagnostics(),
+            }
+        )
     if discovered.discovery_rejection is not None:
         base["rejection_category"] = discovered.discovery_rejection
         base["rejection_detail"] = "input is not an ordinary .syz file"
-        return _finalize_classification(base, syzkaller_revision), False
+        return _finalize_classification(
+            base,
+            syzkaller_revision,
+            importer_version,
+        ), False
 
     try:
         file_stat = path.lstat()
         if stat.S_ISLNK(file_stat.st_mode) or not stat.S_ISREG(file_stat.st_mode):
             base["rejection_category"] = "symlink"
             base["rejection_detail"] = "input changed into a non-regular file"
-            return _finalize_classification(base, syzkaller_revision), False
+            return _finalize_classification(
+                base,
+                syzkaller_revision,
+                importer_version,
+            ), False
         base["program_size"] = file_stat.st_size
         if file_stat.st_size > MAX_SYZ_FILE_BYTES:
             base["rejection_category"] = "file-too-large"
             base["rejection_detail"] = (
                 f"{file_stat.st_size} exceeds {MAX_SYZ_FILE_BYTES} bytes"
             )
-            return _finalize_classification(base, syzkaller_revision), False
+            return _finalize_classification(
+                base,
+                syzkaller_revision,
+                importer_version,
+            ), False
         encoded = path.read_bytes()
     except OSError as error:
         base["rejection_category"] = "input-read-failure"
         base["rejection_detail"] = str(error)
-        return _finalize_classification(base, syzkaller_revision), True
+        return _finalize_classification(
+            base,
+            syzkaller_revision,
+            importer_version,
+        ), True
 
     base["program_size"] = len(encoded)
     base["program_sha256"] = hashlib.sha256(encoded).hexdigest()
     try:
         program = parse_syz_program(encoded)
-        conversion = convert_syz_program(program)
     except SyzSyntaxError as error:
         base["rejection_category"] = f"syntax-{error.category.value}"
         base["rejection_detail"] = str(error)
-        return _finalize_classification(base, syzkaller_revision), False
+        return _finalize_classification(
+            base,
+            syzkaller_revision,
+            importer_version,
+        ), False
+
+    try:
+        conversion = convert_syz_program(program)
     except SyzConversionError as error:
-        base["rejection_category"] = error.category.value
-        base["rejection_detail"] = str(error)
-        return _finalize_classification(base, syzkaller_revision), False
+        if not project_vector_slices:
+            base["rejection_category"] = error.category.value
+            base["rejection_detail"] = str(error)
+            return _finalize_classification(
+                base,
+                syzkaller_revision,
+                importer_version,
+            ), False
+        projection = convert_projected_vector_slices(program, error)
+        base["projection"] = projection.diagnostics
+        if projection.document is None:
+            base["rejection_category"] = projection.rejection_category
+            base["rejection_detail"] = projection.rejection_detail
+            return _finalize_classification(
+                base,
+                syzkaller_revision,
+                importer_version,
+            ), False
+        conversion_document = projection.document
+        conversion_log = projection.operation_log
+        conversion_kind = "projected"
+    else:
+        conversion_document = conversion.document
+        conversion_log = conversion.operation_log
+        conversion_kind = "lossless"
 
     base.update(
         {
             "status": "accepted",
-            "canonical_digest": canonical_digest(conversion.document),
-            "canonical_pipe_ops": serialize_document(conversion.document),
-            "conversion_log": list(conversion.operation_log),
+            "canonical_digest": canonical_digest(conversion_document),
+            "canonical_pipe_ops": serialize_document(conversion_document),
+            "conversion_log": list(conversion_log),
         }
     )
-    return _finalize_classification(base, syzkaller_revision), False
+    if project_vector_slices:
+        base["conversion_kind"] = conversion_kind
+    return _finalize_classification(
+        base,
+        syzkaller_revision,
+        importer_version,
+    ), False
 
 
 def conversion_log_bytes(
     report: Dict[str, object],
     syzkaller_revision: str,
+    *,
+    importer_version: str = IMPORTER_VERSION,
 ) -> bytes:
     """Encode the path-independent conversion evidence for one input."""
     document = {
-        "schema_version": 1,
+        "schema_version": 2 if importer_version == PROJECTED_IMPORTER_VERSION else 1,
         "syzkaller_revision": syzkaller_revision,
-        "importer_version": IMPORTER_VERSION,
+        "importer_version": importer_version,
         "program_sha256": report["program_sha256"],
         "program_size": report["program_size"],
         "status": report["status"],
@@ -266,14 +345,26 @@ def conversion_log_bytes(
         "rejection_category": report["rejection_category"],
         "rejection_detail": report["rejection_detail"],
     }
+    if importer_version == PROJECTED_IMPORTER_VERSION:
+        document.update(
+            {
+                "conversion_kind": report["conversion_kind"],
+                "projection": report["projection"],
+            }
+        )
     return (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
 def _finalize_classification(
     report: Dict[str, object],
     syzkaller_revision: str,
+    importer_version: str = IMPORTER_VERSION,
 ) -> Dict[str, object]:
-    encoded_log = conversion_log_bytes(report, syzkaller_revision)
+    encoded_log = conversion_log_bytes(
+        report,
+        syzkaller_revision,
+        importer_version=importer_version,
+    )
     report["conversion_log_sha256"] = hashlib.sha256(encoded_log).hexdigest()
     return report
 

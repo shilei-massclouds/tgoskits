@@ -19,6 +19,52 @@ from syz_import import build_check_report  # noqa: E402
 
 
 class ImportJobPersistenceTests(unittest.TestCase):
+    def test_v3_job_preserves_projected_source_log_and_provenance(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            source = workspace / "mixed.syz"
+            source.write_text(
+                "socket(0, 0, 0)\n"
+                "pipe(&AUTO={<r0=>7, <r1=>9})\n"
+                "writev(r1, &AUTO=[{&AUTO='A', 1}], 1)\n"
+            )
+            report, failed = build_check_report(
+                (source,),
+                SUPPORTED_SYZKALLER_REVISION,
+                project_vector_slices=True,
+            )
+            self.assertFalse(failed)
+            input_report = report["inputs"][0]
+
+            store = ImportStore(workspace)
+            job = store.create_job(
+                "import-v3",
+                reports=(input_report,),
+                syzkaller_revision=SUPPORTED_SYZKALLER_REVISION,
+                importer_version=report["importer_version"],
+                host_repetitions=3,
+                batch_size=8,
+                max_qemu=64,
+            )
+
+            self.assertEqual(job.metadata["schema_version"], 1)
+            self.assertEqual(job.metadata["importer_version"], "3")
+            conversion_path = next((job.path / "conversions").iterdir())
+            conversion = json.loads(conversion_path.read_text())
+            self.assertEqual(conversion["schema_version"], 2)
+            self.assertEqual(conversion["conversion_kind"], "projected")
+            self.assertNotIn(str(source), conversion_path.read_text())
+            digest = job.metadata["canonical_inputs"][0]["digest"]
+            provenance = store.provenance(job, digest)
+            self.assertEqual(provenance.external_sources[0].importer_version, "3")
+
+            conversion_path.write_bytes(conversion_path.read_bytes() + b"corrupt")
+            with self.assertRaisesRegex(
+                CorpusValidationError,
+                "conversion log digest mismatch",
+            ):
+                store.load_job(job.job_id)
+
     def test_job_persists_every_source_and_resumes_atomic_batch_progress(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             workspace = Path(temporary_directory)
