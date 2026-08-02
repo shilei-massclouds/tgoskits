@@ -15,7 +15,9 @@ syzkaller program importer, external-source provenance, and opt-in stable-input
 admission on 2026-08-01. Stage 4.2 added lossless pinned `readv`/`writev`
 conversion, report schema v2, and deterministic admission selection on
 2026-08-01 without changing the oracle IR, trace, harness, coverage target, or
-Starry syscall ABI.
+Starry syscall ABI. Stage 4.3 designs an explicit, auditable vector-slice
+projection for mixed programs; its implementation and aggregate acceptance are
+not yet recorded in this design-only change.
 
 Base: `dev-cov2` at `fb399d055`.
 
@@ -119,6 +121,11 @@ The implementation is complete when all of the following hold:
   attributed new coverage;
 - importer v2 losslessly maps the bounded pinned `readv`/`writev` syntax into
   the existing v4 vector operations;
+- explicit `--project-vector-slices` first attempts the unchanged lossless
+  conversion and only projects a rejected mixed program;
+- importer v3 emits at most four deterministic resource-closed scenarios,
+  repairs only the execution environment needed for synchronous vector I/O,
+  and records every retained, dropped, synthesized, and rejected target call;
 - `--max-admit-unique N` selects the lexicographically first `N` accepted
   canonical digests before any host or QEMU execution while retaining every
   source for each selected digest;
@@ -154,6 +161,11 @@ The first implementation deliberately excludes:
 - accepting arbitrary syzkaller calls, threaded/async/repeat properties,
   blocking I/O, memory aliases, nonzero poll timeouts, or vector calls other
   than bounded `readv`/`writev` in the Stage 4.2 importer;
+- claiming that a Stage 4.3 projected scenario is semantically equivalent to
+  its complete source program, or using projection without a fresh Linux
+  oracle trace;
+- repairing vector count, segment length, pointer mode, payload, memory alias,
+  fd direction, or source call order during Stage 4.3 projection;
 - changing `pipe.ops` v4, trace v4, the C harness operation set, or the
   `pipe-poll-v4` coverage target for imported programs.
 
@@ -179,6 +191,10 @@ The first implementation deliberately excludes:
 | Add new importer-only vector operations | Can mirror arbitrary syzkaller vectors | Forks the v4 codec, C harness, trace, reducer, and comparator contracts | Reject; accept exactly the vector boundary already represented by v4 |
 | Stop after the first `N` host-stable or QEMU-tested inputs | Avoids some later execution | Selection depends on host results, batching, and interruption point | Reject; select a canonical-digest prefix before execution |
 | Select the first `N` source paths | Simple to explain | Duplicate canonical inputs consume the limit and path renames change execution | Reject; bound unique canonical digests and retain all selected sources |
+| Loosen the lossless importer for mixed programs | Fewer explicit modes | Silently changes the established importer-v2 contract and makes dropped behavior unauditable | Reject; keep v2 byte-compatible and require an opt-in v3 mode |
+| Minimize the complete syzkaller program first | Reuses upstream reduction concepts | Requires executor semantics and still cannot guarantee synchronous pipe execution | Reject; derive a bounded resource slice and re-record Linux truth |
+| Keep every call that parses | Preserves more source text | Unsupported consumers can mutate or close a selected fd through semantics the oracle cannot represent | Reject; use fail-closed resource barriers |
+| Project one scenario per source | Smaller reports | Conflates independent vector targets and makes the chosen target depend on incidental source shape | Reject; create one ordered scenario per target and deduplicate canonically |
 
 ## Architecture
 
@@ -713,6 +729,207 @@ host stability, QEMU counts, coverage across the seven target files, exact
 attribution rate, and sizes before/after minimization. Until that evidence
 exists, fixed fixtures and local regression/host/QEMU validation prove the
 implementation boundary but do not claim pinned-corpus aggregate acceptance.
+
+### Auditable vector-slice projection (Stage 4.3 design)
+
+#### Problem, users, and acceptance boundary
+
+The Stage 4.2 lossless importer intentionally rejects a complete program when
+any call is outside its synchronous v4 boundary. In the pinned 100-program
+sample, this admitted one program even though many rejected programs contained
+a bounded `readv` or `writev` whose descriptor originated from a pipe. Running
+the complete programs would require the syzkaller executor, unsupported
+syscalls, blocking and scheduling semantics, and resources outside the pipe
+oracle. Discarding every such program, however, leaves useful vector shapes and
+payloads unexamined.
+
+Stage 4.3 serves pipe-oracle maintainers who want to derive independently
+executable pipe scenarios from those mixed programs without weakening the
+lossless contract. It is a high-risk feature because it adds report and
+conversion-evidence formats and deliberately transforms external input. It is
+complete only when:
+
+- the default command remains importer v2/report schema v2 and produces the
+  same canonical bytes and schema-v1 conversion logs as Stage 4.2;
+- `--project-vector-slices` explicitly selects importer v3/report schema v3,
+  tries the unchanged lossless conversion first, and projects only after that
+  conversion rejects the program;
+- every projected scenario contains a `readv` or `writev` target whose fd
+  resource resolves to `pipe`/`pipe2`, preserves its vector and memory shape,
+  and passes the existing v4 codec and resource validator;
+- every dropped, retained, repaired, synthesized, deduplicated, or rejected
+  decision is path-independent and attributable to source line numbers;
+- the pinned 100-program manifest with SHA-256
+  `792ec290d50098cb43eba9ec6f8fdd5b5755851dfb74ac044a9c237ebb50adb5`
+  yields at least 20 accepted sources and 10 unique canonical documents; and
+- bounded admission records three identical host traces for every selected
+  input and completes without a mismatch, panic, timeout, missing coverage,
+  attribution failure, exhausted budget, or failed job.
+
+The projection is a derived test scenario, not an equivalence claim about the
+complete source program. Its expected trace is always regenerated by executing
+the derived `pipe.ops` on the current Linux host.
+
+#### Prior art and local boundary
+
+The dependency model follows syzkaller's resource-aware minimization at pinned
+revision `e611ffe1caa28a0228c8f3642cc768f0dba3dd0c`, specifically
+[`prog/minimization.go`](https://github.com/google/syzkaller/blob/e611ffe1caa28a0228c8f3642cc768f0dba3dd0c/prog/minimization.go).
+That implementation demonstrates that a call cannot be removed independently
+of the resource producers and consumers that make the remaining program
+executable. Stage 4.3 borrows that resource-closure principle, but does not
+reuse syzkaller's serializer, type database, executor, or equivalence
+predicate. The local parser remains pinned, the existing `scenario.py` v4
+validator remains the final boundary, and Linux execution supplies truth.
+
+Internally, the Stage 4.2 converter already owns the allowlist, fd generation
+checks, anchored-memory overlap checks, vector-shape conversion, payload
+validation, and operation/slot/encoding limits. Projection therefore produces
+a typed `SyzProgram` slice and sends it through that converter rather than
+duplicating or relaxing those rules. A separate projection module owns only
+resource selection, environmental repair, scenario ordering, and diagnostics.
+
+#### Opt-in conversion flow
+
+For each ordinary input that parsed successfully, importer v3 performs these
+steps in order:
+
+1. Run the unchanged lossless converter over the complete AST.
+2. If it succeeds, emit its exact one-scenario document with
+   `conversion_kind=lossless`; do not inspect, rewrite, or project calls.
+3. If it fails, enumerate `readv`/`writev` targets in source-call order.
+4. For each target, resolve its plain fd resource through resource producers,
+   descriptor replacement, and `dup*` dependencies to one pipe creation.
+5. Retain the selected pipe's connected prefix through the target, repair only
+   the synchronous execution environment, and run the resulting typed program
+   through the lossless converter.
+6. Keep successful target scenarios in target order and discard later
+   canonical duplicates while retaining their diagnostics.
+7. Accept the source when at least one target succeeds. If no target succeeds,
+   reject it as `projection-no-accepted-target`. If the program contains no
+   vector target, reject it as `projection-no-vector-target`.
+8. If more than four distinct target scenarios succeed, reject the complete
+   source as `projection-entry-limit`; do not truncate the source-dependent
+   result to the first four.
+
+Only calls at or before a target can enter its scenario. The resource closure
+contains the selected `pipe`/`pipe2`, all producer calls needed for a retained
+descriptor, and allowlisted calls connected to either endpoint or an alias of
+that pipe. This preserves preceding reads, writes, vector operations, closes,
+fd/status/size queries and mutations, `FIONREAD`, timeout-zero poll, and `dup*`
+effects that can change the target's observable state. A separate pipe and a
+call with no selected-pipe resource edge are dropped. Calls remain in original
+order; projection never moves a source call across another source call.
+
+The projection fails closed for a target when its selected resource prefix
+contains any of these barriers:
+
+- an unsupported or pseudo-syscall call that references a selected pipe fd;
+- resource arithmetic on a selected fd reference;
+- `dup2`/`dup3` between the selected pipe and an external or different-pipe
+  resource;
+- call properties on a retained or selected-pipe call;
+- an undefined resource, duplicate result, stale descriptor generation, or
+  use-after-close needed by the slice; or
+- an allowlisted connected call that the lossless converter cannot represent.
+
+These are target-local barriers: another vector target in the same source can
+still produce an accepted scenario when its resource prefix is independent.
+The diagnostic retains the stable lossless rejection category and detail when
+the final converter rejects a target. Unsupported calls that do not reference
+the selected pipe are ordinary dropped calls, not barriers.
+
+#### Bounded deterministic repair
+
+Projection repairs only two facts needed to make a selected scenario
+synchronously executable:
+
+- Each retained pipe output field is rewritten to the integer zero expected by
+  the pinned serializer while preserving its result-capture name. A retained
+  `pipe` becomes `pipe2(..., O_NONBLOCK)`. A retained `pipe2` becomes
+  `pipe2(..., O_NONBLOCK | (original_flags & O_CLOEXEC))`. No other original
+  flag is carried into the derived creation call.
+- Projection tracks the open-file-description identity shared by descriptor
+  aliases. If a retained `fcntl$setstatus(..., F_SETFL, flags)` can clear
+  `O_NONBLOCK`, it marks that description as requiring repair. Immediately
+  before the next retained positive-length scalar or vector I/O on that
+  description, projection synthesizes
+  `fcntl$setstatus(fd, F_SETFL, O_NONBLOCK)` and marks every alias of the same
+  description nonblocking again. No restore is emitted for zero-length,
+  invalid-vector, or invalid-count I/O.
+
+The synthesized restore uses the exact fd operand of the following I/O, so it
+cannot redirect the target to another endpoint. Creation repair and restores
+are explicitly identified in diagnostics. Projection does not change iovec
+count, segment count or length, outer or per-segment pointer mode, payload
+bytes, fd direction, or any non-pipe memory address. Nonuniform payload,
+anchored overlap, vector shape, use-after-close, operation count, slot count,
+scenario count, and encoded entry size remain hard rejections at the existing
+converter/codec boundary.
+
+#### Report and conversion evidence
+
+The default path keeps report schema v2 and conversion-log schema v1 byte for
+byte. The opt-in path uses report schema v3 and importer version `3`. Every v3
+input adds `conversion_kind` (`lossless`, `projected`, or null) and a
+`projection` object. The object records whether projection was attempted, the
+complete lossless rejection that triggered it, and one diagnostic per vector
+target. Each target diagnostic contains:
+
+- source target index, call name, and line number;
+- accepted, rejected, or duplicate status and its canonical scenario digest;
+- stable rejection category and detail when it did not produce a scenario;
+- retained source calls with line, name, converted operation, and repair
+  reasons;
+- dropped source calls with line, name, and the resource-selection reason; and
+- synthesized calls with the source line they precede, converted operation,
+  and repair reason.
+
+Report-v3 summary data includes lossless/projected conversion counts, target
+status and rejection-category distributions, and retained/dropped/synthesized
+transformation counts. All arrays use source order unless explicitly described
+as sorted canonical digest sets. No absolute path enters conversion evidence.
+
+Importer-v3 conversion logs use schema v2 and include the new conversion kind
+and projection object in addition to the existing source digest, canonical
+digest, operation mapping, and rejection. Their digest remains the external
+source identity used by corpus and failure provenance. A projected operation
+mapping includes a scenario index so repeated source lines in independent
+target scenarios are unambiguous.
+
+Admission reads `importer_version` from the validated report rather than a
+module constant. Import-job schema remains v1: its existing nonempty importer
+version string distinguishes v2 and v3 jobs, while its source and conversion
+digest fields preserve the original `.syz` and schema-v2 log. Existing
+importer-v1/v2 jobs, old reports used only for their owning saved job, corpus
+entries, failures, and provenance require no migration. Saved jobs always
+resume before a new report is matched or admitted. A conversion-log digest or
+file mismatch remains a fail-closed persistent-state error.
+
+#### Validation, rollout, and rollback
+
+Deterministic regressions must prove default-v2 byte compatibility, lossless
+priority, unrelated-call slicing, pipe placeholder and flag repair,
+nonblocking restoration, `dup*` closure, every resource barrier, unchanged
+vector/payload/alias validation, target ordering/deduplication, the four-
+scenario limit, path-independent logs, repeatability, v2/v3 schema selection,
+provenance, restart, old import-job loading, and conversion-log tamper
+rejection. The checked-in 162-operation corpus must still record and compare on
+the host, and the explicit x86_64 QEMU case must still pass.
+
+Aggregate check-only acceptance uses exactly the Stage 4.2 manifest and records
+all source rejections, projection transformations, and target diagnostics.
+Bounded admission uses `--max-admit-unique 8 --max-qemu 64 --batch-size 8
+--host-repetitions 3`. Any Linux/Starry semantic difference stops acceptance;
+the remedy is a necessarily failing raw-syscall regression and production
+semantic fix, never a weaker comparator or projection rule.
+
+The feature is default-off and stateless before admission. Operational rollback
+is to stop passing `--project-vector-slices`; this immediately restores the v2
+report and conversion path. Existing v3 jobs remain owned persistent work and
+must be resumed or explicitly archived under the same campaign rules as older
+jobs. No `pipe.ops`, trace, harness, Starry ABI, coverage target, or default CI
+rollback is needed.
 
 ### Persistent corpus ownership and schema
 
@@ -1295,6 +1512,10 @@ independently.
 - Stage 4.2 is complete: importer-v2 vector conversion and bounded
   canonical-digest admission preserve the existing v4/runtime contracts, and
   the pinned 100-program aggregate acceptance passed.
+- Stage 4.3 design is complete: an explicit importer-v3 mode will project
+  resource-closed vector slices, repair only synchronous execution state, and
+  persist auditable transformation diagnostics. Implementation and acceptance
+  evidence remain pending.
 - A later stage may evaluate blocking/concurrent scenarios, cross-architecture
   differential coverage, or automatic CI regression detection. It must receive
   separate design evidence, must not silently expand the Stage 4.1 allowlist,
