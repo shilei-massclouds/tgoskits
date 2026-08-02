@@ -1048,6 +1048,63 @@ operations, the checked-in x86_64 QEMU case, and `git diff --check` passed. The
 optional upstream compatibility test was skipped because no pinned syzkaller
 checkout was configured.
 
+The Stage 4.2 acceptance used syzbot's immutable `corpus.db` objects for the
+`ci-upstream-kasan-gce`, `ci-upstream-kasan-gce-root`, and
+`ci-qemu2-arm64-mte` managers at GCS generations `1785647672872099`,
+`1785646365757143`, and `1785660534694398`. Their SHA-256 digests were
+`da360ca9d5cbb02bb8df601f78a51d17f60e0c361dbf412269da0702bab71d1`,
+`a37d7e06b70f52a8d5402dd29d5a6c055029d2ddee990ca2540b59a4e1c8333`,
+and `7af49216f53b5077578fce4fd43aba461ef50aa0a5ad8016b95e6205f23d5398`.
+The source revision was pinned to
+`e611ffe1caa28a0228c8f3642cc768f0dba3dd0c`. Recursive ordinary-file
+selection without following symlinks found 311745 `.syz` files, 302242
+distinct raw-content digests, and 102 parser-confirmed programs containing
+both `pipe`/`pipe2` and `readv`/`writev`. Sorting by raw SHA-256 and relative
+path selected the first 100. The newline-terminated UTF-8 manifest SHA-256 was
+`792ec290d50098cb43eba9ec6f8fdd5b5755851dfb74ac044a9c237ebb50adb5`.
+The manifest and source corpora remain outside Git.
+
+Check-only classified 1 input as accepted and 99 as rejected, producing 1
+unique canonical scenario. The complete rejection distribution was 47
+`unsupported-call`, 45 `pointer-shape`, 3 `unsupported-constant`, 2
+`file-too-large`, and 2 `pseudo-syscall`. Bounded admission selected that one
+unique digest and deferred zero. Job
+`import-20260802T113905858318Z-pid-14948` completed
+`passed-new-coverage`: its three host records were stable, with zero unstable
+records, and its 10 QEMU launches comprised one initial comparison, two exact
+attribution replays, one minimization validation, four minimization candidates,
+and two final proofs. It admitted one corpus digest,
+`b2168a1c49679305472341a7608ddcebfcbb4cab73df4f1eaec0c1d30e14f058`.
+The single attribution child completed, for an exact attribution rate of 1/1
+(100%). The single minimization job recorded `original_size=60` and
+`best_size=60`, also 60 to 60 bytes in total; validation and both final proofs
+passed.
+
+The admitted program added 957 `pipe-poll-v4` regions: 224 in
+`file/pipe.rs`, 29 in `syscall/fs/pipe.rs`, 278 in
+`syscall/fs/fd_ops.rs`, 161 in `syscall/fs/io.rs`, 87 in `mm/io.rs`, 170 in
+`syscall/io_mpx/poll.rs`, and 8 in `syscall/io_mpx/mod.rs`. All seven target
+files were present. Existing durable import, attribution, and minimization jobs
+were already terminal, so no prior resumable job consumed this acceptance
+budget. Three disclosed environment-bootstrap attempts
+(`import-20260802T105848336172Z-pid-2`,
+`import-20260802T112737727709Z-pid-2`, and
+`import-20260802T113248274906Z-pid-2`) each stopped as an infrastructure
+failure after being charged one QEMU attempt, recorded no run, and started no
+attribution or minimization child. They respectively exposed an absent rootfs
+registry, an unavailable OVMF download in the restricted environment, and a
+denied QEMU monitor socket in the sandbox. The acceptance decision treats
+these retained preflight records as environment preparation rather than Stage
+4.2 admission; their three attempts are excluded from the successful job's
+metrics.
+
+At unchanged HEAD `211f1c708e0d356ed4f26491cbc6e288d57ef182`, the previously
+completed 172 Python checks, all 23 `starry-kernel` clippy configurations, and
+host record/compare evidence for 162 operations remained applicable. The
+explicit x86_64 QEMU oracle case was rerun serially and passed all 162
+operations with fresh coverage. No importer, comparator, Starry syscall, test
+configuration, or build-input change was required.
+
 Before implementation, the previous Python codec and saved version-3 C harness
 both rejected the version-4 checked-in corpus. After implementation, all 120
 Python/host-harness regressions, `py_compile`, all 23 `starry-kernel` clippy
@@ -1235,10 +1292,9 @@ independently.
   bounded timeout-zero multi-fd poll.
 - Stage 4.1 is complete: pinned restricted syzkaller parsing, durable external
   provenance, check-only reporting, and opt-in stable admission.
-- Stage 4.2 implementation is complete: importer-v2 vector conversion and
-  bounded canonical-digest admission preserve the existing v4/runtime
-  contracts. Aggregate acceptance remains gated on a user-supplied 100-program
-  corpus from the pinned revision.
+- Stage 4.2 is complete: importer-v2 vector conversion and bounded
+  canonical-digest admission preserve the existing v4/runtime contracts, and
+  the pinned 100-program aggregate acceptance passed.
 - A later stage may evaluate blocking/concurrent scenarios, cross-architecture
   differential coverage, or automatic CI regression detection. It must receive
   separate design evidence, must not silently expand the Stage 4.1 allowlist,
