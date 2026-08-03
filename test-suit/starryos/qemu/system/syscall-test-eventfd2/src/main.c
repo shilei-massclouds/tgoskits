@@ -8,7 +8,7 @@
  *   4. 信号量模式：read 每次返回 1 并递减
  *   5. 多次写入累积
  *   6. 写 UINT64_MAX → EINVAL
- *   7. 读写缓冲区大小校验（< 8 字节 → EINVAL）
+ *   7. 读写缓冲区大小校验（< 8 字节 → EINVAL，> 8 字节仅传输前 8 字节）
  *   8. 非阻塞模式：空 eventfd 读 → EAGAIN，满 eventfd 写 → EAGAIN
  *   9. 写 0 边界情况
  *  10. 计数器溢出保护：写会使计数超过 UINT64_MAX-1 → EAGAIN
@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/eventfd.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -205,6 +206,28 @@ static void test_buffer_size_validation(void) {
         /* read 缓冲区 == 8 → 成功 */
         CHECK_RET(do_read(fd, &val64), (ssize_t)sizeof(val64), "read with 8-byte buffer succeeds");
         CHECK(val64 == 1, "read with 8-byte buffer returns initval 1");
+
+        close(fd);
+    }
+
+    {
+        int fd = eventfd(0, EFD_NONBLOCK);
+        uint8_t oversized[sizeof(uint64_t) + 1];
+        uint64_t written = 17;
+        uint64_t observed = 0;
+
+        CHECK(fd >= 0, "fd for oversized raw write test");
+        memcpy(oversized, &written, sizeof(written));
+        oversized[sizeof(written)] = 0xa5;
+
+        errno = 0;
+        long ret = syscall(SYS_write, fd, oversized, sizeof(oversized));
+        CHECK_RET(ret, (ssize_t)sizeof(written),
+                  "raw write with 9-byte buffer consumes the first 8 bytes");
+        CHECK_RET(do_read(fd, &observed), (ssize_t)sizeof(observed),
+                  "read after oversized raw write succeeds");
+        CHECK(observed == written,
+              "oversized raw write adds the value from the first 8 bytes");
 
         close(fd);
     }
