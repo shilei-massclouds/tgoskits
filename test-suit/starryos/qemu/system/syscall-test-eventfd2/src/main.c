@@ -207,6 +207,12 @@ static void test_buffer_size_validation(void) {
         CHECK_RET(do_read(fd, &val64), (ssize_t)sizeof(val64), "read with 8-byte buffer succeeds");
         CHECK(val64 == 1, "read with 8-byte buffer returns initval 1");
 
+        /* eventfd checks count before touching the user pointer. */
+        errno = 0;
+        ret = syscall(SYS_write, fd, (const void *)(uintptr_t)1, 7);
+        CHECK(ret == -1 && errno == EINVAL,
+              "short raw write with invalid pointer returns EINVAL before EFAULT");
+
         close(fd);
     }
 

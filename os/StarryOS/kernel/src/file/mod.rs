@@ -212,6 +212,15 @@ pub trait FileLike: Pollable + DowncastSync {
         true
     }
 
+    /// Validate a scalar write length before importing the user buffer.
+    ///
+    /// File types with count errors that take precedence over `EFAULT` can
+    /// override this hook. The full write operation must repeat any invariant
+    /// needed to remain correct for non-scalar callers.
+    fn validate_write_len(&self, _len: usize) -> AxResult {
+        Ok(())
+    }
+
     fn read(&self, _dst: &mut IoDst) -> AxResult<usize> {
         Err(AxError::InvalidInput)
     }

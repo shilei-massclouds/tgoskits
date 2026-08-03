@@ -33,6 +33,13 @@ impl EventFd {
 }
 
 impl FileLike for EventFd {
+    fn validate_write_len(&self, len: usize) -> ax_io::Result {
+        if len < size_of::<u64>() {
+            return Err(AxError::InvalidInput);
+        }
+        Ok(())
+    }
+
     fn read(&self, dst: &mut IoDst) -> ax_io::Result<usize> {
         if dst.remaining_mut() < size_of::<u64>() {
             return Err(AxError::InvalidInput);
