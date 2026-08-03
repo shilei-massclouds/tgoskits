@@ -14,6 +14,7 @@
  *  10. 计数器溢出保护：写会使计数超过 UINT64_MAX-1 → EAGAIN
  *  11. 阻塞读：子进程写入后父进程阻塞读被唤醒
  *  12. fork 继承：子进程可以读写父进程创建的 eventfd
+ *  13. poll 返回精确的 Linux readiness mask，并清空负 fd 的 revents
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -21,6 +22,7 @@
 
 #include "test_framework.h"
 #include <errno.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -404,6 +406,27 @@ static void test_fork_inheritance(void) {
     close(fd);
 }
 
+/* ─── 13. poll readiness mask ───────────────────────────── */
+
+static void test_poll_readiness_mask(void) {
+    int fd = eventfd(1, EFD_NONBLOCK);
+    struct pollfd fds[] = {
+        {.fd = fd, .events = INT16_MAX, .revents = (short)0x5a5a},
+        {.fd = -2, .events = INT16_MAX, .revents = (short)0x5a5a},
+        {.fd = -2, .events = POLLIN | POLLOUT, .revents = (short)0x5a5a},
+        {.fd = -2, .events = POLLERR, .revents = (short)0x5a5a},
+    };
+
+    CHECK(fd >= 0, "fd for poll readiness mask test");
+    CHECK_RET(syscall(SYS_poll, fds, sizeof(fds) / sizeof(fds[0]), 0), 1,
+              "poll reports exactly one ready eventfd");
+    CHECK(fds[0].revents == (POLLIN | POLLOUT),
+          "eventfd poll reports only Linux POLLIN|POLLOUT readiness");
+    CHECK(fds[1].revents == 0 && fds[2].revents == 0 && fds[3].revents == 0,
+          "poll ignores negative fds and clears their revents");
+    close(fd);
+}
+
 /* ─── main ────────────────────────────────────────────────── */
 
 int main(void) {
@@ -444,6 +467,9 @@ int main(void) {
 
     printf("\n--- 12. fork inheritance ---\n");
     test_fork_inheritance();
+
+    printf("\n--- 13. poll readiness mask ---\n");
+    test_poll_readiness_mask();
 
     TEST_DONE();
 }

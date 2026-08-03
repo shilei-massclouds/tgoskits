@@ -70,12 +70,6 @@ fn collect_ready_poll_events(
     let mut res = 0usize;
     for ((fd, events), revent_index) in fds.0.iter().zip(revent_indices.iter()) {
         let mut result = fd.poll();
-        if result.contains(IoEvents::IN) {
-            result |= IoEvents::RDNORM;
-        }
-        if result.contains(IoEvents::OUT) {
-            result |= IoEvents::WRNORM;
-        }
         // POSIX: POLLHUP and POLLERR are always reported in revents,
         // even if not requested in events. They must NOT be masked out.
         let always_report =

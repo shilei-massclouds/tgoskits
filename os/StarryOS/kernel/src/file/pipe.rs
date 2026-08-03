@@ -530,27 +530,34 @@ impl Pollable for Pipe {
         let mut events = IoEvents::empty();
         let state = self.shared.state.lock();
         if self.read_side {
-            events.set(IoEvents::IN, state.buffer.occupied_len() > 0);
+            events.set(
+                IoEvents::IN | IoEvents::RDNORM,
+                state.buffer.occupied_len() > 0,
+            );
             events.set(IoEvents::HUP, state.writers == 0);
         } else {
             events.set(IoEvents::ERR, state.readers == 0);
             // Linux reports POLLOUT when the pipe has a free PIPE_BUF-sized
             // slot, independently of whether the reader has already closed.
-            events.set(IoEvents::OUT, state.has_free_buffer());
+            events.set(IoEvents::OUT | IoEvents::WRNORM, state.has_free_buffer());
         }
         events
     }
 
     fn register(&self, context: &mut Context<'_>, events: IoEvents) {
+        let read_ready = events.intersects(IoEvents::IN | IoEvents::RDNORM);
+        let write_ready = events.intersects(IoEvents::OUT | IoEvents::WRNORM);
         let mut interests = if self.read_side {
-            events & (IoEvents::IN | IoEvents::HUP)
+            events & IoEvents::HUP
         } else {
-            events & (IoEvents::OUT | IoEvents::ERR)
+            events & IoEvents::ERR
         };
-        if self.read_side && events.contains(IoEvents::IN) {
+        if self.read_side && read_ready {
+            interests.insert(IoEvents::IN);
             interests.insert(IoEvents::HUP);
         }
-        if !self.read_side && events.contains(IoEvents::OUT) {
+        if !self.read_side && write_ready {
+            interests.insert(IoEvents::OUT);
             interests.insert(IoEvents::ERR);
         }
         if interests.is_empty() {
