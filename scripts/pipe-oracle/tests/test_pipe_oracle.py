@@ -21,6 +21,7 @@ ARTIFACT_ENV = "STARRY_PIPE_ORACLE_ARTIFACT_DIR"
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import analyze  # noqa: E402
+import adapter  # noqa: E402
 import corpus  # noqa: E402
 import coverage  # noqa: E402
 import fuzz  # noqa: E402
@@ -28,6 +29,7 @@ import generator  # noqa: E402
 import mutation  # noqa: E402
 import replay  # noqa: E402
 import scenario  # noqa: E402
+from linux_oracle.driver import select_batch  # noqa: E402
 
 
 class PipeOracleRegressionTests(unittest.TestCase):
@@ -69,6 +71,42 @@ class PipeOracleRegressionTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("usage:", result.stdout)
+
+    def test_common_campaign_hooks_are_canonical_and_deterministic(self):
+        spec = adapter.SPEC
+        hooks = spec.campaign_hooks
+        self.assertIsNotNone(hooks)
+        self.assertTrue(spec.campaign.corpus_directory.startswith("common-"))
+        seeds = tuple(hooks.seed_inputs(WORKSPACE_ROOT))
+        self.assertGreaterEqual(len(seeds), 5)
+        corpus_inputs = {}
+        for encoded in seeds:
+            document = spec.codec.parse(encoded)
+            spec.codec.validate_entry(document)
+            self.assertEqual(spec.codec.serialize(document), encoded)
+            corpus_inputs[hashlib.sha256(encoded).hexdigest()] = encoded
+
+        first = select_batch(
+            spec, hooks, hooks.make_rng(42), corpus_inputs, 8
+        )
+        second = select_batch(
+            spec, hooks, hooks.make_rng(42), corpus_inputs, 8
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 8)
+
+        initial = hooks.reduction.initial(first[0].encoded)
+        candidates = tuple(hooks.reduction.candidates(initial))
+        self.assertTrue(candidates)
+        for candidate in candidates[:8]:
+            encoded = hooks.reduction.encode(candidate)
+            self.assertEqual(
+                spec.codec.serialize(spec.codec.parse(encoded)), encoded
+            )
+            self.assertLess(
+                hooks.reduction.complexity(candidate),
+                hooks.reduction.complexity(initial),
+            )
 
     def test_host_oracle_cache_is_checked_by_cmake_before_reuse(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
