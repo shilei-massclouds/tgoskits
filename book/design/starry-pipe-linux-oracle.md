@@ -1570,6 +1570,12 @@ independently.
   persists auditable transformation diagnostics, and passed the pinned
   100-program and bounded-admission gates while the default importer-v2 path
   remained byte-compatible.
+- Stage 5 is complete: eventfd provides the second synchronous vertical
+  adapter, pipe and eventfd now share an adapter-neutral campaign framework,
+  a third fake adapter verifies the extension boundary, and the retained pipe
+  162-operation host/QEMU comparison remains compatible. See
+  `book/design/starry-eventfd-linux-oracle.md` for the design and acceptance
+  evidence.
 - A later stage may evaluate blocking/concurrent scenarios, cross-architecture
   differential coverage, or automatic CI regression detection. It must receive
   separate design evidence, must not silently expand the Stage 4.1 allowlist,

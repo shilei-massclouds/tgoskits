@@ -2,14 +2,20 @@
 
 ## Status
 
-Proposed for implementation on 2026-08-03. This is the independently reviewable
-high-risk design for Stage 5 of the Starry Linux differential testing roadmap.
-Acceptance evidence is recorded only after the implementation and all gates in
-this document complete.
+Accepted on 2026-08-04. This document is the independently reviewed high-risk
+design and acceptance record for Stage 5 of the Starry Linux differential
+testing roadmap.
 
 The fixed production reference is Linux commit
 [`a2cf4ef33184df0ae9e1a2b05b550133dde1698c`](https://github.com/torvalds/linux/blob/a2cf4ef33184df0ae9e1a2b05b550133dde1698c/fs/eventfd.c#L118-L280).
 The public contract is [`eventfd(2)`](https://man7.org/linux/man-pages/man2/eventfd.2.html).
+
+The formal user-facing Chinese name of this testing method is
+“以 Linux 语义为参考的场景差分测试” (scenario differential testing with
+Linux semantics as the reference). In implementation terminology, a Linux
+oracle is the Linux reference-semantics adjudicator: it records the normalized
+expected trace for the same canonical scenario that Starry later executes. It
+is not a performance benchmark.
 
 ## Problem, users, and success criteria
 
@@ -51,7 +57,10 @@ QEMU cases, persistent roots, and coverage files.
 ## Scope and non-goals
 
 The eventfd is the primary resource, while fd lifecycle, `fcntl`, and timeout-
-zero `poll` are supporting syscalls. Version 1 covers:
+zero-timeout `poll` participate in the eventfd-focused stories. "Focus" is
+relative to an adapter: these same syscalls may be the observation target in a
+different adapter, so the common framework does not assign intrinsic primary
+or supporting roles. Version 1 covers:
 
 - raw `eventfd` and `eventfd2` creation;
 - scalar `read` and `write` with explicit lengths and valid/invalid pointers;
@@ -84,7 +93,8 @@ machine:
   resets it, while semaphore mode returns one and decrements by one. An empty
   nonblocking read returns `EAGAIN`
   ([`eventfd_read`](https://github.com/torvalds/linux/blob/a2cf4ef33184df0ae9e1a2b05b550133dde1698c/fs/eventfd.c#L214-L245));
-- a write requires length exactly eight, faults while copying the value,
+- a write requires a length of at least eight, consumes exactly eight bytes,
+  faults while copying the value,
   rejects `UINT64_MAX`, adds every other value including zero, and returns
   `EAGAIN` in nonblocking mode when the sum would exceed `UINT64_MAX-1`
   ([`eventfd_write`](https://github.com/torvalds/linux/blob/a2cf4ef33184df0ae9e1a2b05b550133dde1698c/fs/eventfd.c#L247-L280)); and
@@ -190,6 +200,14 @@ The internal `scripts/linux_oracle/` package receives one immutable
 - optional extensions such as the pipe importer/projection, which call the
   common execution boundary without entering the common package.
 
+At runtime the generic data input is a sequence of adapter-canonical byte
+documents, not a syscall name, a "primary role", or a syzkaller program. Seed
+corpora, deterministic generation, mutation, a hand-written converter, and a
+syzkaller importer are interchangeable producers behind the adapter boundary.
+Each producer must lower its source into the same canonical document and pass
+the adapter's validation before the common layer accepts it. Stage 5 keeps the
+existing pipe syzkaller producer and deliberately adds no eventfd importer.
+
 The common package owns only mechanics with identical meaning for both real
 adapters:
 
@@ -261,6 +279,15 @@ then proves the selected union in a fresh replay before baseline admission.
 Incomplete or unstable attribution preserves all evidence and leaves the
 baseline unchanged.
 
+The campaign budget reserves one QEMU execution for every requested foreground
+batch that has not run yet. Exact attribution and minimization use only the
+unreserved remainder. Reaching that remainder is a normal resumable boundary:
+the task stays `pending` or `running`, its target regions prevent duplicate
+jobs, and later foreground batches still execute. Semantic, parser,
+infrastructure, and coverage failures remain fatal; only budget exhaustion is
+deferred. A campaign is complete when all requested foreground batches have
+run, and it reports the count of durable background tasks that remain.
+
 The resource-aware reducer deletes scenarios/operations and simplifies typed
 parameters while preserving operation origins. Coverage minimization preserves
 the representative's assigned region set. Mismatch minimization preserves the
@@ -325,6 +352,44 @@ do not change. Physical-board and self-hosted validation are not applicable:
 this adapter deliberately uses one native/static x86_64 ELF on host Linux and
 Starry x86_64 QEMU.
 
+## Acceptance evidence
+
+Stage 5 passed all gates on 2026-08-04:
+
+- the common-framework tests passed 11/11, the eventfd adapter tests passed
+  22/22, and the retained pipe tests passed 187 tests with one expected
+  environment-dependent skip;
+- all affected Python modules passed `py_compile`; the common-package contract
+  exercised a third fake adapter with distinct artifacts, QEMU selection,
+  persistence root, and coverage source set, and its static scan found no
+  pipe/eventfd constants in `scripts/linux_oracle/`;
+- three consecutive host records of the fixed eventfd corpus produced identical
+  normalized traces, and the host comparison passed;
+- `cargo fmt` and all 23 targeted
+  `cargo xtask clippy --package starry-kernel` checks passed;
+- the existing `qemu/system/syscall-test-eventfd2` case passed 92 assertions,
+  including the raw-syscall oversized-write regression;
+- the explicit pipe comparison remained byte- and trace-compatible at 162/162
+  operations, while the explicit eventfd comparison passed 107/107 operations;
+- the fixed `seed=42`, four-batch, 32-candidate, `max-qemu=64` campaign completed
+  every foreground batch with 62 QEMU executions, durable exact attribution,
+  stable replay, 18 effective corpus inputs (six fixed seeds plus 12 durable
+  entries), and seven background jobs safely left resumable at the budget
+  boundary;
+- completed coverage minimizations included a 595-byte input reduced to 503
+  bytes and an independently proved 1811-byte `already-minimal` input; completed
+  jobs performed two passing final replays; and
+- the final QEMU runs produced fresh coverage without semantic mismatch, panic,
+  timeout, or missing profraw, and `git diff --check` passed.
+
+During acceptance the oracle exposed three production differences instead of
+masking them in generation or comparison: eventfd writes with lengths above
+eight, eventfd write error/byte-count propagation, and file-specific poll
+masks. Each received a deterministic regression before its Starry fix. A later
+nonblocking-proof audit found that the adapter model and C harness still encoded
+the former exact-eight assumption. They were corrected, and a regression now
+prevents an oversized overflow write from entering a blocking scenario.
+
 ## Syscall impact map
 
 This stage adds a test adapter and does not intentionally change production
@@ -335,7 +400,7 @@ syscall behavior. The comparator nevertheless observes each entry separately.
 | `eventfd` | 32-bit initial value, default normal/blocking flags, logical fd result | [`eventfd(2)`](https://man7.org/linux/man-pages/man2/eventfd.2.html), [Linux source](https://github.com/torvalds/linux/blob/a2cf4ef33184df0ae9e1a2b05b550133dde1698c/fs/eventfd.c#L379-L419) |
 | `eventfd2` | valid/unknown flags, initial value, nonblock/semaphore/cloexec ownership | [`eventfd(2)`](https://man7.org/linux/man-pages/man2/eventfd.2.html), [Linux source](https://github.com/torvalds/linux/blob/a2cf4ef33184df0ae9e1a2b05b550133dde1698c/fs/eventfd.c#L379-L414) |
 | `read` | length, pointer, errno, returned value, consumed count, buffer suffix | [`eventfd(2)`](https://man7.org/linux/man-pages/man2/eventfd.2.html), [Linux source](https://github.com/torvalds/linux/blob/a2cf4ef33184df0ae9e1a2b05b550133dde1698c/fs/eventfd.c#L214-L245) |
-| `write` | exact length, pointer, zero/max value, counter addition and overflow errno | [`eventfd(2)`](https://man7.org/linux/man-pages/man2/eventfd.2.html), [Linux source](https://github.com/torvalds/linux/blob/a2cf4ef33184df0ae9e1a2b05b550133dde1698c/fs/eventfd.c#L247-L280) |
+| `write` | short/oversized length, pointer, zero/max value, counter addition and overflow errno | [`eventfd(2)`](https://man7.org/linux/man-pages/man2/eventfd.2.html), [Linux source](https://github.com/torvalds/linux/blob/a2cf4ef33184df0ae9e1a2b05b550133dde1698c/fs/eventfd.c#L247-L280) |
 | `dup` | same description, new independent descriptor flags, logical result | [`dup(2)`](https://man7.org/linux/man-pages/man2/dup.2.html) |
 | `dup2` | same-fd behavior and atomic occupied-destination replacement | [`dup(2)`](https://man7.org/linux/man-pages/man2/dup.2.html) |
 | `dup3` | same-fd/unknown-flag `EINVAL`, replacement, optional close-on-exec | [`dup(2)`](https://man7.org/linux/man-pages/man2/dup.2.html) |
