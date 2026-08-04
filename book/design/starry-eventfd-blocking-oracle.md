@@ -2,11 +2,11 @@
 
 ## Status
 
-Implementation in progress; runtime acceptance is pending. This document is
-the independently reviewable high-risk design for Stage 6.1 of the Starry
-Linux differential-testing roadmap. It introduces a bounded pthread
-concurrency model and a new persistent canonical format, so implementation
-must remain a separate commit from this design.
+Accepted on 2026-08-04. This document is the independently reviewable
+high-risk design for Stage 6.1 of the Starry Linux differential-testing
+roadmap. It introduces a bounded pthread concurrency model and a new
+persistent canonical format; the design, implementation, and acceptance
+evidence remain separately reviewable commits.
 
 Stage 5's synchronous adapter remains `eventfd-v1`. The CLI calls that scenario
 model `simple-single` because it is single-threaded and statically nonblocking.
@@ -377,6 +377,35 @@ Runtime acceptance is serial:
 
 Physical-board, self-hosted, SMP-stress, performance, and default-CI validation
 are not applicable to this bounded x86_64 QEMU stage.
+
+## Acceptance evidence
+
+Acceptance completed on 2026-08-04 without a StarryOS production change. The
+fixed v2 corpus contains 57 operations; three consecutive host recordings on
+Linux 5.15.0-186-generic were byte-identical, host compare passed, and the same
+trace passed in StarryOS x86_64 QEMU. The retained simple eventfd model passed
+107 operations and the neighboring pipe oracle passed 162 operations. The
+raw `syscall-test-eventfd2` case passed 92 of 92 tests. No semantic mismatch,
+early completion, schedule timeout, harness error, panic, outer timeout, or
+missing coverage was observed.
+
+The serial Python results were 11 common-framework tests, 36 combined eventfd
+tests, and 187 pipe tests with one environment-dependent skip. Python bytecode
+compilation, workspace rustfmt, all 23 targeted `starry-kernel` clippy checks,
+and `git diff --check` passed. Failure tests rejected wrong or unknown adapter
+identities and tampered corpus/digest, trace, host ELF, and Starry ELF data;
+simple and blocking persistence remained isolated.
+
+The required campaign used `--model blocking --seed 42 --batches 3
+--batch-size 16 --max-qemu 32`. It completed all 48 candidates and used exactly
+32 QEMU executions. The first batch attributed 876 target regions to two
+representatives and persisted two resulting corpus entries; with six built-in
+seeds, the active campaign pool contained eight entries. Coverage minimization
+reduced one representative from 419 to 252 bytes in six candidate attempts and
+classified the other 264-byte representative as `already-minimal`. The second
+and third productive batches were durably saved as two pending attribution
+jobs when the QEMU budget was exhausted; preserving those resumable jobs rather
+than exceeding the requested budget is the normal campaign policy.
 
 ## Rollback and Stage 6.2
 

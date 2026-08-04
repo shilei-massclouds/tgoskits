@@ -633,42 +633,70 @@ pipe 和 eventfd 都能够稳定执行后，再从两个实现中提取公共部
 
 ## 10. 阶段 6：受控并发与阻塞语义
 
-**定位：长期，投入大；仅在同步场景收益趋于稳定后启动。**
+**定位：长期，投入大；按受控调度模型拆分。**
 
-为场景格式增加 actor、barrier、join 和 watchdog，而不是直接生成任意线程。典型
-结构为：
+### 10.1 Stage 6.1：eventfd 受控阻塞与唤醒
 
-```text
-actor reader:
-  barrier ready
-  blocking read
+**状态：已完成（2026-08-04）。**
 
-actor writer:
-  wait ready
-  write
-  close
-```
+Stage 6.1 新增单控制线程、单工作线程的 `blocking` 场景模型；它不是同步模型的
+格式升级或替代。命令不带 `--model` 时仍选择 `simple-single` 和历史 adapter
+`eventfd-v1`，显式 `--model blocking` 才选择独立 adapter
+`eventfd-blocking-v1`。前者继续使用 `eventfd.ops` version 1，后者使用 version 2；
+replay 根据 artifact 中的 adapter ID 严格分派，两个 campaign 根目录和持久状态
+完全隔离。
 
-目标场景包括：
+version 2 固定 actor 0 为 controller、actor 1 为 worker，并增加 `start-read`、
+`start-write`、`assert-pending` 和 `join`。每次只允许一个未完成 syscall，validator
+静态证明 start 必然阻塞、controller trigger 指向同一 eventfd、`join` 前调用最终
+可完成。worker 活跃期间禁止 close、dup、flag 修改、poll 和其他生命周期竞争。
+固定 50 ms pending guard 与 5 s 完成期限不进入 canonical 输入或 trace；提前完成
+属于语义 mismatch，触发后不完成属于 `schedule-timeout`，线程或时钟故障属于
+`harness-error`。宿主候选只有连续三次录制得到逐字节一致 trace 才会被接受。
 
-- blocking read/write 的唤醒；
-- 多 reader 和多 writer；
-- 多 writer 下的 `PIPE_BUF` 原子性；
-- close 与阻塞操作竞争；
-- signal、`EINTR` 和 `SA_RESTART`；
-- poll/epoll 与状态变化交错。
+固定 corpus 覆盖 normal/semaphore eventfd 的空 counter 阻塞读、满 counter 阻塞
+写、原 fd 与 alias 唤醒、共享 counter 和 `O_NONBLOCK`、一次释放空间不足、零写不
+唤醒及随后正值写入。coverage target 在 eventfd syscall/file 路径之外纳入
+`axtask::poll_io` 和 `axpoll::PollSet`。公共 campaign 层仍只处理 opaque canonical
+bytes；actor 状态机暂留 eventfd adapter，等待第二个阻塞适配器验证公共边界。
 
-并发比较不能要求 host 与 StarryOS 产生相同调度顺序。比较对象应是允许结果集合
-和不变量，例如数据不丢失、不重复、小写入不交错、所有 actor 最终退出，以及
-wakeup、EOF、`EPIPE` 的合法状态转换。
+验收结果如下：
 
-### 验收标准
+| 项目 | 结果 |
+|---|---|
+| 固定宿主 trace | Linux 5.15.0-186-generic 连续 3 次逐字节一致，57 operations 的 host compare 通过 |
+| StarryOS QEMU | blocking eventfd 57、simple eventfd 107、pipe 162 operations 全部匹配并导出 coverage |
+| raw syscall 回归 | `syscall-test-eventfd2` 92/92 通过 |
+| Python 回归 | common 11、eventfd 36、pipe 187 通过；pipe 另有 1 个环境条件 skip；`py_compile` 通过 |
+| Rust 检查 | workspace rustfmt 与 `starry-kernel` 23/23 clippy 通过 |
+| blocking campaign | seed 42、3 batches、16 candidates/batch、32 次 QEMU；第 1 批的 876 regions 精确归因到 2 个代表并持久化，含 6 个内置 seed 的总池为 8 entries |
+| coverage 最小化 | 419→252 bytes（6 次候选）；另一个 264-byte entry 为 `already-minimal` |
 
-- actor 和 barrier 调度可由固定场景稳定重放；
-- watchdog 失败与语义 mismatch 分开分类；
-- 候选输入通过配置数量的重复 host 稳定性检查后才进入 corpus；
-- comparator 明确记录比较的是 exact result、允许结果集合还是不变量；
-- 不以扩大 timeout 掩盖死锁、丢失唤醒或不稳定场景。
+campaign 在 32 次 QEMU 的硬预算内完成全部三个请求 batch；第 2、3 批各留下一个
+严格可恢复的 pending attribution job，没有为清空后台任务突破预算。运行中未发现
+Linux/Starry mismatch、提前完成、panic、timeout、harness error 或 coverage 缺失，
+因此没有修改 StarryOS 生产等待或原子实现。完整设计、兼容边界和非目标见
+`book/design/starry-eventfd-blocking-oracle.md`。
+
+### 10.2 Stage 6.2：剩余受控并发模型
+
+**状态：未开始。**
+
+Stage 6.2 明确保留以下工作，不把它们反向塞入 Stage 6.1：
+
+- eventfd 多等待者、多 reader/writer、公平性和唤醒数量；
+- pipe 阻塞 read/write、多 writer 下的 `PIPE_BUF` 原子性，以及 EOF/`EPIPE` 状态
+  转换；
+- comparator 的允许结果集合和跨 actor 不变量，替代对自然调度顺序的比较；
+- signal、`EINTR`、`SA_RESTART` 及信号与阻塞 syscall 的受控交错；
+- 非零 timeout 的 poll 与 epoll 注册、状态变化、唤醒和超时交错；
+- close/lifetime 竞争，以及这些场景所需但 Stage 6.1 明确禁止的资源转换。
+
+pipe 提供第二个真实阻塞实现后，才能从 eventfd 中提取公共 actor/barrier/join
+抽象。Stage 6.2 仍须满足：固定场景可稳定重放；watchdog、schedule timeout、
+harness failure 与语义 mismatch 分开；宿主重复稳定性达到适配器声明的门槛；
+comparator 对每个字段明确采用 exact result、允许结果集合或不变量；不得通过扩大
+timeout 或降低生成权重掩盖死锁、丢失唤醒和不稳定场景。
 
 ## 11. 阶段 7：持续扩展与优先级管理
 
