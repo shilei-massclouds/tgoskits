@@ -1,0 +1,112 @@
+version 1
+scenario generated-0001
+eventfd2 0 2 526337
+get-status-flags 0
+get-fd-flags 0
+dup 0 1
+get-fd-flags 1
+set-fd-flags 1 1
+get-fd-flags 1
+get-fd-flags 0
+set-status-flags 1 0
+get-status-flags 0
+read 1 8 0
+read 0 8 0
+set-status-flags 0 2048
+read 1 8 0
+eventfd2 2 7 2048
+dup2 0 2
+write 2 8 0 5
+read 0 8 0
+dup3 2 3 524288
+get-fd-flags 3
+close 2
+read 3 8 0
+close 0
+read 1 8 0
+dup2 15 3
+read 3 8 0
+dup3 3 3 0
+close 3
+close 1
+read 1 8 0
+scenario generated-0002
+eventfd2 0 0 2048
+read 0 0 0
+read 0 7 0
+read 0 8 0
+read 0 16 1
+write 0 0 0 1
+write 0 7 0 1
+write 0 9 0 1
+write 0 8 1 1
+write 0 8 0 18446744073709551615
+write 0 8 0 0
+poll-many 1 0 0 5
+write 0 8 0 5
+poll-many 2 0 0 1 0 0 4
+read 0 16 0
+read 0 8 0
+write 0 8 0 18446744073709551614
+poll-many 1 0 0 5
+write 0 8 0 1
+write 0 8 0 0
+read 0 9 0
+poll-many 1 0 0 5
+close 0
+scenario generated-0003
+eventfd2 0 7 2048
+read 0 8 1
+poll-many 1 0 0 5
+write 0 8 0 2
+read 0 16 1
+poll-many 1 0 0 5
+eventfd2 1 3 2049
+read 1 8 1
+poll-many 1 0 1 5
+read 1 16 0
+read 1 9 0
+read 1 8 0
+eventfd2 2 0 1073741824
+get-status-flags 2
+close 2
+eventfd 4 1
+get-status-flags 4
+set-status-flags 4 2048
+read 4 16 0
+read 4 8 0
+eventfd2 5 4294967295 526336
+get-fd-flags 5
+read 5 8 0
+close 0
+close 1
+close 4
+close 5
+scenario generated-0004
+eventfd2 0 0 2048
+eventfd2 1 1 526336
+poll-many 0
+poll-many 4 0 0 1 0 1 1 1 -2 4 1 2147483647 4
+dup 1 2
+poll-many 4 0 1 1 0 2 1 1 -1 1 1 2147483647 1
+read 2 8 0
+poll-many 3 0 1 5 0 2 5 0 0 5
+write 0 8 0 18446744073709551614
+poll-many 3 0 0 1 0 0 4 0 1 5
+write 0 8 0 1
+read 0 8 0
+poll-many 4 0 0 5 0 1 5 0 2 5 1 -2 5
+dup2 0 1
+get-fd-flags 1
+set-fd-flags 1 1
+get-fd-flags 0
+get-fd-flags 1
+set-status-flags 1 0
+get-status-flags 0
+set-status-flags 0 2048
+close 0
+poll-many 3 0 0 5 0 1 5 1 2147483647 5
+write 1 8 0 9
+read 1 8 0
+close 1
+close 2

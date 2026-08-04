@@ -1,0 +1,33 @@
+args = [
+    "-nographic",
+    "-m",
+    "512M",
+    "-smp",
+    "4",
+    "-device",
+    "nvme,serial=deadbeef,drive=nvm",
+    "-drive",
+    "id=nvm,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-x86_64-alpine.img",
+]
+uefi = true
+to_bin = true
+shell_prefix = "root@starry:"
+shell_init_cmd = """
+/usr/bin/eventfd-linux-oracle --compare /usr/share/starry-tests/eventfd-linux-oracle/eventfd.ops /usr/share/starry-tests/eventfd-linux-oracle/linux.trace
+status=$?
+if [ "$status" -ne 0 ]; then
+    echo AXTEST_COVERAGE_DEFERRED_"FAIL"
+fi
+echo ok > /proc/starry-test-coverage
+exec sleep 300
+"""
+asset_cache = "bypass"
+default_run = false
+success_regex = ['(?m)^STARRY_EVENTFD_LINUX_ORACLE_PASSED: operations=[0-9]+ host_linux=[^\r\n]+\r?$']
+fail_regex = [
+    "(?m)^STARRY_EVENTFD_LINUX_ORACLE_FAILED:",
+    '(?i)\bpanic(?:ked)?\b',
+    "(?m)^lockdep fatal violation\\s*$",
+    "AXTEST_COVERAGE_DEFERRED_FAIL",
+]
+timeout = 300
