@@ -21,6 +21,10 @@ _KINDS = {
     "get-fd-flags": 11,
     "set-fd-flags": 12,
     "poll-many": 13,
+    "start-read": 14,
+    "start-write": 15,
+    "assert-pending": 16,
+    "join": 17,
 }
 _FIELD_ORDER = ("result", "errno", "value", "data_len", "data")
 

@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(eventfd-linux-oracle C)
 
+find_package(Threads REQUIRED)
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)
@@ -47,6 +49,7 @@ else()
 
     add_executable(eventfd-linux-oracle src/eventfd_linux_oracle.c)
     target_compile_options(eventfd-linux-oracle PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(eventfd-linux-oracle PRIVATE Threads::Threads)
     target_link_options(eventfd-linux-oracle PRIVATE -static)
 
     add_custom_command(

@@ -5,16 +5,19 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
 #include <sys/utsname.h>
+#include <time.h>
 #include <unistd.h>
 
-#define TRACE_VERSION 1U
-#define CORPUS_VERSION 1L
+#define SIMPLE_CORPUS_VERSION 1L
+#define BLOCKING_CORPUS_VERSION 2L
 #define MAX_SLOTS 16
 #define MAX_OBJECTS 32
 #define MAX_IO_BYTES 16
@@ -27,8 +30,13 @@
 #define UNKNOWN_FLAG 0x40000000L
 #define READ_SENTINEL 0xa5U
 #define POLL_REVENTS_SENTINEL ((short)0x5a5a)
+#define WORKER_ACTOR 1L
+#define PENDING_GUARD_NANOSECONDS UINT64_C(50000000)
+#define COMPLETION_TIMEOUT_NANOSECONDS UINT64_C(5000000000)
+#define WAIT_POLL_NANOSECONDS 1000000L
 
-static const unsigned char trace_magic[8] = {'E', 'V', 'F', 'D', 'O', 'R', 'C', '1'};
+static const unsigned char trace_magic_v1[8] = {'E', 'V', 'F', 'D', 'O', 'R', 'C', '1'};
+static const unsigned char trace_magic_v2[8] = {'E', 'V', 'F', 'D', 'O', 'R', 'C', '2'};
 
 enum operation_kind {
     OP_EVENTFD = 1,
@@ -44,6 +52,10 @@ enum operation_kind {
     OP_GET_FD_FLAGS,
     OP_SET_FD_FLAGS,
     OP_POLL_MANY,
+    OP_START_READ,
+    OP_START_WRITE,
+    OP_ASSERT_PENDING,
+    OP_JOIN,
 };
 
 enum operation_difference {
@@ -89,6 +101,31 @@ enum run_mode {
     MODE_COMPARE,
 };
 
+enum worker_phase {
+    WORKER_IDLE,
+    WORKER_ENTERED,
+    WORKER_COMPLETED,
+};
+
+enum worker_kind {
+    WORKER_READ,
+    WORKER_WRITE,
+};
+
+struct worker_state {
+    pthread_t thread;
+    atomic_int phase;
+    enum worker_kind kind;
+    struct operation_result result;
+    int active;
+    int pending_confirmed;
+    int completable;
+    int slot;
+    int fd;
+    int object;
+    uint64_t value;
+};
+
 struct run_context {
     enum run_mode mode;
     FILE *trace;
@@ -97,6 +134,8 @@ struct run_context {
     int slot_objects[MAX_SLOTS];
     struct event_object objects[MAX_OBJECTS];
     int object_count;
+    long corpus_version;
+    struct worker_state worker;
     uint32_t scenario_index;
     uint32_t operation_index;
 };
@@ -115,6 +154,23 @@ static int fail_line(unsigned int line_number, const char *line, const char *mes
     return 1;
 }
 
+static int fail_schedule_timeout(unsigned int line_number, const char *line)
+{
+    fprintf(stderr,
+            "STARRY_EVENTFD_LINUX_ORACLE_SCHEDULE_TIMEOUT: line=%u operation=\"%s\"\n",
+            line_number, line);
+    return 1;
+}
+
+static int fail_harness(unsigned int line_number, const char *line,
+                        const char *message)
+{
+    fprintf(stderr,
+            "STARRY_EVENTFD_LINUX_ORACLE_HARNESS_ERROR: line=%u operation=\"%s\" %s\n",
+            line_number, line, message);
+    return 1;
+}
+
 static void initialize_scenario(struct run_context *context)
 {
     int index;
@@ -125,6 +181,8 @@ static void initialize_scenario(struct run_context *context)
     }
     memset(context->objects, 0, sizeof(context->objects));
     context->object_count = 0;
+    memset(&context->worker, 0, sizeof(context->worker));
+    atomic_init(&context->worker.phase, WORKER_IDLE);
 }
 
 static void close_scenario(struct run_context *context)
@@ -225,11 +283,139 @@ static void finish_syscall_result(struct operation_result *result, long syscall_
     result->error = syscall_result < 0 ? errno : 0;
 }
 
+static int monotonic_nanoseconds(uint64_t *value)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0 ||
+        now.tv_nsec < 0)
+        return -1;
+    *value = (uint64_t)now.tv_sec * UINT64_C(1000000000) +
+             (uint64_t)now.tv_nsec;
+    return 0;
+}
+
+static int sleep_wait_interval(void)
+{
+    struct timespec delay = {.tv_sec = 0, .tv_nsec = WAIT_POLL_NANOSECONDS};
+
+    while (nanosleep(&delay, &delay) != 0) {
+        if (errno != EINTR)
+            return -1;
+    }
+    return 0;
+}
+
+static int wait_for_worker_phase(struct worker_state *worker, int target,
+                                 uint64_t timeout_nanoseconds)
+{
+    uint64_t started;
+
+    if (monotonic_nanoseconds(&started) != 0)
+        return -1;
+    for (;;) {
+        uint64_t now;
+
+        if (atomic_load_explicit(&worker->phase, memory_order_acquire) >= target)
+            return 0;
+        if (monotonic_nanoseconds(&now) != 0)
+            return -1;
+        if (now - started >= timeout_nanoseconds)
+            return 1;
+        if (sleep_wait_interval() != 0)
+            return -1;
+    }
+}
+
+static int observe_pending_guard(struct worker_state *worker)
+{
+    uint64_t started;
+    int status = wait_for_worker_phase(worker, WORKER_ENTERED,
+                                       COMPLETION_TIMEOUT_NANOSECONDS);
+
+    if (status != 0)
+        return status == 1 ? 2 : -1;
+    if (monotonic_nanoseconds(&started) != 0)
+        return -1;
+    for (;;) {
+        uint64_t now;
+
+        if (atomic_load_explicit(&worker->phase, memory_order_acquire) ==
+            WORKER_COMPLETED)
+            return 1;
+        if (monotonic_nanoseconds(&now) != 0)
+            return -1;
+        if (now - started >= PENDING_GUARD_NANOSECONDS)
+            return 0;
+        if (sleep_wait_interval() != 0)
+            return -1;
+    }
+}
+
+static void *run_worker(void *argument)
+{
+    struct worker_state *worker = argument;
+    long syscall_result;
+
+    if (worker->kind == WORKER_READ) {
+        unsigned char buffer[MAX_IO_BYTES];
+        uint64_t decoded;
+
+        memset(buffer, READ_SENTINEL, sizeof(buffer));
+        atomic_store_explicit(&worker->phase, WORKER_ENTERED,
+                              memory_order_release);
+        errno = 0;
+        syscall_result = syscall(SYS_read, worker->fd, buffer, 8U);
+        finish_syscall_result(&worker->result, syscall_result);
+        memcpy(&decoded, buffer, sizeof(decoded));
+        worker->result.value = decoded;
+        worker->result.data_len = sizeof(buffer);
+        memcpy(worker->result.data, buffer, sizeof(buffer));
+    } else {
+        atomic_store_explicit(&worker->phase, WORKER_ENTERED,
+                              memory_order_release);
+        errno = 0;
+        syscall_result = syscall(SYS_write, worker->fd, &worker->value, 8U);
+        finish_syscall_result(&worker->result, syscall_result);
+    }
+    atomic_store_explicit(&worker->phase, WORKER_COMPLETED,
+                          memory_order_release);
+    return NULL;
+}
+
 static struct event_object *object_for_slot(struct run_context *context, int slot)
 {
     int object = context->slot_objects[slot];
 
     return object >= 0 ? &context->objects[object] : NULL;
+}
+
+static int valid_controller_trigger(const struct run_context *context, int slot,
+                                    long length, long pointer_mode,
+                                    int is_write, uint64_t value)
+{
+    if (!context->worker.active)
+        return 1;
+    if (!context->worker.pending_confirmed || context->worker.completable ||
+        context->slots[slot] < 0 || context->slot_objects[slot] < 0 ||
+        context->slot_objects[slot] != context->worker.object || length != 8 ||
+        pointer_mode != 0)
+        return 0;
+    return !is_write || value != UINT64_MAX;
+}
+
+static void update_worker_completable(struct run_context *context)
+{
+    struct event_object *object;
+
+    if (!context->worker.active)
+        return;
+    object = &context->objects[context->worker.object];
+    if (context->worker.kind == WORKER_READ)
+        context->worker.completable = object->count > 0;
+    else
+        context->worker.completable =
+            UINT64_MAX - object->count > context->worker.value;
 }
 
 static int create_object(struct run_context *context, int slot, uint64_t initval,
@@ -310,7 +496,9 @@ static int execute_read(struct run_context *context, char *save,
         parse_long_value(length_text, 0, MAX_IO_BYTES, &length) != 0 ||
         parse_long_value(pointer_text, 0, 1, &pointer_mode) != 0 ||
         strtok_r(NULL, " \t", &save) != NULL ||
-        !read_cannot_block(context, slot, length))
+        !read_cannot_block(context, slot, length) ||
+        (context->worker.active &&
+         !valid_controller_trigger(context, slot, length, pointer_mode, 0, 0)))
         return -1;
 
     memset(buffer, READ_SENTINEL, sizeof(buffer));
@@ -329,6 +517,7 @@ static int execute_read(struct run_context *context, char *save,
 
         object->count -= consumed;
     }
+    update_worker_completable(context);
     result->kind = OP_READ;
     return 0;
 }
@@ -364,7 +553,10 @@ static int execute_write(struct run_context *context, char *save,
         parse_long_value(pointer_text, 0, 1, &pointer_mode) != 0 ||
         parse_u64_value(value_text, &value) != 0 ||
         strtok_r(NULL, " \t", &save) != NULL ||
-        !write_cannot_block(context, slot, length, pointer_mode, value))
+        !write_cannot_block(context, slot, length, pointer_mode, value) ||
+        (context->worker.active &&
+         !valid_controller_trigger(context, slot, length, pointer_mode, 1,
+                                   value)))
         return -1;
 
     errno = 0;
@@ -376,6 +568,7 @@ static int execute_write(struct run_context *context, char *save,
     if (object != NULL && length >= 8 && pointer_mode == 0 &&
         value != UINT64_MAX && UINT64_MAX - object->count > value)
         object->count += value;
+    update_worker_completable(context);
     result->kind = OP_WRITE;
     return 0;
 }
@@ -542,11 +735,126 @@ static int execute_poll_many(struct run_context *context, char *save,
     return 0;
 }
 
+static int execute_start_worker(struct run_context *context, char *save,
+                                struct operation_result *result, int is_write)
+{
+    char *actor_text = strtok_r(NULL, " \t", &save);
+    char *slot_text = strtok_r(NULL, " \t", &save);
+    char *value_text = is_write ? strtok_r(NULL, " \t", &save) : NULL;
+    struct event_object *object;
+    uint64_t value = 0;
+    long actor;
+    int slot;
+
+    if (context->corpus_version != BLOCKING_CORPUS_VERSION ||
+        parse_long_value(actor_text, WORKER_ACTOR, WORKER_ACTOR, &actor) != 0 ||
+        parse_slot(slot_text, &slot) != 0 ||
+        (is_write && parse_u64_value(value_text, &value) != 0) ||
+        strtok_r(NULL, " \t", &save) != NULL || context->worker.active ||
+        context->slots[slot] < 0 || context->slot_objects[slot] < 0)
+        return -1;
+    object = object_for_slot(context, slot);
+    if (object == NULL || object->nonblocking ||
+        (!is_write && object->count != 0) ||
+        (is_write &&
+         (value == UINT64_MAX || UINT64_MAX - object->count > value)))
+        return -1;
+
+    memset(&context->worker, 0, sizeof(context->worker));
+    atomic_init(&context->worker.phase, WORKER_IDLE);
+    context->worker.kind = is_write ? WORKER_WRITE : WORKER_READ;
+    context->worker.active = 1;
+    context->worker.slot = slot;
+    context->worker.fd = context->slots[slot];
+    context->worker.object = context->slot_objects[slot];
+    context->worker.value = value;
+    if (pthread_create(&context->worker.thread, NULL, run_worker,
+                       &context->worker) != 0) {
+        context->worker.active = 0;
+        return -2;
+    }
+    result->kind = is_write ? OP_START_WRITE : OP_START_READ;
+    result->value = value;
+    return 0;
+}
+
+static int execute_assert_pending(struct run_context *context, char *save,
+                                  struct operation_result *result)
+{
+    char *actor_text = strtok_r(NULL, " \t", &save);
+    long actor;
+    int pending_status;
+
+    if (context->corpus_version != BLOCKING_CORPUS_VERSION ||
+        parse_long_value(actor_text, WORKER_ACTOR, WORKER_ACTOR, &actor) != 0 ||
+        strtok_r(NULL, " \t", &save) != NULL || !context->worker.active ||
+        context->worker.completable)
+        return -1;
+    pending_status = observe_pending_guard(&context->worker);
+    if (pending_status < 0)
+        return -2;
+    if (pending_status == 2)
+        return -4;
+    result->kind = OP_ASSERT_PENDING;
+    result->result = pending_status == 1 ? 1 : 0;
+    if (pending_status == 1)
+        return context->mode == MODE_RECORD ? -3 : 0;
+    context->worker.pending_confirmed = 1;
+    return 0;
+}
+
+static int execute_join(struct run_context *context, char *save,
+                        struct operation_result *result)
+{
+    char *actor_text = strtok_r(NULL, " \t", &save);
+    struct event_object *object;
+    long actor;
+    int wait_status;
+
+    if (context->corpus_version != BLOCKING_CORPUS_VERSION ||
+        parse_long_value(actor_text, WORKER_ACTOR, WORKER_ACTOR, &actor) != 0 ||
+        strtok_r(NULL, " \t", &save) != NULL || !context->worker.active ||
+        !context->worker.pending_confirmed || !context->worker.completable)
+        return -1;
+    wait_status = wait_for_worker_phase(&context->worker, WORKER_COMPLETED,
+                                        COMPLETION_TIMEOUT_NANOSECONDS);
+    if (wait_status < 0)
+        return -2;
+    if (wait_status > 0)
+        return -4;
+    if (pthread_join(context->worker.thread, NULL) != 0)
+        return -2;
+
+    result->kind = OP_JOIN;
+    result->result = context->worker.result.result;
+    result->error = context->worker.result.error;
+    result->value = context->worker.result.value;
+    result->data_len = context->worker.result.data_len;
+    memcpy(result->data, context->worker.result.data, sizeof(result->data));
+
+    object = &context->objects[context->worker.object];
+    if (context->worker.kind == WORKER_READ) {
+        uint64_t consumed = object->semaphore ? 1 : object->count;
+
+        object->count -= consumed;
+    } else {
+        object->count += context->worker.value;
+    }
+    context->worker.active = 0;
+    return 0;
+}
+
 static int execute_operation(struct run_context *context, char *line,
                              struct operation_result *result)
 {
     char *save = NULL;
     char *operation = strtok_r(line, " \t", &save);
+
+    if (context->worker.active && strcmp(operation, "read") != 0 &&
+        strcmp(operation, "write") != 0 &&
+        strcmp(operation, "assert-pending") != 0 &&
+        strcmp(operation, "join") != 0)
+        return -1;
 
     if (strcmp(operation, "eventfd") == 0)
         return execute_eventfd(context, save, result, 0);
@@ -578,6 +886,14 @@ static int execute_operation(struct run_context *context, char *line,
                              OP_SET_FD_FLAGS, 0);
     if (strcmp(operation, "poll-many") == 0)
         return execute_poll_many(context, save, result);
+    if (strcmp(operation, "start-read") == 0)
+        return execute_start_worker(context, save, result, 0);
+    if (strcmp(operation, "start-write") == 0)
+        return execute_start_worker(context, save, result, 1);
+    if (strcmp(operation, "assert-pending") == 0)
+        return execute_assert_pending(context, save, result);
+    if (strcmp(operation, "join") == 0)
+        return execute_join(context, save, result);
     return -1;
 }
 
@@ -634,11 +950,21 @@ static int process_operation(struct run_context *context, char *parse_line,
                              const char *display_line, unsigned int line_number)
 {
     struct operation_result result;
+    int execution_status;
 
     memset(&result, 0, sizeof(result));
     result.scenario_index = context->scenario_index;
     result.operation_index = context->operation_index;
-    if (execute_operation(context, parse_line, &result) != 0)
+    execution_status = execute_operation(context, parse_line, &result);
+    if (execution_status == -2)
+        return fail_harness(line_number, display_line,
+                            "thread or monotonic-clock operation failed");
+    if (execution_status == -3)
+        return fail_line(line_number, display_line,
+                         "worker completed before pending guard");
+    if (execution_status == -4)
+        return fail_schedule_timeout(line_number, display_line);
+    if (execution_status != 0)
         return fail_line(line_number, display_line, "invalid operation");
     if (context->mode == MODE_RECORD) {
         if (fwrite(&result, sizeof(result), 1, context->trace) != 1)
@@ -684,8 +1010,8 @@ static int process_corpus(struct run_context *context, const char *corpus_path)
             long version;
 
             if (saw_version || saw_scenario ||
-                parse_long_value(trim(line + 8), CORPUS_VERSION,
-                                 CORPUS_VERSION, &version) != 0) {
+                parse_long_value(trim(line + 8), context->corpus_version,
+                                 context->corpus_version, &version) != 0) {
                 status = fail_line(line_number, display_line, "invalid corpus version");
                 break;
             }
@@ -696,7 +1022,8 @@ static int process_corpus(struct run_context *context, const char *corpus_path)
             char *name = trim(line + 9);
 
             if (!saw_version || *name == '\0' || strchr(name, ' ') != NULL ||
-                strchr(name, '\t') != NULL) {
+                strchr(name, '\t') != NULL ||
+                (saw_scenario && context->worker.active)) {
                 status = fail_line(line_number, display_line, "invalid scenario");
                 break;
             }
@@ -719,6 +1046,8 @@ static int process_corpus(struct run_context *context, const char *corpus_path)
         status = fail("cannot read operation corpus");
     if ((!saw_version || !saw_scenario || context->operation_index == 0U) && status == 0)
         status = fail("operation corpus is incomplete");
+    if (context->worker.active && status == 0)
+        status = fail("operation corpus ends with an active worker");
     close_scenario(context);
     if (fclose(corpus) != 0 && status == 0)
         status = fail("cannot close operation corpus");
@@ -748,6 +1077,36 @@ static int digest_file(const char *path, uint64_t *digest)
     return 0;
 }
 
+static int read_corpus_version(const char *path, long *version)
+{
+    FILE *corpus = fopen(path, "r");
+    char raw_line[MAX_LINE_BYTES];
+    int status = -1;
+
+    if (corpus == NULL)
+        return -1;
+    while (fgets(raw_line, sizeof(raw_line), corpus) != NULL) {
+        char *comment = strchr(raw_line, '#');
+        char *line;
+
+        if (comment != NULL)
+            *comment = '\0';
+        line = trim(raw_line);
+        if (*line == '\0')
+            continue;
+        if (strncmp(line, "version ", 8) == 0 &&
+            parse_long_value(trim(line + 8), SIMPLE_CORPUS_VERSION,
+                             BLOCKING_CORPUS_VERSION, version) == 0)
+            status = 0;
+        break;
+    }
+    if (ferror(corpus) != 0)
+        status = -1;
+    if (fclose(corpus) != 0)
+        status = -1;
+    return status;
+}
+
 static void copy_metadata(char *destination, size_t capacity, const char *source)
 {
     size_t length = strnlen(source, capacity - 1U);
@@ -756,14 +1115,17 @@ static void copy_metadata(char *destination, size_t capacity, const char *source
     destination[length] = '\0';
 }
 
-static int initialize_record_header(struct trace_header *header, uint64_t corpus_digest)
+static int initialize_record_header(struct trace_header *header,
+                                    uint64_t corpus_digest, long corpus_version)
 {
     struct utsname system_name;
     long page_size;
 
     memset(header, 0, sizeof(*header));
-    memcpy(header->magic, trace_magic, sizeof(trace_magic));
-    header->version = TRACE_VERSION;
+    memcpy(header->magic,
+           corpus_version == SIMPLE_CORPUS_VERSION ? trace_magic_v1 : trace_magic_v2,
+           sizeof(header->magic));
+    header->version = (uint32_t)corpus_version;
     header->corpus_digest = corpus_digest;
     if (uname(&system_name) != 0)
         return -1;
@@ -777,15 +1139,16 @@ static int initialize_record_header(struct trace_header *header, uint64_t corpus
 }
 
 static int record_trace(const char *corpus_path, const char *trace_path,
-                        uint64_t corpus_digest)
+                        uint64_t corpus_digest, long corpus_version)
 {
     struct run_context context;
     int status;
 
     memset(&context, 0, sizeof(context));
     context.mode = MODE_RECORD;
+    context.corpus_version = corpus_version;
     initialize_scenario(&context);
-    if (initialize_record_header(&context.header, corpus_digest) != 0)
+    if (initialize_record_header(&context.header, corpus_digest, corpus_version) != 0)
         return fail("cannot read host Linux metadata");
     context.trace = fopen(trace_path, "wb+");
     if (context.trace == NULL)
@@ -813,7 +1176,7 @@ static int record_trace(const char *corpus_path, const char *trace_path,
 }
 
 static int compare_trace(const char *corpus_path, const char *trace_path,
-                         uint64_t corpus_digest)
+                         uint64_t corpus_digest, long corpus_version)
 {
     struct run_context context;
     unsigned char trailing_byte;
@@ -821,13 +1184,17 @@ static int compare_trace(const char *corpus_path, const char *trace_path,
 
     memset(&context, 0, sizeof(context));
     context.mode = MODE_COMPARE;
+    context.corpus_version = corpus_version;
     initialize_scenario(&context);
     context.trace = fopen(trace_path, "rb");
     if (context.trace == NULL)
         return fail("cannot open expected trace");
     if (fread(&context.header, sizeof(context.header), 1, context.trace) != 1 ||
-        memcmp(context.header.magic, trace_magic, sizeof(trace_magic)) != 0 ||
-        context.header.version != TRACE_VERSION ||
+        memcmp(context.header.magic,
+               corpus_version == SIMPLE_CORPUS_VERSION ? trace_magic_v1
+                                                       : trace_magic_v2,
+               sizeof(context.header.magic)) != 0 ||
+        context.header.version != (uint32_t)corpus_version ||
         context.header.corpus_digest != corpus_digest) {
         fclose(context.trace);
         return fail("invalid expected trace header or corpus digest");
@@ -857,6 +1224,7 @@ int main(int argc, char **argv)
 {
     enum run_mode mode;
     uint64_t corpus_digest;
+    long corpus_version;
 
     if (argc != 4)
         return fail("usage: eventfd-linux-oracle --record|--compare CORPUS TRACE");
@@ -868,7 +1236,9 @@ int main(int argc, char **argv)
         return fail("unknown mode");
     if (digest_file(argv[2], &corpus_digest) != 0)
         return fail("cannot digest operation corpus");
+    if (read_corpus_version(argv[2], &corpus_version) != 0)
+        return fail("invalid corpus version");
     if (mode == MODE_RECORD)
-        return record_trace(argv[2], argv[3], corpus_digest);
-    return compare_trace(argv[2], argv[3], corpus_digest);
+        return record_trace(argv[2], argv[3], corpus_digest, corpus_version);
+    return compare_trace(argv[2], argv[3], corpus_digest, corpus_version);
 }

@@ -10,10 +10,10 @@ _SCRIPTS_ROOT = Path(__file__).resolve().parents[1]
 if str(_SCRIPTS_ROOT) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_ROOT))
 
-from adapter import SPEC
 from linux_oracle.campaign import CampaignRequest
 from linux_oracle.driver import run_campaign as _run_common_campaign
 from linux_oracle.persistence import PersistentStateError
+from models import DEFAULT_MODEL, MODEL_NAMES, spec_for_model
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -24,10 +24,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--max-qemu", type=int, default=64)
     parser.add_argument("--max-minimize", type=int, default=8)
     parser.add_argument("--no-minimize", action="store_true")
+    parser.add_argument("--model", choices=MODEL_NAMES, default=DEFAULT_MODEL)
     parser.add_argument(
         "--workspace", type=Path, default=Path(__file__).resolve().parents[2]
     )
     args = parser.parse_args(argv)
+    spec = spec_for_model(args.model)
     try:
         request = CampaignRequest(
             args.seed,
@@ -37,9 +39,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.max_minimize,
             not args.no_minimize,
         )
-        return _run_common_campaign(SPEC, request, args.workspace)
+        return _run_common_campaign(spec, request, args.workspace)
     except (OSError, PersistentStateError, RuntimeError, ValueError) as error:
-        print(f"{SPEC.adapter_id} campaign failed: {error}", file=sys.stderr)
+        print(f"{spec.adapter_id} campaign failed: {error}", file=sys.stderr)
         return 1
 
 

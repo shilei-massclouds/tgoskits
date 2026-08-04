@@ -8,10 +8,10 @@ import tempfile
 from pathlib import Path
 from typing import Optional, Sequence
 
-from artifact import load_failure
-from host_runtime import record_host
-from runner import run_guest_compare
-from store import PersistentStateError
+from linux_oracle.failure import load_failure
+from linux_oracle.persistence import PersistentStateError
+from linux_oracle.qemu import run_guest_compare
+from models import spec_for_failure
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -21,24 +21,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--workspace", type=Path, default=Path(__file__).resolve().parents[2])
     args = parser.parse_args(argv)
     try:
-        artifact = load_failure(args.failure)
+        spec = spec_for_failure(args.failure)
+        artifact = load_failure(spec, args.failure)
         artifact_dir = artifact.path
         temporary = None
         if args.refresh_host:
             temporary = tempfile.TemporaryDirectory()
             artifact_dir = Path(temporary.name)
-            shutil.copy2(artifact.host_elf_path, artifact_dir / "eventfd-linux-oracle")
-            shutil.copy2(artifact.ops_path, artifact_dir / "eventfd.ops")
-            recorded = record_host(
-                artifact_dir / "eventfd-linux-oracle",
-                artifact_dir / "eventfd.ops",
-                artifact_dir / "linux.trace",
+            shutil.copy2(
+                artifact.host_elf_path,
+                artifact_dir / spec.artifacts.host_executable_filename,
+            )
+            shutil.copy2(
+                artifact.ops_path,
+                artifact_dir / spec.artifacts.scenario_filename,
+            )
+            recorded = spec.host_record(
+                artifact_dir / spec.artifacts.host_executable_filename,
+                artifact_dir / spec.artifacts.scenario_filename,
+                artifact_dir / spec.artifacts.trace_filename,
             )
             if not recorded.passed:
                 print(recorded.log, file=sys.stderr)
                 return 1
         result = run_guest_compare(
-            args.workspace.resolve(), artifact_dir, artifact.starry_elf_path
+            spec,
+            args.workspace.resolve(),
+            artifact_dir,
+            pinned_starry_elf=artifact.starry_elf_path,
         )
         print(result.log)
         if temporary is not None:
