@@ -21,6 +21,9 @@ TARGET_SOURCE_PATHS = tuple(
         | {
             "os/StarryOS/kernel/src/syscall/mod.rs",
             "os/StarryOS/kernel/src/syscall/signal.rs",
+            "os/StarryOS/kernel/src/syscall/io_mpx/epoll.rs",
+            "os/StarryOS/kernel/src/file/epoll.rs",
+            "os/StarryOS/kernel/src/file/epoll_file.rs",
             "os/StarryOS/kernel/src/task/signal.rs",
             "os/StarryOS/kernel/src/task/user.rs",
         }

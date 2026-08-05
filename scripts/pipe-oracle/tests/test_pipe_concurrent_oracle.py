@@ -20,12 +20,69 @@ import concurrent_generator  # noqa: E402
 import concurrent_mutation  # noqa: E402
 import concurrent_scenario  # noqa: E402
 import fuzz  # noqa: E402
+import fingerprint  # noqa: E402
 import guest_result  # noqa: E402
 import models  # noqa: E402
 from linux_oracle.outcomes import AllowedTrace, decode_raw_run_trace, fnv1a64  # noqa: E402
 
 
 class PipeConcurrentCodecTests(unittest.TestCase):
+    def test_epoll_operations_and_wait_families_round_trip(self):
+        encoded = (
+            "version 7\n"
+            "scenario lt\n"
+            "pipe2 0 1 0\n"
+            "epoll-create 2 0\n"
+            "epoll-ctl 2 add 0 1 17\n"
+            "start-epoll-wait 1 2 1 -1\n"
+            "start-epoll-wait 2 2 1 -1\n"
+            "assert-all-pending\n"
+            "write 1 1 65\n"
+            "join-set 1 2\n"
+            "epoll-ctl 2 mod 0 1073741825 34\n"
+            "epoll-ctl 2 del 0 0 0\n"
+            "scenario pwait\n"
+            "signal-config 10 268435456\n"
+            "pipe2 0 1 0\n"
+            "epoll-create 2 524288\n"
+            "epoll-ctl 2 add 0 2147483649 51\n"
+            "start-epoll-pwait 1 2 4 -1 usr1\n"
+            "assert-pending 1\n"
+            "send-signal 1 10\n"
+            "assert-signal-handled 1 0\n"
+            "write 1 1 66\n"
+            "join 1\n"
+            "assert-signal-handled 1 1\n"
+            "scenario pwait2\n"
+            "epoll-create 0 0\n"
+            "start-epoll-pwait2 2 0 4 200000000 empty\n"
+            "assert-pending 2\n"
+            "join 2\n"
+        )
+
+        document = concurrent_scenario.parse_document(encoded)
+        canonical = concurrent_scenario.serialize_document(document)
+
+        self.assertEqual(concurrent_scenario.parse_document(canonical), document)
+        self.assertIn("epoll-ctl 2 mod 0 1073741825 34", canonical)
+        self.assertIn("start-epoll-pwait2 2 0 4 200000000 empty", canonical)
+
+    def test_epoll_rejects_invalid_flags_events_actions_and_timeouts(self):
+        prefix = "version 7\nscenario x\npipe2 0 1 0\nepoll-create 2 0\n"
+        for operation in (
+            "epoll-create 3 1",
+            "epoll-ctl 2 add 0 2 1",
+            "epoll-ctl 2 mod 0 268435457 1",
+            "epoll-ctl 2 del 0 1 0",
+            "start-epoll-wait 1 2 0 -1",
+            "start-epoll-pwait 1 2 1 -1 all",
+            "start-epoll-pwait2 1 2 1 1000000001 empty",
+        ):
+            with self.subTest(operation=operation), self.assertRaises(
+                concurrent_scenario.ScenarioCodecError
+            ):
+                concurrent_scenario.parse_document(prefix + operation + "\n")
+
     def test_signal_timeout_and_ppoll_atomic_mask_round_trip(self):
         encoded = (
             "version 7\nscenario signal-timeout\n"
@@ -125,6 +182,28 @@ class PipeConcurrentRoutingTests(unittest.TestCase):
         self.assertIn(
             "kernel/src/task/signal.rs", concurrent_coverage.TARGET_SOURCE_PATHS
         )
+        self.assertIn(
+            "kernel/src/syscall/io_mpx/epoll.rs",
+            concurrent_coverage.TARGET_SOURCE_PATHS,
+        )
+        self.assertEqual(
+            {name: fingerprint._OPERATION_KINDS[name] for name in (
+                "start-ppoll",
+                "epoll-create",
+                "epoll-ctl",
+                "start-epoll-wait",
+                "start-epoll-pwait",
+                "start-epoll-pwait2",
+            )},
+            {
+                "start-ppoll": 31,
+                "epoll-create": 32,
+                "epoll-ctl": 33,
+                "start-epoll-wait": 34,
+                "start-epoll-pwait": 35,
+                "start-epoll-pwait2": 36,
+            },
+        )
         self.assertEqual(models.spec_for_model("simple-single").adapter_id, "pipe-v4")
         self.assertEqual(models.spec_for_model("blocking").adapter_id, "pipe-blocking-v2")
 
@@ -155,7 +234,7 @@ class PipeConcurrentRoutingTests(unittest.TestCase):
 
     def test_generator_mutation_and_timeout_categories_cover_new_stories(self):
         generated = []
-        for story in range(9):
+        for story in range(concurrent_generator.STORY_COUNT):
             scenario = concurrent_generator.generate_scenario(
                 concurrent_generator.CampaignRng(42 + story), story=story
             )
@@ -171,6 +250,19 @@ class PipeConcurrentRoutingTests(unittest.TestCase):
             any(
                 isinstance(operation, concurrent_scenario.StartPpoll)
                 for operation in generated[8].operations
+            )
+        )
+        self.assertTrue(
+            any(
+                isinstance(operation, concurrent_scenario.StartEpollWait)
+                for scenario in generated[9:14]
+                for operation in scenario.operations
+            )
+        )
+        self.assertTrue(
+            any(
+                isinstance(operation, concurrent_scenario.StartEpollPwait2)
+                for operation in generated[14].operations
             )
         )
 
@@ -267,6 +359,36 @@ class PipeConcurrentHarnessTests(unittest.TestCase):
             )
         self.assertEqual(compared.returncode, 0, compared.stderr)
 
+    def test_epoll_wait_pwait_and_pwait2_execute_on_host(self):
+        encoded = (
+            "version 7\nscenario lt\npipe2 0 1 0\nepoll-create 2 0\n"
+            "epoll-ctl 2 add 0 1 17\nstart-epoll-wait 1 2 1 -1\n"
+            "start-epoll-wait 2 2 1 -1\nassert-all-pending\n"
+            "write 1 1 65\njoin-set 1 2\n"
+            "scenario pwait\nsignal-config 10 268435456\npipe2 0 1 0\n"
+            "epoll-create 2 0\nepoll-ctl 2 add 0 2147483649 34\n"
+            "start-epoll-pwait 1 2 4 -1 usr1\nassert-pending 1\n"
+            "send-signal 1 10\nassert-signal-handled 1 0\n"
+            "write 1 1 66\njoin 1\nassert-signal-handled 1 1\n"
+            "scenario timeout\nepoll-create 0 0\n"
+            "start-epoll-pwait2 2 0 4 200000000 empty\n"
+            "assert-pending 2\njoin 2\n"
+        )
+        document = concurrent_scenario.parse_document(encoded)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            corpus = root / "epoll.ops"
+            trace = root / "epoll.trace"
+            corpus.write_text(concurrent_scenario.serialize_document(document))
+            result = subprocess.run(
+                [str(self.oracle), "--record", str(corpus), str(trace)],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("operations=23 scenarios=3", result.stdout)
+
     def test_cleanup_joins_restart_mask_and_large_write_workers(self):
         corpora = (
             "version 7\nscenario cleanup\nsignal-config 10 268435456\n"
@@ -277,6 +399,11 @@ class PipeConcurrentHarnessTests(unittest.TestCase):
             "send-signal 1 10\nassert-signal-handled 1 0\ninvalid\n",
             "version 7\nscenario cleanup\npipe2 0 1 0\nset-size 1 4096\n"
             "write 1 4096 17\nstart-write 1 1 8192\nassert-pending 1\ninvalid\n",
+            "version 7\nscenario cleanup\nsignal-config 10 268435456\n"
+            "pipe2 0 1 0\nepoll-create 2 0\n"
+            "epoll-ctl 2 add 0 2147483649 17\n"
+            "start-epoll-pwait 1 2 1 -1 usr1\nassert-pending 1\n"
+            "send-signal 1 10\nassert-signal-handled 1 0\ninvalid\n",
         )
         for index, encoded in enumerate(corpora):
             with self.subTest(index=index), tempfile.TemporaryDirectory() as temporary:

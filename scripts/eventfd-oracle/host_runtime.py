@@ -33,10 +33,29 @@ def find_or_build_host_oracle(workspace: Path) -> Optional[Path]:
 
 
 def record_host(elf: Path, ops: Path, trace: Path) -> HostRecordResult:
+    environment = os.environ.copy()
+    environment.pop("STARRY_EVENTFD_CONCURRENT_START_BIAS", None)
+    return _record_host(elf, ops, trace, environment)
+
+
+def record_host_scheduled(
+    elf: Path, ops: Path, trace: Path, run_index: int
+) -> HostRecordResult:
+    environment = os.environ.copy()
+    environment["STARRY_EVENTFD_CONCURRENT_START_BIAS"] = str(
+        run_index % 2 + 1
+    )
+    return _record_host(elf, ops, trace, environment)
+
+
+def _record_host(
+    elf: Path, ops: Path, trace: Path, environment: dict[str, str]
+) -> HostRecordResult:
     try:
         result = subprocess.run(
             [str(elf), "--record", str(ops), str(trace)],
             capture_output=True,
+            env=environment,
             text=True,
             timeout=30,
         )
@@ -62,4 +81,9 @@ def _is_parser_rejection(stderr: str) -> bool:
     return any(message in stderr for message in messages)
 
 
-__all__ = ["HostRecordResult", "find_or_build_host_oracle", "record_host"]
+__all__ = [
+    "HostRecordResult",
+    "find_or_build_host_oracle",
+    "record_host",
+    "record_host_scheduled",
+]

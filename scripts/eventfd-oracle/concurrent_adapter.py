@@ -15,6 +15,7 @@ import concurrent_scenario
 from guest_result import classify_guest_execution, normalize_guest_execution
 from host_runtime import find_or_build_host_oracle
 from host_runtime import record_host as record_host_once
+from host_runtime import record_host_scheduled
 from linux_oracle.batch import HostRecordResult
 from linux_oracle.host_record import record_converged_host
 from linux_oracle.outcomes import decode_raw_run_trace, fnv1a64
@@ -57,6 +58,7 @@ def record_host_converged(
         version=4,
         temporary_prefix=".eventfd-concurrent-v1-host-",
         deterministic=(6, 7),
+        indexed_record_once=record_host_scheduled,
     )
 
 

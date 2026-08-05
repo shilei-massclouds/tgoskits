@@ -28,6 +28,15 @@ _KINDS = {
     "start-poll": 18,
     "assert-all-pending": 19,
     "join-set": 20,
+    "signal-config": 21,
+    "send-signal": 22,
+    "assert-signal-handled": 23,
+    "start-ppoll": 24,
+    "epoll-create": 25,
+    "epoll-ctl": 26,
+    "start-epoll-wait": 27,
+    "start-epoll-pwait": 28,
+    "start-epoll-pwait2": 29,
 }
 _FIELD_ORDER = ("result", "errno", "value", "data_len", "data")
 

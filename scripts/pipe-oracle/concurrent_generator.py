@@ -9,6 +9,14 @@ from concurrent_scenario import (
     AssertSignalHandled,
     Close,
     Dup,
+    EPOLLEXCLUSIVE,
+    EPOLLIN,
+    EPOLLONESHOT,
+    EPOLLET,
+    EPOLLOUT,
+    EpollCreate,
+    EpollCtl,
+    EpollCtlAction,
     Join,
     JoinSet,
     O_NONBLOCK,
@@ -27,6 +35,9 @@ from concurrent_scenario import (
     SignalMask,
     StartPoll,
     StartPpoll,
+    StartEpollPwait,
+    StartEpollPwait2,
+    StartEpollWait,
     StartRead,
     StartWrite,
     Write,
@@ -38,7 +49,7 @@ from generator import CampaignRng
 
 
 GENERATOR_VERSION = "pipe-concurrent-generator-v1"
-STORY_COUNT = 9
+STORY_COUNT = 15
 
 
 @dataclass(frozen=True)
@@ -127,7 +138,19 @@ def generate_scenario(rng: CampaignRng, story: Optional[int] = None) -> Scenario
         return _signal_story(rng, actors[0])
     if story_index == 7:
         return _timeout_story(rng, actors[0])
-    return _ppoll_story(rng, actors[0])
+    if story_index == 8:
+        return _ppoll_story(rng, actors[0])
+    if story_index == 9:
+        return _epoll_lt_story(rng, actors)
+    if story_index == 10:
+        return _epoll_et_story(rng, actors)
+    if story_index == 11:
+        return _epoll_oneshot_story(rng, actors)
+    if story_index == 12:
+        return _epoll_exclusive_story(rng, actors)
+    if story_index == 13:
+        return _epoll_hup_err_story(rng, actors)
+    return _epoll_signal_timeout_story(rng, actors[0])
 
 
 def generate_document(rng: CampaignRng) -> ScenarioDocument:
@@ -261,6 +284,134 @@ def _ppoll_story(rng: CampaignRng, actor: int) -> Scenario:
             ),
             AssertPending(actor),
             Write(pairs[3][1], 1, 102),
+            Join(actor),
+        )
+    )
+
+
+def _epoll_lt_story(rng: CampaignRng, actors: tuple[int, int]) -> Scenario:
+    read_slot, write_slot, alias, epoll = _distinct_slots(rng, 4)
+    return Scenario(
+        (
+            Pipe2(read_slot, write_slot, 0),
+            Dup(read_slot, alias),
+            EpollCreate(epoll, 0),
+            EpollCtl(epoll, EpollCtlAction.ADD, read_slot, EPOLLIN, 17),
+            EpollCtl(epoll, EpollCtlAction.ADD, alias, EPOLLIN, 34),
+            StartEpollWait(actors[0], epoll, 1, -1),
+            StartEpollWait(actors[1], epoll, 1, -1),
+            AssertAllPending(),
+            Write(write_slot, 1, 65),
+            JoinSet((1, 2)),
+        )
+    )
+
+
+def _epoll_et_story(rng: CampaignRng, actors: tuple[int, int]) -> Scenario:
+    read_slot, write_slot, epoll = _distinct_slots(rng, 3)
+    return Scenario(
+        (
+            Pipe2(read_slot, write_slot, 0),
+            EpollCreate(epoll, 0),
+            EpollCtl(epoll, EpollCtlAction.ADD, read_slot, EPOLLIN | EPOLLET, 51),
+            StartEpollWait(actors[0], epoll, 1, -1),
+            StartEpollWait(actors[1], epoll, 1, -1),
+            AssertAllPending(),
+            Write(write_slot, 1, 66),
+            Read(read_slot, 1),
+            Write(write_slot, 1, 67),
+            JoinSet((1, 2)),
+        )
+    )
+
+
+def _epoll_oneshot_story(rng: CampaignRng, actors: tuple[int, int]) -> Scenario:
+    read_slot, write_slot, epoll = _distinct_slots(rng, 3)
+    events = EPOLLIN | EPOLLONESHOT
+    return Scenario(
+        (
+            Pipe2(read_slot, write_slot, 0),
+            EpollCreate(epoll, 0),
+            EpollCtl(epoll, EpollCtlAction.ADD, read_slot, events, 68),
+            StartEpollWait(actors[0], epoll, 1, -1),
+            StartEpollWait(actors[1], epoll, 1, -1),
+            AssertAllPending(),
+            Write(write_slot, 1, 68),
+            EpollCtl(epoll, EpollCtlAction.MOD, read_slot, events, 85),
+            JoinSet((1, 2)),
+        )
+    )
+
+
+def _epoll_exclusive_story(rng: CampaignRng, actors: tuple[int, int]) -> Scenario:
+    read_slot, write_slot, first_epoll, second_epoll = _distinct_slots(rng, 4)
+    events = EPOLLIN | EPOLLEXCLUSIVE
+    return Scenario(
+        (
+            Pipe2(read_slot, write_slot, 0),
+            EpollCreate(first_epoll, 0),
+            EpollCreate(second_epoll, 0),
+            EpollCtl(first_epoll, EpollCtlAction.ADD, read_slot, events, 102),
+            EpollCtl(second_epoll, EpollCtlAction.ADD, read_slot, events, 119),
+            StartEpollWait(actors[0], first_epoll, 1, -1),
+            StartEpollWait(actors[1], second_epoll, 1, -1),
+            AssertAllPending(),
+            Write(write_slot, 1, 69),
+            Read(read_slot, 1),
+            Write(write_slot, 1, 70),
+            JoinSet((1, 2)),
+        )
+    )
+
+
+def _epoll_hup_err_story(rng: CampaignRng, actors: tuple[int, int]) -> Scenario:
+    slots = _distinct_slots(rng, 6)
+    hup_read, hup_write, hup_epoll, err_read, err_write, err_epoll = slots
+    return Scenario(
+        (
+            Pipe2(hup_read, hup_write, 0),
+            EpollCreate(hup_epoll, 0),
+            EpollCtl(hup_epoll, EpollCtlAction.ADD, hup_read, EPOLLIN, 136),
+            StartEpollWait(actors[0], hup_epoll, 1, -1),
+            StartEpollWait(actors[1], hup_epoll, 1, -1),
+            AssertAllPending(),
+            Close(hup_write),
+            JoinSet((1, 2)),
+            Pipe2(err_read, err_write, 0),
+            SetSize(err_write, 4096),
+            Write(err_write, 4096, 85),
+            EpollCreate(err_epoll, 0),
+            EpollCtl(err_epoll, EpollCtlAction.ADD, err_write, EPOLLOUT, 153),
+            StartEpollWait(actors[0], err_epoll, 1, -1),
+            StartEpollWait(actors[1], err_epoll, 1, -1),
+            AssertAllPending(),
+            Close(err_read),
+            JoinSet((1, 2)),
+        )
+    )
+
+
+def _epoll_signal_timeout_story(rng: CampaignRng, actor: int) -> Scenario:
+    read_slot, write_slot, epoll, timeout_epoll = _distinct_slots(rng, 4)
+    return Scenario(
+        (
+            SignalConfig(SIGUSR1, SA_RESTART),
+            Pipe2(read_slot, write_slot, 0),
+            EpollCreate(epoll, 0),
+            EpollCtl(epoll, EpollCtlAction.ADD, read_slot, EPOLLIN | EPOLLET, 170),
+            StartEpollPwait(actor, epoll, 4, -1, SignalMask.USR1),
+            AssertPending(actor),
+            SendSignal(actor, SIGUSR1),
+            AssertSignalHandled(actor, 0),
+            AssertPending(actor),
+            Write(write_slot, 1, 86),
+            Join(actor),
+            AssertSignalHandled(actor, 1),
+            EpollCreate(timeout_epoll, 0),
+            StartEpollPwait2(
+                actor, timeout_epoll, 4, 200_000_000, SignalMask.EMPTY
+            ),
+            AssertPending(actor),
             Join(actor),
         )
     )

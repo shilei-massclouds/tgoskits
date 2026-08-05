@@ -25,6 +25,17 @@ SIGUSR1 = 10
 SA_RESTART = 268435456
 SIGNAL_FLAGS = (0, SA_RESTART)
 MAX_TIMEOUT_NS = 1_000_000_000
+EPOLL_CLOEXEC = 524288
+EPOLLIN = 1
+EPOLLOUT = 4
+EPOLLERR = 8
+EPOLLHUP = 16
+EPOLLEXCLUSIVE = 268435456
+EPOLLONESHOT = 1073741824
+EPOLLET = 2147483648
+EPOLL_READY_BITS = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP
+EPOLL_MODE_BITS = EPOLLEXCLUSIVE | EPOLLONESHOT | EPOLLET
+EPOLL_ALLOWED_BITS = EPOLL_READY_BITS | EPOLL_MODE_BITS
 
 Scenario = blocking.Scenario
 ScenarioDocument = blocking.ScenarioDocument
@@ -102,6 +113,53 @@ class AssertSignalHandled:
     count: int
 
 
+class EpollCtlAction(str, Enum):
+    ADD = "add"
+    MOD = "mod"
+    DEL = "del"
+
+
+@dataclass(frozen=True)
+class EpollCreate:
+    slot: int
+    flags: int
+
+
+@dataclass(frozen=True)
+class EpollCtl:
+    epoll_slot: int
+    action: EpollCtlAction
+    target_slot: int
+    events: int
+    data: int
+
+
+@dataclass(frozen=True)
+class StartEpollWait:
+    actor: int
+    epoll_slot: int
+    maxevents: int
+    timeout_ms: int
+
+
+@dataclass(frozen=True)
+class StartEpollPwait:
+    actor: int
+    epoll_slot: int
+    maxevents: int
+    timeout_ms: int
+    sigmask: SignalMask
+
+
+@dataclass(frozen=True)
+class StartEpollPwait2:
+    actor: int
+    epoll_slot: int
+    maxevents: int
+    timeout_ns: Optional[int]
+    sigmask: SignalMask
+
+
 @dataclass(frozen=True)
 class AssertPending:
     actor: int
@@ -133,6 +191,11 @@ ConcurrentOperation = Union[
     SignalConfig,
     SendSignal,
     AssertSignalHandled,
+    EpollCreate,
+    EpollCtl,
+    StartEpollWait,
+    StartEpollPwait,
+    StartEpollPwait2,
     AssertPending,
     AssertAllPending,
     Join,
@@ -141,12 +204,32 @@ ConcurrentOperation = Union[
 Operation = Union[simple.Operation, ConcurrentOperation]
 
 
+@dataclass
+class EpollRegistration:
+    target_slot: int
+    pipe_id: int
+    endpoint: str
+    events: int
+    data: int
+    enabled: bool
+    last_ready: bool
+    edge_pending: bool
+
+
+@dataclass
+class EpollState:
+    flags: int
+    registrations: dict[int, EpollRegistration]
+
+
 class ResourceState(blocking.ResourceState):
     """Track record slots while leaving the first completion order open."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.workers = controlled_actor.ControlledWorkers[ConcurrentOperation, int]()
+        self.workers = controlled_actor.ControlledWorkers[
+            ConcurrentOperation, tuple[str, int]
+        ]()
         self._next_completion_ordinal = 1
         self.signal_flags: Optional[int] = None
         self.signal_counts = {actor: 0 for actor in controlled_actor.WORKER_ACTORS}
@@ -156,10 +239,30 @@ class ResourceState(blocking.ResourceState):
         self.worker_write_progress = {
             actor: 0 for actor in controlled_actor.WORKER_ACTORS
         }
+        self.epolls: dict[int, EpollState] = {}
+        self.exclusive_cursor: dict[tuple[int, str], int] = {}
 
     def apply(self, operation: Operation, line_number: int = 0) -> None:
-        if isinstance(operation, (StartRead, StartWrite, StartPoll, StartPpoll)):
+        if isinstance(
+            operation,
+            (
+                StartRead,
+                StartWrite,
+                StartPoll,
+                StartPpoll,
+                StartEpollWait,
+                StartEpollPwait,
+                StartEpollPwait2,
+            ),
+        ):
             self._start(operation, line_number)
+        elif isinstance(operation, EpollCreate):
+            self._epoll_create(operation, line_number)
+        elif isinstance(operation, EpollCtl):
+            if self.workers.active_actors:
+                self._apply_trigger(operation, line_number)
+            else:
+                self._epoll_ctl(operation, line_number)
         elif isinstance(operation, SignalConfig):
             if self.workers.active_actors:
                 blocking._raise(
@@ -199,17 +302,52 @@ class ResourceState(blocking.ResourceState):
         elif self.workers.active_actors:
             self._apply_trigger(operation, line_number)
         else:
-            self._apply_synchronous(operation, line_number)
+            self._apply_resource_operation(operation, line_number)
 
     def finish_scenario(self, line_number: int = 0) -> None:
         self._transition(line_number, self.workers.finish_scenario)
 
     def _start(
         self,
-        operation: Union[StartRead, StartWrite, StartPoll, StartPpoll],
+        operation: Union[
+            StartRead,
+            StartWrite,
+            StartPoll,
+            StartPpoll,
+            StartEpollWait,
+            StartEpollPwait,
+            StartEpollPwait2,
+        ],
         line_number: int,
     ) -> None:
-        def identify_pipe() -> int:
+        def identify_resource() -> tuple[str, int]:
+            if isinstance(
+                operation, (StartEpollWait, StartEpollPwait, StartEpollPwait2)
+            ):
+                epoll = self.epolls.get(operation.epoll_slot)
+                if epoll is None:
+                    blocking._raise(
+                        line_number,
+                        CodecErrorCategory.RESOURCE_CONFLICT,
+                        "worker epoll slot is not live",
+                    )
+                finite_timeout = (
+                    operation.timeout_ms
+                    if isinstance(operation, (StartEpollWait, StartEpollPwait))
+                    else operation.timeout_ns
+                )
+                timeout_too_short = (
+                    0 <= finite_timeout < 100
+                    if isinstance(operation, (StartEpollWait, StartEpollPwait))
+                    else finite_timeout is not None and finite_timeout < 100_000_000
+                )
+                if timeout_too_short or self._epoll_has_ready(epoll):
+                    blocking._raise(
+                        line_number,
+                        CodecErrorCategory.BLOCKING_IO,
+                        "worker epoll wait must initially block",
+                    )
+                return ("epoll", operation.epoll_slot)
             endpoint = (
                 "reader"
                 if isinstance(operation, StartRead)
@@ -258,12 +396,12 @@ class ResourceState(blocking.ResourceState):
                     CodecErrorCategory.BLOCKING_IO,
                     "worker operation must initially block",
                 )
-            return resource.pipe_id
+            return ("pipe", resource.pipe_id)
 
         self._transition(
             line_number,
             lambda: self.workers.start(
-                operation.actor, operation, identify_pipe
+                operation.actor, operation, identify_resource
             ),
         )
         self.worker_write_progress[operation.actor] = 0
@@ -287,14 +425,26 @@ class ResourceState(blocking.ResourceState):
             lambda: self.workers.before_trigger((operation.actor,)),
         )
         if (
-            isinstance(worker.operation, StartPpoll)
+            isinstance(
+                worker.operation,
+                (StartPpoll, StartEpollPwait, StartEpollPwait2),
+            )
             and worker.operation.sigmask is SignalMask.USR1
         ):
             self.pending_signal_counts[operation.actor] += 1
             return
         self.signal_counts[operation.actor] += 1
         interrupted = (
-            isinstance(worker.operation, (StartPoll, StartPpoll))
+            isinstance(
+                worker.operation,
+                (
+                    StartPoll,
+                    StartPpoll,
+                    StartEpollWait,
+                    StartEpollPwait,
+                    StartEpollPwait2,
+                ),
+            )
             or self.signal_flags == 0
             or isinstance(worker.operation, StartWrite)
             and self.worker_write_progress[operation.actor] > 0
@@ -311,6 +461,12 @@ class ResourceState(blocking.ResourceState):
             isinstance(operation, StartPoll) and operation.timeout_ms >= 0
         ) or (
             isinstance(operation, StartPpoll) and operation.timeout_ns is not None
+        ) or (
+            isinstance(operation, (StartEpollWait, StartEpollPwait))
+            and operation.timeout_ms >= 0
+        ) or (
+            isinstance(operation, StartEpollPwait2)
+            and operation.timeout_ns is not None
         )
         if finite:
             self._mark_completed(actor, line_number)
@@ -334,20 +490,37 @@ class ResourceState(blocking.ResourceState):
             self.signal_counts[actor] += pending
             self.pending_signal_counts[actor] = 0
 
-    def _apply_trigger(self, operation: simple.Operation, line_number: int) -> None:
-        if not isinstance(operation, (Read, Write, Close)):
+    def _apply_trigger(self, operation: Operation, line_number: int) -> None:
+        if not isinstance(operation, (Read, Write, Close, EpollCtl)):
             blocking._raise(
                 line_number,
                 CodecErrorCategory.RESOURCE_CONFLICT,
-                "active workers allow only same-pipe read/write/close triggers",
+                "active workers allow only resource transitions or epoll MOD",
             )
-        slot = operation.slot
-        resource = self._require_live(slot, line_number)
+        if isinstance(operation, EpollCtl):
+            if operation.action is not EpollCtlAction.MOD:
+                blocking._raise(
+                    line_number,
+                    CodecErrorCategory.RESOURCE_CONFLICT,
+                    "only epoll MOD may trigger active workers",
+                )
+            resource_kind = "epoll"
+            resource_id = operation.epoll_slot
+        else:
+            resource = self._require_live(operation.slot, line_number)
+            resource_kind = "pipe"
+            resource_id = resource.pipe_id
         selected = tuple(
             actor
             for actor in self.workers.active_actors
             if not self.workers.worker(actor).completed
-            and self.workers.worker(actor).resource == resource.pipe_id
+            and (
+                self.workers.worker(actor).resource == (resource_kind, resource_id)
+                or resource_kind == "pipe"
+                and self._epoll_worker_watches(
+                    self.workers.worker(actor), resource_id
+                )
+            )
         )
         if not selected:
             blocking._raise(
@@ -358,7 +531,10 @@ class ResourceState(blocking.ResourceState):
         self._transition(
             line_number, lambda: self.workers.before_trigger(selected)
         )
-        self._apply_synchronous(operation, line_number)
+        if isinstance(operation, EpollCtl):
+            self._epoll_ctl(operation, line_number)
+        else:
+            self._apply_resource_operation(operation, line_number)
         self._complete_ready_workers(line_number)
 
     def _complete_ready_workers(self, line_number: int) -> None:
@@ -370,8 +546,17 @@ class ResourceState(blocking.ResourceState):
                 if worker.completed:
                     continue
                 operation = worker.operation
+                if isinstance(
+                    operation,
+                    (StartEpollWait, StartEpollPwait, StartEpollPwait2),
+                ):
+                    epoll = self.epolls[operation.epoll_slot]
+                    if self._epoll_ready(epoll, operation.maxevents):
+                        self._mark_completed(actor, line_number)
+                        made_progress = True
+                    continue
                 resource = self._require_live(operation.slot, line_number)
-                pipe = self.pipes[worker.resource]
+                pipe = self.pipes[worker.resource[1]]
                 ready = False
                 if isinstance(operation, StartRead):
                     ready = pipe.queued_bytes != 0 or pipe.writers == 0
@@ -401,6 +586,159 @@ class ResourceState(blocking.ResourceState):
                     continue
                 self._mark_completed(actor, line_number)
                 made_progress = True
+
+    def _apply_resource_operation(
+        self, operation: simple.Operation, line_number: int
+    ) -> None:
+        occupied = []
+        if isinstance(operation, Pipe2):
+            occupied = [operation.read_slot, operation.write_slot]
+        elif isinstance(operation, Dup):
+            occupied = [operation.source_slot, operation.destination_slot]
+        if any(slot in self.epolls for slot in occupied):
+            blocking._raise(
+                line_number,
+                CodecErrorCategory.RESOURCE_CONFLICT,
+                "pipe operation conflicts with an epoll slot",
+            )
+        resource = (
+            self.slots[operation.slot]
+            if isinstance(operation, (Read, Write, Close, SetSize))
+            else None
+        )
+        super()._apply_synchronous(operation, line_number)
+        if resource is not None:
+            self._refresh_epolls(resource.pipe_id)
+
+    def _epoll_create(self, operation: EpollCreate, line_number: int) -> None:
+        if operation.slot in self.epolls or self.slots[operation.slot] is not None:
+            blocking._raise(
+                line_number,
+                CodecErrorCategory.RESOURCE_CONFLICT,
+                "epoll destination slot is occupied",
+            )
+        self.epolls[operation.slot] = EpollState(operation.flags, {})
+
+    def _epoll_ctl(self, operation: EpollCtl, line_number: int) -> None:
+        epoll = self.epolls.get(operation.epoll_slot)
+        if epoll is None:
+            blocking._raise(
+                line_number,
+                CodecErrorCategory.RESOURCE_CONFLICT,
+                "epoll ctl slot is not live",
+            )
+        resource = self._require_live(operation.target_slot, line_number)
+        existing = epoll.registrations.get(operation.target_slot)
+        if operation.action is EpollCtlAction.ADD:
+            if existing is not None:
+                blocking._raise(
+                    line_number,
+                    CodecErrorCategory.RESOURCE_CONFLICT,
+                    "duplicate epoll ADD",
+                )
+            ready = self._pipe_ready(resource.pipe_id, resource.endpoint, operation.events)
+            epoll.registrations[operation.target_slot] = EpollRegistration(
+                operation.target_slot,
+                resource.pipe_id,
+                resource.endpoint,
+                operation.events,
+                operation.data,
+                True,
+                ready,
+                ready and bool(operation.events & EPOLLET),
+            )
+        elif operation.action is EpollCtlAction.MOD:
+            if existing is None:
+                blocking._raise(
+                    line_number,
+                    CodecErrorCategory.RESOURCE_CONFLICT,
+                    "epoll MOD is not registered",
+                )
+            ready = self._pipe_ready(resource.pipe_id, resource.endpoint, operation.events)
+            existing.events = operation.events
+            existing.data = operation.data
+            existing.enabled = True
+            existing.last_ready = ready
+            existing.edge_pending = ready and bool(operation.events & EPOLLET)
+        else:
+            if existing is None:
+                blocking._raise(
+                    line_number,
+                    CodecErrorCategory.RESOURCE_CONFLICT,
+                    "epoll DEL is not registered",
+                )
+            del epoll.registrations[operation.target_slot]
+
+    def _refresh_epolls(self, pipe_id: int) -> None:
+        exclusive: dict[str, list[tuple[int, EpollRegistration]]] = {}
+        for epoll_slot, epoll in self.epolls.items():
+            for registration in epoll.registrations.values():
+                if registration.pipe_id != pipe_id:
+                    continue
+                ready = self._pipe_ready(
+                    pipe_id, registration.endpoint, registration.events
+                )
+                transitioned = not registration.last_ready and ready
+                registration.last_ready = ready
+                if transitioned and registration.events & EPOLLEXCLUSIVE:
+                    exclusive.setdefault(registration.endpoint, []).append(
+                        (epoll_slot, registration)
+                    )
+                elif transitioned and registration.events & EPOLLET:
+                    registration.edge_pending = True
+        for endpoint, registrations in exclusive.items():
+            registrations.sort(key=lambda item: item[0])
+            key = (pipe_id, endpoint)
+            cursor = self.exclusive_cursor.get(key, 0) % len(registrations)
+            registrations[cursor][1].edge_pending = True
+            self.exclusive_cursor[key] = cursor + 1
+
+    def _epoll_worker_watches(self, worker, pipe_id: int) -> bool:
+        if worker.resource[0] != "epoll":
+            return False
+        return any(
+            registration.pipe_id == pipe_id
+            for registration in self.epolls[worker.resource[1]].registrations.values()
+        )
+
+    def _epoll_has_ready(self, epoll: EpollState) -> bool:
+        return any(
+            self._registration_ready(registration)
+            for registration in epoll.registrations.values()
+        )
+
+    def _epoll_ready(self, epoll: EpollState, maxevents: int) -> bool:
+        ready = [
+            registration
+            for registration in epoll.registrations.values()
+            if self._registration_ready(registration)
+        ][:maxevents]
+        if not ready:
+            return False
+        for registration in ready:
+            if registration.events & (EPOLLET | EPOLLEXCLUSIVE):
+                registration.edge_pending = False
+            if registration.events & EPOLLONESHOT:
+                registration.enabled = False
+        return True
+
+    def _registration_ready(self, registration: EpollRegistration) -> bool:
+        if not registration.enabled:
+            return False
+        if registration.events & (EPOLLET | EPOLLEXCLUSIVE):
+            return registration.edge_pending
+        return self._pipe_ready(
+            registration.pipe_id, registration.endpoint, registration.events
+        )
+
+    def _pipe_ready(self, pipe_id: int, endpoint: str, events: int) -> bool:
+        pipe = self.pipes[pipe_id]
+        if endpoint == "reader":
+            return bool(events & EPOLLIN and pipe.queued_bytes or pipe.writers == 0)
+        return bool(
+            events & EPOLLOUT and pipe.available_buffer_slots > 0 and pipe.readers > 0
+            or pipe.readers == 0
+        )
 
     @staticmethod
     def _transition(line_number: int, transition):
@@ -548,6 +886,16 @@ def operation_name(operation: Operation) -> str:
         return "send-signal"
     if isinstance(operation, AssertSignalHandled):
         return "assert-signal-handled"
+    if isinstance(operation, EpollCreate):
+        return "epoll-create"
+    if isinstance(operation, EpollCtl):
+        return "epoll-ctl"
+    if isinstance(operation, StartEpollWait):
+        return "start-epoll-wait"
+    if isinstance(operation, StartEpollPwait):
+        return "start-epoll-pwait"
+    if isinstance(operation, StartEpollPwait2):
+        return "start-epoll-pwait2"
     if isinstance(operation, AssertPending):
         return "assert-pending"
     if isinstance(operation, AssertAllPending):
@@ -655,6 +1003,92 @@ def _parse_operation(fields: Tuple[str, ...], line_number: int) -> Operation:
                 "signal handler count",
             ),
         )
+    if keyword == "epoll-create" and len(values) == 2:
+        flags = simple._parse_integer(values[1], line_number)
+        if flags not in (0, EPOLL_CLOEXEC):
+            blocking._raise(
+                line_number, CodecErrorCategory.OUT_OF_RANGE, "unsupported epoll flags"
+            )
+        return EpollCreate(
+            simple._slot(simple._parse_integer(values[0], line_number), line_number),
+            flags,
+        )
+    if keyword == "epoll-ctl" and len(values) == 5:
+        try:
+            action = EpollCtlAction(values[1])
+        except ValueError:
+            blocking._raise(
+                line_number, CodecErrorCategory.OUT_OF_RANGE, "unsupported epoll action"
+            )
+        events = simple._parse_integer(values[3], line_number)
+        data = simple._parse_integer(values[4], line_number)
+        _validate_epoll_ctl_fields(action, events, data, line_number)
+        return EpollCtl(
+            simple._slot(simple._parse_integer(values[0], line_number), line_number),
+            action,
+            simple._slot(simple._parse_integer(values[2], line_number), line_number),
+            events,
+            data,
+        )
+    if keyword in ("start-epoll-wait", "start-epoll-pwait") and len(values) in (4, 5):
+        if (keyword == "start-epoll-wait") != (len(values) == 4):
+            return simple._parse_operation(fields, line_number, simple.CORPUS_VERSION)
+        actor = _actor(values[0], line_number)
+        epoll_slot = simple._slot(simple._parse_integer(values[1], line_number), line_number)
+        maxevents = simple._range(
+            simple._parse_integer(values[2], line_number),
+            1,
+            4,
+            line_number,
+            "epoll maxevents",
+        )
+        timeout_ms = simple._parse_integer(values[3], line_number)
+        if timeout_ms < -1 or timeout_ms > 1000:
+            blocking._raise(
+                line_number, CodecErrorCategory.OUT_OF_RANGE, "unsupported epoll timeout"
+            )
+        if keyword == "start-epoll-wait":
+            return StartEpollWait(actor, epoll_slot, maxevents, timeout_ms)
+        try:
+            sigmask = SignalMask(values[4])
+        except ValueError:
+            blocking._raise(
+                line_number, CodecErrorCategory.OUT_OF_RANGE, "unsupported epoll mask"
+            )
+        return StartEpollPwait(
+            actor, epoll_slot, maxevents, timeout_ms, sigmask
+        )
+    if keyword == "start-epoll-pwait2" and len(values) == 5:
+        timeout_ns = (
+            None
+            if values[3] == "null"
+            else simple._range(
+                simple._parse_integer(values[3], line_number),
+                0,
+                MAX_TIMEOUT_NS,
+                line_number,
+                "epoll pwait2 timeout",
+            )
+        )
+        try:
+            sigmask = SignalMask(values[4])
+        except ValueError:
+            blocking._raise(
+                line_number, CodecErrorCategory.OUT_OF_RANGE, "unsupported epoll mask"
+            )
+        return StartEpollPwait2(
+            _actor(values[0], line_number),
+            simple._slot(simple._parse_integer(values[1], line_number), line_number),
+            simple._range(
+                simple._parse_integer(values[2], line_number),
+                1,
+                4,
+                line_number,
+                "epoll maxevents",
+            ),
+            timeout_ns,
+            sigmask,
+        )
     if keyword in ("assert-pending", "join") and len(values) == 1:
         operation_type = AssertPending if keyword == "assert-pending" else Join
         return operation_type(_actor(values[0], line_number))
@@ -697,6 +1131,29 @@ def _serialize_operation(operation: Operation) -> str:
         return f"send-signal {operation.actor} {operation.signo}"
     if isinstance(operation, AssertSignalHandled):
         return f"assert-signal-handled {operation.actor} {operation.count}"
+    if isinstance(operation, EpollCreate):
+        return f"epoll-create {operation.slot} {operation.flags}"
+    if isinstance(operation, EpollCtl):
+        return (
+            f"epoll-ctl {operation.epoll_slot} {operation.action.value} "
+            f"{operation.target_slot} {operation.events} {operation.data}"
+        )
+    if isinstance(operation, (StartEpollWait, StartEpollPwait)):
+        encoded = (
+            f"{operation_name(operation)} {operation.actor} "
+            f"{operation.epoll_slot} {operation.maxevents} {operation.timeout_ms}"
+        )
+        return (
+            encoded
+            if isinstance(operation, StartEpollWait)
+            else f"{encoded} {operation.sigmask.value}"
+        )
+    if isinstance(operation, StartEpollPwait2):
+        timeout = "null" if operation.timeout_ns is None else operation.timeout_ns
+        return (
+            f"start-epoll-pwait2 {operation.actor} {operation.epoll_slot} "
+            f"{operation.maxevents} {timeout} {operation.sigmask.value}"
+        )
     if isinstance(operation, (AssertPending, Join)):
         return f"{operation_name(operation)} {operation.actor}"
     if isinstance(operation, AssertAllPending):
@@ -721,6 +1178,39 @@ def _actor(text: str, line_number: int) -> int:
             line_number, CodecErrorCategory.OUT_OF_RANGE, "worker actor must be 1 or 2"
         )
     return actor
+
+
+def _validate_epoll_ctl_fields(
+    action: EpollCtlAction, events: int, data: int, line_number: int
+) -> None:
+    if events < 0 or events & ~EPOLL_ALLOWED_BITS:
+        blocking._raise(
+            line_number, CodecErrorCategory.OUT_OF_RANGE, "unsupported epoll events"
+        )
+    if data < 0 or data > (1 << 64) - 1:
+        blocking._raise(
+            line_number, CodecErrorCategory.OUT_OF_RANGE, "unsupported epoll data"
+        )
+    if action is EpollCtlAction.DEL:
+        if events != 0 or data != 0:
+            blocking._raise(
+                line_number,
+                CodecErrorCategory.OUT_OF_RANGE,
+                "epoll DEL requires canonical zero events/data",
+            )
+        return
+    if events & EPOLL_READY_BITS == 0:
+        blocking._raise(
+            line_number, CodecErrorCategory.OUT_OF_RANGE, "empty epoll interest"
+        )
+    if events & EPOLLEXCLUSIVE and (
+        action is not EpollCtlAction.ADD or events & EPOLLONESHOT
+    ):
+        blocking._raise(
+            line_number,
+            CodecErrorCategory.OUT_OF_RANGE,
+            "invalid EPOLLEXCLUSIVE combination",
+        )
 
 
 __all__ = [name for name in globals() if not name.startswith("_")]

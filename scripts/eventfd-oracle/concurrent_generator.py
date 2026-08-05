@@ -9,6 +9,13 @@ from concurrent_scenario import (
     AssertSignalHandled,
     Dup,
     EFD_SEMAPHORE,
+    EPOLLEXCLUSIVE,
+    EPOLLIN,
+    EPOLLONESHOT,
+    EPOLLET,
+    EpollCreate,
+    EpollCtl,
+    EpollCtlAction,
     EventFd,
     EventFd2,
     Join,
@@ -29,6 +36,9 @@ from concurrent_scenario import (
     SignalConfig,
     StartPoll,
     StartPpoll,
+    StartEpollPwait,
+    StartEpollPwait2,
+    StartEpollWait,
     StartRead,
     StartWrite,
     Write,
@@ -40,7 +50,7 @@ from poll_generator import CampaignRng
 
 
 GENERATOR_VERSION = "eventfd-concurrent-generator-v1"
-STORY_COUNT = 9
+STORY_COUNT = 14
 _FULL_COUNTER_INCREMENT = MAX_COUNTER - ((1 << 32) - 1)
 
 
@@ -95,7 +105,17 @@ def generate_scenario(rng: CampaignRng, story: Optional[int] = None) -> Scenario
         return _signal_story(rng, actors[0])
     if story_index == 7:
         return _timeout_story(first, second, actors[0])
-    return _ppoll_story(rng, actors[0])
+    if story_index == 8:
+        return _ppoll_story(rng, actors[0])
+    if story_index == 9:
+        return _epoll_lt_story(rng, actors)
+    if story_index == 10:
+        return _epoll_et_story(rng, actors)
+    if story_index == 11:
+        return _epoll_oneshot_story(rng, actors)
+    if story_index == 12:
+        return _epoll_exclusive_story(rng, actors)
+    return _epoll_signal_timeout_story(rng, actors[0])
 
 
 def generate_document(rng: CampaignRng) -> ScenarioDocument:
@@ -262,6 +282,107 @@ def _ppoll_story(rng: CampaignRng, actor: int) -> Scenario:
             StartPpoll(actor, ready, POLLIN, 1_000_000_000, SignalMask.EMPTY),
             AssertPending(actor),
             Write(ready, 8, PointerMode.VALID, 1),
+            Join(actor),
+        )
+    )
+
+
+def _epoll_lt_story(rng: CampaignRng, actors: tuple[int, int]) -> Scenario:
+    event, alias, epoll = _distinct_slots(rng, 3)
+    return Scenario(
+        (
+            EventFd(event, 0),
+            Dup(event, alias),
+            EpollCreate(epoll, 0),
+            EpollCtl(epoll, EpollCtlAction.ADD, event, EPOLLIN, 17),
+            EpollCtl(epoll, EpollCtlAction.ADD, alias, EPOLLIN, 34),
+            StartEpollWait(actors[0], epoll, 1, -1),
+            StartEpollWait(actors[1], epoll, 1, -1),
+            AssertAllPending(),
+            Write(event, 8, PointerMode.VALID, 1),
+            JoinSet((1, 2)),
+        )
+    )
+
+
+def _epoll_et_story(rng: CampaignRng, actors: tuple[int, int]) -> Scenario:
+    event, epoll = _distinct_slots(rng, 2)
+    return Scenario(
+        (
+            EventFd(event, 0),
+            EpollCreate(epoll, 0),
+            EpollCtl(epoll, EpollCtlAction.ADD, event, EPOLLIN | EPOLLET, 51),
+            StartEpollWait(actors[0], epoll, 1, -1),
+            StartEpollWait(actors[1], epoll, 1, -1),
+            AssertAllPending(),
+            Write(event, 8, PointerMode.VALID, 1),
+            Read(event, 8, PointerMode.VALID),
+            Write(event, 8, PointerMode.VALID, 1),
+            JoinSet((1, 2)),
+        )
+    )
+
+
+def _epoll_oneshot_story(rng: CampaignRng, actors: tuple[int, int]) -> Scenario:
+    event, epoll = _distinct_slots(rng, 2)
+    events = EPOLLIN | EPOLLONESHOT
+    return Scenario(
+        (
+            EventFd(event, 0),
+            EpollCreate(epoll, 0),
+            EpollCtl(epoll, EpollCtlAction.ADD, event, events, 68),
+            StartEpollWait(actors[0], epoll, 1, -1),
+            StartEpollWait(actors[1], epoll, 1, -1),
+            AssertAllPending(),
+            Write(event, 8, PointerMode.VALID, 1),
+            EpollCtl(epoll, EpollCtlAction.MOD, event, events, 85),
+            JoinSet((1, 2)),
+        )
+    )
+
+
+def _epoll_exclusive_story(rng: CampaignRng, actors: tuple[int, int]) -> Scenario:
+    event, first_epoll, second_epoll = _distinct_slots(rng, 3)
+    events = EPOLLIN | EPOLLEXCLUSIVE
+    return Scenario(
+        (
+            EventFd(event, 0),
+            EpollCreate(first_epoll, 0),
+            EpollCreate(second_epoll, 0),
+            EpollCtl(first_epoll, EpollCtlAction.ADD, event, events, 102),
+            EpollCtl(second_epoll, EpollCtlAction.ADD, event, events, 119),
+            StartEpollWait(actors[0], first_epoll, 1, -1),
+            StartEpollWait(actors[1], second_epoll, 1, -1),
+            AssertAllPending(),
+            Write(event, 8, PointerMode.VALID, 1),
+            Read(event, 8, PointerMode.VALID),
+            Write(event, 8, PointerMode.VALID, 1),
+            JoinSet((1, 2)),
+        )
+    )
+
+
+def _epoll_signal_timeout_story(rng: CampaignRng, actor: int) -> Scenario:
+    event, epoll, timeout_epoll = _distinct_slots(rng, 3)
+    return Scenario(
+        (
+            SignalConfig(SIGUSR1, SA_RESTART),
+            EventFd(event, 0),
+            EpollCreate(epoll, 0),
+            EpollCtl(epoll, EpollCtlAction.ADD, event, EPOLLIN | EPOLLET, 136),
+            StartEpollPwait(actor, epoll, 4, -1, SignalMask.USR1),
+            AssertPending(actor),
+            SendSignal(actor, SIGUSR1),
+            AssertSignalHandled(actor, 0),
+            AssertPending(actor),
+            Write(event, 8, PointerMode.VALID, 1),
+            Join(actor),
+            AssertSignalHandled(actor, 1),
+            EpollCreate(timeout_epoll, 0),
+            StartEpollPwait2(
+                actor, timeout_epoll, 4, 200_000_000, SignalMask.EMPTY
+            ),
+            AssertPending(actor),
             Join(actor),
         )
     )

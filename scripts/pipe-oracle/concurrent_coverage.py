@@ -21,6 +21,9 @@ TARGET_SOURCE_PATHS = tuple(
         | {
             "kernel/src/syscall/mod.rs",
             "kernel/src/syscall/signal.rs",
+            "kernel/src/syscall/io_mpx/epoll.rs",
+            "kernel/src/file/epoll.rs",
+            "kernel/src/file/epoll_file.rs",
             "kernel/src/task/signal.rs",
             "kernel/src/task/user.rs",
         }

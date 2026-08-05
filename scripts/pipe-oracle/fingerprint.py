@@ -33,6 +33,17 @@ _OPERATION_KINDS = {
     "assert-pending": 23,
     "join": 24,
     "start-poll": 25,
+    "assert-all-pending": 26,
+    "join-set": 27,
+    "signal-config": 28,
+    "send-signal": 29,
+    "assert-signal-handled": 30,
+    "start-ppoll": 31,
+    "epoll-create": 32,
+    "epoll-ctl": 33,
+    "start-epoll-wait": 34,
+    "start-epoll-pwait": 35,
+    "start-epoll-pwait2": 36,
 }
 _DIFFERENCE_FIELDS = ("result", "errno", "value", "data_len", "data")
 _RESULT_CLASSES = {"error", "zero", "positive"}

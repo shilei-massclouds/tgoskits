@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <time.h>
@@ -34,6 +35,13 @@
 #define MAX_TIMEOUT_NS UINT64_C(1000000000)
 #define KERNEL_SIGSET_SIZE 8U
 #define SIGUSR1_MASK (UINT64_C(1) << (SIGUSR1 - 1))
+#define MAX_EPOLL_OBJECTS 8
+#define MAX_EPOLL_REGISTRATIONS 16
+#define MAX_EPOLL_EVENTS 4
+#define EPOLL_EVENT_RESULT_BYTES 12U
+#define ENDPOINT_NONE 0
+#define ENDPOINT_READER 1
+#define ENDPOINT_WRITER 2
 
 static const unsigned char raw_magic[8] = {
     'P', 'I', 'P', 'E', 'R', 'U', 'N', '7',
@@ -74,6 +82,11 @@ enum operation_kind {
     OP_SEND_SIGNAL,
     OP_ASSERT_SIGNAL_HANDLED,
     OP_START_PPOLL,
+    OP_EPOLL_CREATE,
+    OP_EPOLL_CTL,
+    OP_START_EPOLL_WAIT,
+    OP_START_EPOLL_PWAIT,
+    OP_START_EPOLL_PWAIT2,
 };
 
 enum worker_kind {
@@ -81,6 +94,21 @@ enum worker_kind {
     WORKER_WRITE,
     WORKER_POLL,
     WORKER_PPOLL,
+    WORKER_EPOLL_WAIT,
+    WORKER_EPOLL_PWAIT,
+    WORKER_EPOLL_PWAIT2,
+};
+
+struct epoll_registration {
+    int active;
+    int target_slot;
+    uint32_t events;
+    uint64_t data;
+};
+
+struct epoll_object {
+    int fd;
+    struct epoll_registration registrations[MAX_EPOLL_REGISTRATIONS];
 };
 
 struct concurrent_worker_state {
@@ -97,6 +125,9 @@ struct concurrent_worker_state {
     size_t length;
     unsigned char byte_value;
     struct pollfd poll_fd;
+    struct epoll_event epoll_events[MAX_EPOLL_EVENTS];
+    int epoll_object;
+    int maxevents;
     int timeout_ms;
     int64_t timeout_ns;
     int block_sigusr1;
@@ -117,6 +148,10 @@ struct concurrent_context {
     struct concurrent_operation_result results[CONCURRENT_MAX_OPERATIONS];
     int slots[MAX_SLOTS];
     int slot_peer_fds[MAX_SLOTS];
+    int slot_epolls[MAX_SLOTS];
+    int slot_endpoints[MAX_SLOTS];
+    struct epoll_object epolls[MAX_EPOLL_OBJECTS];
+    int epoll_count;
     uint32_t scenario_index;
     uint32_t operation_index;
     uint32_t total_operations;
@@ -202,6 +237,21 @@ static int parse_long_value(const char *text, long minimum, long maximum,
     return 0;
 }
 
+static int parse_u64_value(const char *text, uint64_t *value)
+{
+    char *end;
+    unsigned long long parsed;
+
+    if (text == NULL || *text == '\0' || *text == '-')
+        return -1;
+    errno = 0;
+    parsed = strtoull(text, &end, 0);
+    if (errno != 0 || *end != '\0')
+        return -1;
+    *value = (uint64_t)parsed;
+    return 0;
+}
+
 static int parse_slot(const char *text, int *slot)
 {
     long parsed;
@@ -282,6 +332,72 @@ static int cleanup_workers(void *argument)
 
         if (!worker->active || !worker->controller->started)
             continue;
+        if (worker->kind == WORKER_EPOLL_WAIT ||
+            worker->kind == WORKER_EPOLL_PWAIT ||
+            worker->kind == WORKER_EPOLL_PWAIT2) {
+            struct epoll_object *epoll = &context->epolls[worker->epoll_object];
+            int registration_index;
+            int triggered = 0;
+
+            if (!worker->block_sigusr1) {
+                if (controlled_worker_send_signal(worker->controller, SIGUSR1) !=
+                    CONTROLLED_WORKER_OK)
+                    status = -1;
+                continue;
+            }
+            for (registration_index = 0;
+                 registration_index < MAX_EPOLL_REGISTRATIONS;
+                 registration_index++) {
+                struct epoll_registration *registration =
+                    &epoll->registrations[registration_index];
+                int target_slot;
+
+                if (!registration->active)
+                    continue;
+                target_slot = registration->target_slot;
+                if ((registration->events & EPOLLIN) != 0 &&
+                    context->slot_endpoints[target_slot] == ENDPOINT_READER) {
+                    int queued = 0;
+
+                    if (syscall(SYS_ioctl, context->slots[target_slot], FIONREAD,
+                                &queued) != 0) {
+                        status = -1;
+                        break;
+                    }
+                    if (queued > 0) {
+                        size_t length = queued > (int)sizeof(buffer) ?
+                                            sizeof(buffer) :
+                                            (size_t)queued;
+
+                        syscall_result = syscall(SYS_read,
+                                                 context->slots[target_slot],
+                                                 buffer, length);
+                        if (syscall_result <= 0)
+                            status = -1;
+                    }
+                    syscall_result = syscall(SYS_write,
+                                             context->slot_peer_fds[target_slot],
+                                             buffer, 1U);
+                    if (syscall_result != 1)
+                        status = -1;
+                    triggered = 1;
+                    break;
+                }
+                if ((registration->events & EPOLLOUT) != 0 &&
+                    context->slot_endpoints[target_slot] == ENDPOINT_WRITER) {
+                    syscall_result = syscall(SYS_read,
+                                             context->slot_peer_fds[target_slot],
+                                             buffer, sizeof(buffer));
+                    if (syscall_result <= 0)
+                        status = -1;
+                    triggered = 1;
+                    break;
+                }
+            }
+            if (!triggered)
+                status = -1;
+            continue;
+        }
         errno = 0;
         if (worker->kind == WORKER_WRITE ||
             ((worker->kind == WORKER_POLL || worker->kind == WORKER_PPOLL) &&
@@ -324,7 +440,11 @@ static void initialize_scenario(struct concurrent_context *context)
     for (index = 0; index < MAX_SLOTS; index++) {
         context->slots[index] = -1;
         context->slot_peer_fds[index] = -1;
+        context->slot_epolls[index] = -1;
+        context->slot_endpoints[index] = ENDPOINT_NONE;
     }
+    memset(context->epolls, 0, sizeof(context->epolls));
+    context->epoll_count = 0;
     context->operation_index = 0;
     context->accounted_actor_mask = 0;
     memset(context->results, 0, sizeof(context->results));
@@ -355,6 +475,8 @@ static int cleanup_scenario(struct concurrent_context *context)
                 status = -1;
             context->slots[index] = -1;
             context->slot_peer_fds[index] = -1;
+            context->slot_epolls[index] = -1;
+            context->slot_endpoints[index] = ENDPOINT_NONE;
         }
     }
     if (configure_count_signal_handler(SIGUSR1, 0, NULL) != 0)
@@ -445,6 +567,99 @@ static void run_ppoll_worker(struct concurrent_worker_state *worker)
     record_poll_revents(worker);
 }
 
+static void record_epoll_events(struct concurrent_worker_state *worker)
+{
+    long count = worker->syscall_result.result;
+    long index;
+
+    if (count <= 0)
+        return;
+    if (count > worker->maxevents)
+        count = worker->maxevents;
+    worker->syscall_result.data_length =
+        (uint32_t)count * EPOLL_EVENT_RESULT_BYTES;
+    for (index = 0; index < count; index++) {
+        size_t offset = (size_t)index * EPOLL_EVENT_RESULT_BYTES;
+        uint32_t events = worker->epoll_events[index].events;
+        uint64_t data = worker->epoll_events[index].data.u64;
+
+        memcpy(worker->syscall_result.data + offset, &events, sizeof(events));
+        memcpy(worker->syscall_result.data + offset + sizeof(events), &data,
+               sizeof(data));
+    }
+}
+
+static void run_epoll_worker(struct concurrent_worker_state *worker)
+{
+    struct timespec timeout;
+    struct timespec started;
+    struct timespec completed;
+    const struct timespec *timeout_pointer = NULL;
+    uint64_t empty_mask = 0;
+    uint64_t original_mask = 0;
+    uint64_t restored_mask = 0;
+    uint64_t temporary_mask = worker->block_sigusr1 ? SIGUSR1_MASK : 0;
+    int uses_mask = worker->kind != WORKER_EPOLL_WAIT;
+    int64_t requested_timeout_ns = -1;
+    long syscall_result;
+
+    if (uses_mask &&
+        syscall(SYS_rt_sigprocmask, SIG_SETMASK, &empty_mask, &original_mask,
+                KERNEL_SIGSET_SIZE) != 0)
+        worker->mask_failed = 1;
+    if (worker->kind == WORKER_EPOLL_PWAIT2 && worker->timeout_ns >= 0) {
+        timeout.tv_sec = (time_t)((uint64_t)worker->timeout_ns / MAX_TIMEOUT_NS);
+        timeout.tv_nsec = (long)((uint64_t)worker->timeout_ns % MAX_TIMEOUT_NS);
+        timeout_pointer = &timeout;
+        requested_timeout_ns = worker->timeout_ns;
+    } else if (worker->kind != WORKER_EPOLL_PWAIT2 && worker->timeout_ms >= 0) {
+        requested_timeout_ns =
+            (int64_t)worker->timeout_ms * INT64_C(1000000);
+    }
+    memset(worker->epoll_events, 0xa5, sizeof(worker->epoll_events));
+    controlled_worker_publish_entered(worker->controller);
+    if (clock_gettime(CLOCK_MONOTONIC, &started) != 0)
+        worker->clock_failed = 1;
+    errno = 0;
+    if (worker->kind == WORKER_EPOLL_WAIT) {
+        syscall_result = syscall(SYS_epoll_wait, worker->fd,
+                                 worker->epoll_events, worker->maxevents,
+                                 worker->timeout_ms);
+    } else if (worker->kind == WORKER_EPOLL_PWAIT) {
+        syscall_result = syscall(SYS_epoll_pwait, worker->fd,
+                                 worker->epoll_events, worker->maxevents,
+                                 worker->timeout_ms, &temporary_mask,
+                                 KERNEL_SIGSET_SIZE);
+    } else {
+        syscall_result = syscall(SYS_epoll_pwait2, worker->fd,
+                                 worker->epoll_events, worker->maxevents,
+                                 timeout_pointer, &temporary_mask,
+                                 KERNEL_SIGSET_SIZE);
+    }
+    finish_syscall_result(&worker->syscall_result, syscall_result);
+    if (clock_gettime(CLOCK_MONOTONIC, &completed) != 0) {
+        worker->clock_failed = 1;
+    } else if (!worker->clock_failed && syscall_result == 0 &&
+               requested_timeout_ns > 0 &&
+               timespec_nanoseconds(&completed) + UINT64_C(10000000) <
+                   timespec_nanoseconds(&started) +
+                       (uint64_t)requested_timeout_ns) {
+        worker->timeout_too_early = 1;
+    }
+    if (uses_mask) {
+        if (syscall(SYS_rt_sigprocmask, SIG_SETMASK, NULL, &restored_mask,
+                    KERNEL_SIGSET_SIZE) != 0)
+            worker->mask_failed = 1;
+        worker->syscall_result.value =
+            (temporary_mask & SIGUSR1_MASK ? UINT64_C(1) : UINT64_C(0)) |
+            (restored_mask & SIGUSR1_MASK ? UINT64_C(2) : UINT64_C(0));
+        if (syscall(SYS_rt_sigprocmask, SIG_SETMASK, &original_mask, NULL,
+                    KERNEL_SIGSET_SIZE) != 0)
+            worker->mask_failed = 1;
+    }
+    record_epoll_events(worker);
+}
+
 static void *run_worker(void *argument)
 {
     struct concurrent_worker_state *worker = argument;
@@ -505,8 +720,10 @@ static void *run_worker(void *argument)
             worker->timeout_too_early = 1;
         }
         record_poll_revents(worker);
-    } else {
+    } else if (worker->kind == WORKER_PPOLL) {
         run_ppoll_worker(worker);
+    } else {
+        run_epoll_worker(worker);
     }
     worker->syscall_result.handler_count =
         atomic_load_explicit(worker->handler_count, memory_order_acquire);
@@ -538,9 +755,12 @@ static int worker_is_ready(struct concurrent_worker_state *worker)
                              memory_order_acquire) == CONTROLLED_WORKER_COMPLETED)
         return 1;
     descriptor.fd = worker->fd;
-    descriptor.events = worker->kind == WORKER_READ ? POLLIN :
-                        worker->kind == WORKER_WRITE ? POLLOUT :
-                                                       worker->poll_fd.events;
+    descriptor.events =
+        worker->kind == WORKER_READ ? POLLIN :
+        worker->kind == WORKER_WRITE ? POLLOUT :
+        worker->kind == WORKER_POLL || worker->kind == WORKER_PPOLL ?
+            worker->poll_fd.events :
+            POLLIN;
     descriptor.revents = 0;
     do {
         errno = 0;
@@ -562,6 +782,22 @@ static int has_unaccounted_worker(struct concurrent_context *context,
         if (worker->kind == kind ||
             ((worker->kind == WORKER_POLL || worker->kind == WORKER_PPOLL) &&
              (worker->poll_fd.events & poll_events) != 0))
+            return 1;
+    }
+    return 0;
+}
+
+static int has_ready_epoll_worker(struct concurrent_context *context)
+{
+    int actor;
+
+    for (actor = 1; actor <= CONTROLLED_WORKER_COUNT; actor++) {
+        struct concurrent_worker_state *worker = &context->workers[actor - 1];
+
+        if ((worker->kind == WORKER_EPOLL_WAIT ||
+             worker->kind == WORKER_EPOLL_PWAIT ||
+             worker->kind == WORKER_EPOLL_PWAIT2) &&
+            worker_is_ready(worker))
             return 1;
     }
     return 0;
@@ -690,6 +926,8 @@ static int execute_pipe2(struct concurrent_context *context, char *save,
         context->slots[write_slot] = descriptors[1];
         context->slot_peer_fds[read_slot] = descriptors[1];
         context->slot_peer_fds[write_slot] = descriptors[0];
+        context->slot_endpoints[read_slot] = ENDPOINT_READER;
+        context->slot_endpoints[write_slot] = ENDPOINT_WRITER;
     }
     result->kind = OP_PIPE2;
     return 0;
@@ -731,8 +969,9 @@ static int execute_read(struct concurrent_context *context, char *save,
         return 0;
     }
     progress_required =
-        syscall_result > 0 && syscall_result == queued_before &&
-        has_unaccounted_worker(context, WORKER_WRITE, POLLOUT);
+        (syscall_result > 0 && syscall_result == queued_before &&
+         has_unaccounted_worker(context, WORKER_WRITE, POLLOUT)) ||
+        has_ready_epoll_worker(context);
     return wait_for_trigger_progress(context, progress_required);
 }
 
@@ -761,8 +1000,10 @@ static int execute_write(struct concurrent_context *context, char *save,
     result->value = (uint64_t)byte_value;
     result->kind = OP_WRITE;
     return wait_for_trigger_progress(
-        context, syscall_result > 0 &&
-                     has_unaccounted_worker(context, WORKER_READ, POLLIN));
+        context,
+        (syscall_result > 0 &&
+         has_unaccounted_worker(context, WORKER_READ, POLLIN)) ||
+            has_ready_epoll_worker(context));
 }
 
 static int execute_dup(struct concurrent_context *context, char *save,
@@ -776,7 +1017,9 @@ static int execute_dup(struct concurrent_context *context, char *save,
 
     if (parse_slot(source_text, &source) != 0 ||
         parse_slot(destination_text, &destination) != 0 || source == destination ||
-        context->slots[source] < 0 || context->slots[destination] >= 0 ||
+        context->slots[source] < 0 ||
+        context->slot_endpoints[source] == ENDPOINT_NONE ||
+        context->slots[destination] >= 0 ||
         strtok_r(NULL, " \t", &save) != NULL)
         return -1;
     errno = 0;
@@ -785,6 +1028,7 @@ static int execute_dup(struct concurrent_context *context, char *save,
     if (syscall_result >= 0) {
         context->slots[destination] = (int)syscall_result;
         context->slot_peer_fds[destination] = context->slot_peer_fds[source];
+        context->slot_endpoints[destination] = context->slot_endpoints[source];
     }
     result->kind = OP_DUP;
     return 0;
@@ -803,8 +1047,12 @@ static int execute_close(struct concurrent_context *context, char *save,
     errno = 0;
     syscall_result = syscall(SYS_close, context->slots[slot]);
     finish_syscall_result(result, syscall_result);
-    if (syscall_result == 0)
+    if (syscall_result == 0) {
         context->slots[slot] = -1;
+        context->slot_peer_fds[slot] = -1;
+        context->slot_epolls[slot] = -1;
+        context->slot_endpoints[slot] = ENDPOINT_NONE;
+    }
     result->kind = OP_CLOSE;
     return wait_for_trigger_progress(context,
                                      has_any_unaccounted_worker(context));
@@ -834,6 +1082,138 @@ static int execute_fcntl(struct concurrent_context *context, char *save,
                                             (uint64_t)(syscall_result & O_NONBLOCK_FLAG);
     result->kind = kind;
     return 0;
+}
+
+static int execute_epoll_create(struct concurrent_context *context, char *save,
+                                struct concurrent_operation_result *result)
+{
+    char *slot_text = strtok_r(NULL, " \t", &save);
+    char *flags_text = strtok_r(NULL, " \t", &save);
+    long flags;
+    long syscall_result;
+    int slot;
+
+    if (parse_slot(slot_text, &slot) != 0 ||
+        parse_long_value(flags_text, 0, EPOLL_CLOEXEC, &flags) != 0 ||
+        (flags != 0 && flags != EPOLL_CLOEXEC) ||
+        strtok_r(NULL, " \t", &save) != NULL || context->slots[slot] >= 0 ||
+        context->epoll_count >= MAX_EPOLL_OBJECTS)
+        return -1;
+    errno = 0;
+    syscall_result = syscall(SYS_epoll_create1, (int)flags);
+    finish_syscall_result(result, syscall_result < 0 ? syscall_result : 0);
+    if (syscall_result >= 0) {
+        int epoll_object = context->epoll_count++;
+
+        context->slots[slot] = (int)syscall_result;
+        context->slot_epolls[slot] = epoll_object;
+        context->epolls[epoll_object].fd = (int)syscall_result;
+    }
+    result->kind = OP_EPOLL_CREATE;
+    result->value = (uint64_t)flags;
+    return 0;
+}
+
+static struct epoll_registration *find_epoll_registration(
+    struct epoll_object *epoll, int target_slot)
+{
+    int index;
+
+    for (index = 0; index < MAX_EPOLL_REGISTRATIONS; index++) {
+        if (epoll->registrations[index].active &&
+            epoll->registrations[index].target_slot == target_slot)
+            return &epoll->registrations[index];
+    }
+    return NULL;
+}
+
+static struct epoll_registration *free_epoll_registration(
+    struct epoll_object *epoll)
+{
+    int index;
+
+    for (index = 0; index < MAX_EPOLL_REGISTRATIONS; index++) {
+        if (!epoll->registrations[index].active)
+            return &epoll->registrations[index];
+    }
+    return NULL;
+}
+
+static int execute_epoll_ctl(struct concurrent_context *context, char *save,
+                             struct concurrent_operation_result *result)
+{
+    char *epoll_slot_text = strtok_r(NULL, " \t", &save);
+    char *action_text = strtok_r(NULL, " \t", &save);
+    char *target_slot_text = strtok_r(NULL, " \t", &save);
+    char *events_text = strtok_r(NULL, " \t", &save);
+    char *data_text = strtok_r(NULL, " \t", &save);
+    struct epoll_registration *registration;
+    struct epoll_object *epoll;
+    struct epoll_event event;
+    uint64_t data;
+    uint64_t events;
+    int command;
+    int epoll_slot;
+    int target_slot;
+    long syscall_result;
+
+    if (parse_slot(epoll_slot_text, &epoll_slot) != 0 || action_text == NULL ||
+        parse_slot(target_slot_text, &target_slot) != 0 ||
+        parse_u64_value(events_text, &events) != 0 || events > UINT32_MAX ||
+        parse_u64_value(data_text, &data) != 0 ||
+        strtok_r(NULL, " \t", &save) != NULL ||
+        context->slot_epolls[epoll_slot] < 0 ||
+        context->slot_endpoints[target_slot] == ENDPOINT_NONE)
+        return -1;
+    if (strcmp(action_text, "add") == 0) {
+        command = EPOLL_CTL_ADD;
+    } else if (strcmp(action_text, "mod") == 0) {
+        command = EPOLL_CTL_MOD;
+    } else if (strcmp(action_text, "del") == 0) {
+        command = EPOLL_CTL_DEL;
+    } else {
+        return -1;
+    }
+    if ((events & ~(uint64_t)(EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP |
+                              EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE)) != 0 ||
+        (command == EPOLL_CTL_DEL && (events != 0 || data != 0)) ||
+        (command != EPOLL_CTL_DEL &&
+         (events & (EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP)) == 0) ||
+        ((events & EPOLLEXCLUSIVE) != 0 &&
+         (command != EPOLL_CTL_ADD || (events & EPOLLONESHOT) != 0)))
+        return -1;
+    epoll = &context->epolls[context->slot_epolls[epoll_slot]];
+    registration = find_epoll_registration(epoll, target_slot);
+    if ((command == EPOLL_CTL_ADD && registration != NULL) ||
+        (command != EPOLL_CTL_ADD && registration == NULL))
+        return -1;
+    if (command == EPOLL_CTL_ADD && free_epoll_registration(epoll) == NULL)
+        return -1;
+    memset(&event, 0, sizeof(event));
+    event.events = (uint32_t)events;
+    event.data.u64 = data;
+    errno = 0;
+    syscall_result = syscall(SYS_epoll_ctl, epoll->fd, command,
+                             context->slots[target_slot],
+                             command == EPOLL_CTL_DEL ? NULL : &event);
+    finish_syscall_result(result, syscall_result);
+    if (syscall_result == 0) {
+        if (command == EPOLL_CTL_ADD) {
+            registration = free_epoll_registration(epoll);
+            memset(registration, 0, sizeof(*registration));
+            registration->active = 1;
+            registration->target_slot = target_slot;
+        }
+        if (command == EPOLL_CTL_DEL) {
+            memset(registration, 0, sizeof(*registration));
+        } else {
+            registration->events = (uint32_t)events;
+            registration->data = data;
+        }
+    }
+    result->kind = OP_EPOLL_CTL;
+    result->value = data;
+    return wait_for_trigger_progress(context, has_ready_epoll_worker(context));
 }
 
 static int execute_set_size(struct concurrent_context *context, char *save,
@@ -918,6 +1298,7 @@ static int execute_start_worker(struct concurrent_context *context, char *save,
     worker->slot = slot;
     worker->fd = context->slots[slot];
     worker->peer_fd = context->slot_peer_fds[slot];
+    worker->epoll_object = -1;
     worker->start_result_index = context->operation_index;
     worker->length = (size_t)argument;
     worker->byte_value = (unsigned char)(64 + actor);
@@ -941,6 +1322,96 @@ static int execute_start_worker(struct concurrent_context *context, char *save,
                    kind == WORKER_POLL ? OP_START_POLL : OP_START_PPOLL;
     result->actor = (uint32_t)actor;
     result->value = (uint64_t)argument;
+    return 0;
+}
+
+static int epoll_has_registration(const struct epoll_object *epoll)
+{
+    int index;
+
+    for (index = 0; index < MAX_EPOLL_REGISTRATIONS; index++) {
+        if (epoll->registrations[index].active)
+            return 1;
+    }
+    return 0;
+}
+
+static int execute_start_epoll_worker(
+    struct concurrent_context *context, char *save,
+    struct concurrent_operation_result *result, enum worker_kind kind)
+{
+    char *actor_text = strtok_r(NULL, " \t", &save);
+    char *slot_text = strtok_r(NULL, " \t", &save);
+    char *maxevents_text = strtok_r(NULL, " \t", &save);
+    char *timeout_text = strtok_r(NULL, " \t", &save);
+    char *sigmask_text = kind == WORKER_EPOLL_WAIT ?
+                             NULL :
+                             strtok_r(NULL, " \t", &save);
+    struct concurrent_worker_state *worker;
+    struct epoll_object *epoll;
+    long maxevents;
+    long timeout_ms = -1;
+    int64_t timeout_ns = -1;
+    int block_sigusr1 = 0;
+    int actor;
+    int slot;
+
+    if (parse_actor(actor_text, &actor) != 0 || parse_slot(slot_text, &slot) != 0 ||
+        parse_long_value(maxevents_text, 1, MAX_EPOLL_EVENTS, &maxevents) != 0 ||
+        (kind != WORKER_EPOLL_PWAIT2 &&
+         parse_long_value(timeout_text, -1, 1000, &timeout_ms) != 0) ||
+        (kind == WORKER_EPOLL_PWAIT2 &&
+         parse_timeout_ns(timeout_text, &timeout_ns) != 0) ||
+        (kind != WORKER_EPOLL_WAIT &&
+         (sigmask_text == NULL ||
+          (strcmp(sigmask_text, "empty") != 0 &&
+           strcmp(sigmask_text, "usr1") != 0))) ||
+        strtok_r(NULL, " \t", &save) != NULL ||
+        context->slot_epolls[slot] < 0 ||
+        (kind != WORKER_EPOLL_PWAIT2 && timeout_ms >= 0 && timeout_ms < 100) ||
+        (kind == WORKER_EPOLL_PWAIT2 && timeout_ns >= 0 &&
+         timeout_ns < INT64_C(100000000)))
+        return -1;
+    if (kind != WORKER_EPOLL_WAIT)
+        block_sigusr1 = strcmp(sigmask_text, "usr1") == 0;
+    epoll = &context->epolls[context->slot_epolls[slot]];
+    if (block_sigusr1 &&
+        ((kind == WORKER_EPOLL_PWAIT && timeout_ms < 0) ||
+         (kind == WORKER_EPOLL_PWAIT2 && timeout_ns < 0)) &&
+        !epoll_has_registration(epoll))
+        return -1;
+    worker = &context->workers[actor - 1];
+    if (worker->active)
+        return -1;
+    {
+        struct controlled_worker *controller = worker->controller;
+
+        memset(worker, 0, sizeof(*worker));
+        worker->controller = controller;
+        worker->handler_count = &context->signal_counts[actor - 1];
+    }
+    context->accounted_actor_mask &= ~(1U << (actor - 1));
+    worker->kind = kind;
+    worker->active = 1;
+    worker->slot = slot;
+    worker->fd = context->slots[slot];
+    worker->peer_fd = -1;
+    worker->epoll_object = context->slot_epolls[slot];
+    worker->start_result_index = context->operation_index;
+    worker->maxevents = (int)maxevents;
+    worker->timeout_ms = (int)timeout_ms;
+    worker->timeout_ns = timeout_ns;
+    worker->block_sigusr1 = block_sigusr1;
+    if (controlled_worker_start(worker->controller, run_worker, worker) !=
+        CONTROLLED_WORKER_OK) {
+        worker->active = 0;
+        return -2;
+    }
+    result->kind = kind == WORKER_EPOLL_WAIT ? OP_START_EPOLL_WAIT :
+                   kind == WORKER_EPOLL_PWAIT ? OP_START_EPOLL_PWAIT :
+                                                OP_START_EPOLL_PWAIT2;
+    result->actor = (uint32_t)actor;
+    result->value = (uint64_t)maxevents;
     return 0;
 }
 
@@ -1113,7 +1584,10 @@ static int execute_send_signal(struct concurrent_context *context, char *save,
     if (controlled_worker_send_signal(worker->controller, (int)signo) !=
         CONTROLLED_WORKER_OK)
         return -2;
-    if (worker->kind == WORKER_PPOLL && worker->block_sigusr1) {
+    if ((worker->kind == WORKER_PPOLL ||
+         worker->kind == WORKER_EPOLL_PWAIT ||
+         worker->kind == WORKER_EPOLL_PWAIT2) &&
+        worker->block_sigusr1) {
         status = 0;
     } else {
         status = wait_for_handler_count(worker->handler_count, target_count);
@@ -1121,8 +1595,14 @@ static int execute_send_signal(struct concurrent_context *context, char *save,
             return status;
     }
     if ((worker->kind == WORKER_POLL || worker->kind == WORKER_PPOLL ||
-         context->signal_flags == 0 || worker->partial_progress_expected) &&
-        !(worker->kind == WORKER_PPOLL && worker->block_sigusr1)) {
+         worker->kind == WORKER_EPOLL_WAIT ||
+         worker->kind == WORKER_EPOLL_PWAIT ||
+         worker->kind == WORKER_EPOLL_PWAIT2 || context->signal_flags == 0 ||
+         worker->partial_progress_expected) &&
+        !((worker->kind == WORKER_PPOLL ||
+           worker->kind == WORKER_EPOLL_PWAIT ||
+           worker->kind == WORKER_EPOLL_PWAIT2) &&
+          worker->block_sigusr1)) {
         worker_status =
             controlled_worker_wait_for_completion(worker->controller);
         if (worker_status == CONTROLLED_WORKER_COMPLETION_TIMEOUT)
@@ -1185,6 +1665,10 @@ static int execute_operation(struct concurrent_context *context, char *line,
     if (strcmp(operation, "set-status-flags") == 0)
         return execute_fcntl(context, save, result, F_SETFL,
                              OP_SET_STATUS_FLAGS);
+    if (strcmp(operation, "epoll-create") == 0)
+        return execute_epoll_create(context, save, result);
+    if (strcmp(operation, "epoll-ctl") == 0)
+        return execute_epoll_ctl(context, save, result);
     if (strcmp(operation, "set-size") == 0)
         return execute_set_size(context, save, result);
     if (strcmp(operation, "start-read") == 0)
@@ -1195,6 +1679,15 @@ static int execute_operation(struct concurrent_context *context, char *line,
         return execute_start_worker(context, save, result, WORKER_POLL);
     if (strcmp(operation, "start-ppoll") == 0)
         return execute_start_worker(context, save, result, WORKER_PPOLL);
+    if (strcmp(operation, "start-epoll-wait") == 0)
+        return execute_start_epoll_worker(context, save, result,
+                                          WORKER_EPOLL_WAIT);
+    if (strcmp(operation, "start-epoll-pwait") == 0)
+        return execute_start_epoll_worker(context, save, result,
+                                          WORKER_EPOLL_PWAIT);
+    if (strcmp(operation, "start-epoll-pwait2") == 0)
+        return execute_start_epoll_worker(context, save, result,
+                                          WORKER_EPOLL_PWAIT2);
     if (strcmp(operation, "assert-pending") == 0)
         return execute_assert_pending(context, save, result, 0);
     if (strcmp(operation, "assert-all-pending") == 0)

@@ -20,12 +20,69 @@ import concurrent_generator  # noqa: E402
 import concurrent_mutation  # noqa: E402
 import concurrent_scenario  # noqa: E402
 import fuzz  # noqa: E402
+import fingerprint  # noqa: E402
 import guest_result  # noqa: E402
 import models  # noqa: E402
 from linux_oracle.outcomes import AllowedTrace, decode_raw_run_trace, fnv1a64  # noqa: E402
 
 
 class EventFdConcurrentCodecTests(unittest.TestCase):
+    def test_epoll_operations_and_wait_families_round_trip(self):
+        encoded = (
+            "version 4\n"
+            "scenario lt\n"
+            "eventfd 0 0\n"
+            "epoll-create 1 0\n"
+            "epoll-ctl 1 add 0 1 17\n"
+            "start-epoll-wait 1 1 1 -1\n"
+            "start-epoll-wait 2 1 1 -1\n"
+            "assert-all-pending\n"
+            "write 0 8 0 1\n"
+            "join-set 1 2\n"
+            "epoll-ctl 1 mod 0 1073741825 34\n"
+            "epoll-ctl 1 del 0 0 0\n"
+            "scenario pwait\n"
+            "signal-config 10 268435456\n"
+            "eventfd 0 0\n"
+            "epoll-create 1 524288\n"
+            "epoll-ctl 1 add 0 2147483649 51\n"
+            "start-epoll-pwait 1 1 4 -1 usr1\n"
+            "assert-pending 1\n"
+            "send-signal 1 10\n"
+            "assert-signal-handled 1 0\n"
+            "write 0 8 0 1\n"
+            "join 1\n"
+            "assert-signal-handled 1 1\n"
+            "scenario pwait2\n"
+            "epoll-create 0 0\n"
+            "start-epoll-pwait2 2 0 4 200000000 empty\n"
+            "assert-pending 2\n"
+            "join 2\n"
+        )
+
+        document = concurrent_scenario.parse_document(encoded)
+        canonical = concurrent_scenario.serialize_document(document)
+
+        self.assertEqual(concurrent_scenario.parse_document(canonical), document)
+        self.assertIn("epoll-ctl 1 mod 0 1073741825 34", canonical)
+        self.assertIn("start-epoll-pwait2 2 0 4 200000000 empty", canonical)
+
+    def test_epoll_rejects_invalid_flags_events_actions_and_timeouts(self):
+        prefix = "version 4\nscenario x\neventfd 0 0\nepoll-create 1 0\n"
+        for operation in (
+            "epoll-create 2 1",
+            "epoll-ctl 1 add 0 2 1",
+            "epoll-ctl 1 mod 0 268435457 1",
+            "epoll-ctl 1 del 0 1 0",
+            "start-epoll-wait 1 1 0 -1",
+            "start-epoll-pwait 1 1 1 -1 all",
+            "start-epoll-pwait2 1 1 1 1000000001 empty",
+        ):
+            with self.subTest(operation=operation), self.assertRaises(
+                concurrent_scenario.ScenarioCodecError
+            ):
+                concurrent_scenario.parse_document(prefix + operation + "\n")
+
     def test_signal_restart_and_finite_timeout_story_round_trips(self):
         encoded = (
             "version 4\n"
@@ -170,6 +227,28 @@ class EventFdConcurrentRoutingTests(unittest.TestCase):
             "os/StarryOS/kernel/src/task/signal.rs",
             concurrent_coverage.TARGET_SOURCE_PATHS,
         )
+        self.assertIn(
+            "os/StarryOS/kernel/src/syscall/io_mpx/epoll.rs",
+            concurrent_coverage.TARGET_SOURCE_PATHS,
+        )
+        self.assertEqual(
+            {name: fingerprint._KINDS[name] for name in (
+                "start-ppoll",
+                "epoll-create",
+                "epoll-ctl",
+                "start-epoll-wait",
+                "start-epoll-pwait",
+                "start-epoll-pwait2",
+            )},
+            {
+                "start-ppoll": 24,
+                "epoll-create": 25,
+                "epoll-ctl": 26,
+                "start-epoll-wait": 27,
+                "start-epoll-pwait": 28,
+                "start-epoll-pwait2": 29,
+            },
+        )
         self.assertEqual(models.spec_for_model("simple-single").adapter_id, "eventfd-v1")
         self.assertEqual(
             models.spec_for_model("blocking").adapter_id, "eventfd-blocking-v2"
@@ -177,7 +256,7 @@ class EventFdConcurrentRoutingTests(unittest.TestCase):
 
     def test_generator_and_mutation_cover_signal_and_timeout_stories(self):
         generated = []
-        for story in range(9):
+        for story in range(concurrent_generator.STORY_COUNT):
             scenario = concurrent_generator.generate_scenario(
                 concurrent_generator.CampaignRng(42 + story), story=story
             )
@@ -201,6 +280,19 @@ class EventFdConcurrentRoutingTests(unittest.TestCase):
             any(
                 isinstance(operation, concurrent_scenario.StartPpoll)
                 for operation in generated[8].operations
+            )
+        )
+        self.assertTrue(
+            any(
+                isinstance(operation, concurrent_scenario.StartEpollWait)
+                for scenario in generated[9:13]
+                for operation in scenario.operations
+            )
+        )
+        self.assertTrue(
+            any(
+                isinstance(operation, concurrent_scenario.StartEpollPwait2)
+                for operation in generated[13].operations
             )
         )
 
@@ -313,7 +405,7 @@ class EventFdConcurrentHarnessTests(unittest.TestCase):
                 expected_corpus_digest=corpus_digest,
             )
             self.assertEqual(len(scenarios), 8)
-            self.assertEqual(sum(item.operation_count for item in scenarios), 121)
+            self.assertEqual(sum(item.operation_count for item in scenarios), 197)
 
             aggregate = root / "linux.trace"
             result = concurrent_adapter.record_host_converged(
@@ -337,6 +429,36 @@ class EventFdConcurrentHarnessTests(unittest.TestCase):
         self.assertEqual(compared.returncode, 0, compared.stderr)
         self.assertIn("STARRY_EVENTFD_LINUX_ORACLE_PASSED", compared.stdout)
 
+    def test_epoll_wait_pwait_and_pwait2_execute_on_host(self):
+        encoded = (
+            "version 4\nscenario lt\neventfd 0 0\nepoll-create 1 0\n"
+            "epoll-ctl 1 add 0 1 17\nstart-epoll-wait 1 1 1 -1\n"
+            "start-epoll-wait 2 1 1 -1\nassert-all-pending\n"
+            "write 0 8 0 1\njoin-set 1 2\n"
+            "scenario pwait\nsignal-config 10 268435456\neventfd 0 0\n"
+            "epoll-create 1 0\nepoll-ctl 1 add 0 2147483649 34\n"
+            "start-epoll-pwait 1 1 4 -1 usr1\nassert-pending 1\n"
+            "send-signal 1 10\nassert-signal-handled 1 0\n"
+            "write 0 8 0 1\njoin 1\nassert-signal-handled 1 1\n"
+            "scenario timeout\nepoll-create 0 0\n"
+            "start-epoll-pwait2 2 0 4 200000000 empty\n"
+            "assert-pending 2\njoin 2\n"
+        )
+        document = concurrent_scenario.parse_document(encoded)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            corpus = root / "epoll.ops"
+            trace = root / "epoll.trace"
+            corpus.write_text(concurrent_scenario.serialize_document(document))
+            result = subprocess.run(
+                [str(self.oracle), "--record", str(corpus), str(trace)],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("operations=23 scenarios=3", result.stdout)
+
     def test_cleanup_joins_restarted_and_masked_workers(self):
         corpora = (
             "version 4\nscenario cleanup\nsignal-config 10 268435456\n"
@@ -344,6 +466,11 @@ class EventFdConcurrentHarnessTests(unittest.TestCase):
             "send-signal 1 10\nassert-signal-handled 1 1\ninvalid\n",
             "version 4\nscenario cleanup\nsignal-config 10 268435456\n"
             "eventfd 0 0\nstart-ppoll 1 0 1 null usr1\nassert-pending 1\n"
+            "send-signal 1 10\nassert-signal-handled 1 0\ninvalid\n",
+            "version 4\nscenario cleanup\nsignal-config 10 268435456\n"
+            "eventfd 0 0\nepoll-create 1 0\n"
+            "epoll-ctl 1 add 0 2147483649 17\n"
+            "start-epoll-pwait 1 1 1 -1 usr1\nassert-pending 1\n"
             "send-signal 1 10\nassert-signal-handled 1 0\ninvalid\n",
         )
         for index, encoded in enumerate(corpora):
