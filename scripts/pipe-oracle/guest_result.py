@@ -14,6 +14,7 @@ class GuestResultCategory(str, Enum):
     ORACLE_FAILURE = "oracle-failure"
     KERNEL_PANIC = "kernel-panic"
     LOCKDEP_FAILURE = "lockdep-failure"
+    SYSCALL_TIMEOUT = "syscall-timeout"
     SCHEDULE_TIMEOUT = "schedule-timeout"
     HARNESS_ERROR = "harness-error"
     TIMEOUT = "timeout"
@@ -107,6 +108,7 @@ _PANIC_RE = re.compile(r"(?i)\bpanic(?:ked)?\b")
 _LOCKDEP_RE = re.compile(r"(?m)^lockdep fatal violation\s*$", re.IGNORECASE)
 _ORACLE_FAILURE_MARKER = "STARRY_PIPE_LINUX_ORACLE_FAILED:"
 _CONCURRENT_MISMATCH_MARKER = "STARRY_PIPE_CONCURRENT_MISMATCH:"
+_SYSCALL_TIMEOUT_MARKER = "STARRY_PIPE_LINUX_ORACLE_SYSCALL_TIMEOUT:"
 _SCHEDULE_TIMEOUT_MARKER = "STARRY_PIPE_LINUX_ORACLE_SCHEDULE_TIMEOUT:"
 _HARNESS_ERROR_MARKER = "STARRY_PIPE_LINUX_ORACLE_HARNESS_ERROR:"
 
@@ -141,6 +143,13 @@ def classify_guest_execution(
             returncode,
         )
 
+    if _SYSCALL_TIMEOUT_MARKER in log:
+        return GuestExecutionResult(
+            GuestResultCategory.SYSCALL_TIMEOUT,
+            log,
+            paths,
+            returncode,
+        )
     if _SCHEDULE_TIMEOUT_MARKER in log:
         return GuestExecutionResult(
             GuestResultCategory.SCHEDULE_TIMEOUT,

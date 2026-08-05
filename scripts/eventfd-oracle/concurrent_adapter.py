@@ -56,6 +56,7 @@ def record_host_converged(
         magic=TRACE_MAGIC,
         version=4,
         temporary_prefix=".eventfd-concurrent-v1-host-",
+        deterministic=(6, 7),
     )
 
 

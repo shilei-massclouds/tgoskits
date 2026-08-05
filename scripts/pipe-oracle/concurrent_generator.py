@@ -5,19 +5,28 @@ from typing import Optional
 
 from concurrent_scenario import (
     AssertAllPending,
+    AssertPending,
+    AssertSignalHandled,
     Close,
     Dup,
+    Join,
     JoinSet,
     O_NONBLOCK,
     POLLIN,
     POLLOUT,
     Pipe2,
     Read,
+    SA_RESTART,
+    SIGUSR1,
     Scenario,
     ScenarioDocument,
+    SendSignal,
     SetSize,
     SetStatusFlags,
+    SignalConfig,
+    SignalMask,
     StartPoll,
+    StartPpoll,
     StartRead,
     StartWrite,
     Write,
@@ -29,7 +38,7 @@ from generator import CampaignRng
 
 
 GENERATOR_VERSION = "pipe-concurrent-generator-v1"
-STORY_COUNT = 6
+STORY_COUNT = 9
 
 
 @dataclass(frozen=True)
@@ -103,16 +112,22 @@ def generate_scenario(rng: CampaignRng, story: Optional[int] = None) -> Scenario
                 JoinSet((1, 2)),
             )
         )
-    return Scenario(
-        (
-            Pipe2(read_slot, write_slot, 0),
-            StartPoll(1, read_slot, POLLIN, -1),
-            StartPoll(2, read_slot, POLLIN, -1),
-            AssertAllPending(),
-            Close(write_slot),
-            JoinSet((1, 2)),
+    if story_index == 5:
+        return Scenario(
+            (
+                Pipe2(read_slot, write_slot, 0),
+                StartPoll(1, read_slot, POLLIN, -1),
+                StartPoll(2, read_slot, POLLIN, -1),
+                AssertAllPending(),
+                Close(write_slot),
+                JoinSet((1, 2)),
+            )
         )
-    )
+    if story_index == 6:
+        return _signal_story(rng, actors[0])
+    if story_index == 7:
+        return _timeout_story(rng, actors[0])
+    return _ppoll_story(rng, actors[0])
 
 
 def generate_document(rng: CampaignRng) -> ScenarioDocument:
@@ -131,6 +146,124 @@ def generate_input(rng: CampaignRng) -> GeneratedInput:
 
 def canonicalize_seed(seed: int) -> GeneratedInput:
     return generate_input(CampaignRng(seed))
+
+
+def _signal_story(rng: CampaignRng, actor: int) -> Scenario:
+    slots = _distinct_slots(rng, 12)
+    pairs = tuple((slots[index], slots[index + 1]) for index in range(0, 12, 2))
+    return Scenario(
+        (
+            SignalConfig(SIGUSR1, 0),
+            Pipe2(*pairs[0], 0),
+            StartRead(actor, pairs[0][0], 1),
+            AssertPending(actor),
+            SendSignal(actor, SIGUSR1),
+            AssertSignalHandled(actor, 1),
+            Join(actor),
+            SignalConfig(SIGUSR1, SA_RESTART),
+            Pipe2(*pairs[1], 0),
+            StartRead(actor, pairs[1][0], 1),
+            AssertPending(actor),
+            SendSignal(actor, SIGUSR1),
+            AssertSignalHandled(actor, 2),
+            AssertPending(actor),
+            Write(pairs[1][1], 1, 65),
+            Join(actor),
+            SignalConfig(SIGUSR1, SA_RESTART),
+            Pipe2(*pairs[2], 0),
+            StartPoll(actor, pairs[2][0], POLLIN, -1),
+            AssertPending(actor),
+            SendSignal(actor, SIGUSR1),
+            AssertSignalHandled(actor, 3),
+            Join(actor),
+            SignalConfig(SIGUSR1, 0),
+            Pipe2(*pairs[3], 0),
+            SetSize(pairs[3][1], 4096),
+            Write(pairs[3][1], 4096, 17),
+            StartWrite(actor, pairs[3][1], 4096),
+            AssertPending(actor),
+            SendSignal(actor, SIGUSR1),
+            AssertSignalHandled(actor, 4),
+            Join(actor),
+            SignalConfig(SIGUSR1, SA_RESTART),
+            Pipe2(*pairs[4], 0),
+            SetSize(pairs[4][1], 4096),
+            Write(pairs[4][1], 4096, 34),
+            StartWrite(actor, pairs[4][1], 4096),
+            AssertPending(actor),
+            SendSignal(actor, SIGUSR1),
+            AssertSignalHandled(actor, 5),
+            AssertPending(actor),
+            Read(pairs[4][0], 4096),
+            Join(actor),
+            SignalConfig(SIGUSR1, SA_RESTART),
+            Pipe2(*pairs[5], 0),
+            SetSize(pairs[5][1], 4096),
+            Write(pairs[5][1], 4096, 51),
+            StartWrite(actor, pairs[5][1], 8192),
+            AssertPending(actor),
+            Read(pairs[5][0], 4096),
+            AssertPending(actor),
+            SendSignal(actor, SIGUSR1),
+            AssertSignalHandled(actor, 6),
+            Join(actor),
+        )
+    )
+
+
+def _timeout_story(rng: CampaignRng, actor: int) -> Scenario:
+    expired_read, expired_write, ready_read, ready_write = _distinct_slots(rng, 4)
+    return Scenario(
+        (
+            Pipe2(expired_read, expired_write, 0),
+            StartPoll(actor, expired_read, POLLIN, 200),
+            AssertPending(actor),
+            Join(actor),
+            Pipe2(ready_read, ready_write, 0),
+            StartPoll(actor, ready_read, POLLIN, 1000),
+            AssertPending(actor),
+            Write(ready_write, 1, 68),
+            Join(actor),
+        )
+    )
+
+
+def _ppoll_story(rng: CampaignRng, actor: int) -> Scenario:
+    slots = _distinct_slots(rng, 8)
+    pairs = tuple((slots[index], slots[index + 1]) for index in range(0, 8, 2))
+    return Scenario(
+        (
+            SignalConfig(SIGUSR1, SA_RESTART),
+            Pipe2(*pairs[0], 0),
+            StartPpoll(actor, pairs[0][0], POLLIN, None, SignalMask.USR1),
+            AssertPending(actor),
+            SendSignal(actor, SIGUSR1),
+            AssertSignalHandled(actor, 0),
+            AssertPending(actor),
+            Write(pairs[0][1], 1, 85),
+            Join(actor),
+            AssertSignalHandled(actor, 1),
+            Pipe2(*pairs[1], 0),
+            StartPpoll(actor, pairs[1][0], POLLIN, None, SignalMask.EMPTY),
+            AssertPending(actor),
+            SendSignal(actor, SIGUSR1),
+            AssertSignalHandled(actor, 2),
+            Join(actor),
+            Pipe2(*pairs[2], 0),
+            StartPpoll(
+                actor, pairs[2][0], POLLIN, 200_000_000, SignalMask.EMPTY
+            ),
+            AssertPending(actor),
+            Join(actor),
+            Pipe2(*pairs[3], 0),
+            StartPpoll(
+                actor, pairs[3][0], POLLIN, 1_000_000_000, SignalMask.EMPTY
+            ),
+            AssertPending(actor),
+            Write(pairs[3][1], 1, 102),
+            Join(actor),
+        )
+    )
 
 
 def _distinct_slots(rng: CampaignRng, count: int) -> tuple[int, ...]:

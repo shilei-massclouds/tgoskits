@@ -8,13 +8,24 @@ _SCRIPTS_ROOT = Path(__file__).resolve().parents[1]
 if str(_SCRIPTS_ROOT) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_ROOT))
 
-from blocking_coverage import TARGET_SOURCE_PATHS
+from blocking_coverage import TARGET_SOURCE_PATHS as BLOCKING_TARGET_SOURCE_PATHS
 from linux_oracle.coverage import covered_region_set as _covered_region_set
 from linux_oracle.coverage import extract_regions as _extract_regions
 from linux_oracle.spec import CoverageTarget
 
 
 TARGET_SET_ID = "eventfd-concurrent-v1"
+TARGET_SOURCE_PATHS = tuple(
+    sorted(
+        set(BLOCKING_TARGET_SOURCE_PATHS)
+        | {
+            "os/StarryOS/kernel/src/syscall/mod.rs",
+            "os/StarryOS/kernel/src/syscall/signal.rs",
+            "os/StarryOS/kernel/src/task/signal.rs",
+            "os/StarryOS/kernel/src/task/user.rs",
+        }
+    )
+)
 TARGET = CoverageTarget(TARGET_SET_ID, TARGET_SOURCE_PATHS)
 
 

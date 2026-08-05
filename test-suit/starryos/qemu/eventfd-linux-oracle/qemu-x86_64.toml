@@ -26,6 +26,7 @@ default_run = false
 success_regex = ['(?m)^STARRY_EVENTFD_LINUX_ORACLE_PASSED: operations=[0-9]+ host_linux=[^\r\n]+\r?$']
 fail_regex = [
     "(?m)^STARRY_EVENTFD_LINUX_ORACLE_FAILED:",
+    "(?m)^STARRY_EVENTFD_LINUX_ORACLE_SYSCALL_TIMEOUT:",
     "(?m)^STARRY_EVENTFD_LINUX_ORACLE_SCHEDULE_TIMEOUT:",
     "(?m)^STARRY_EVENTFD_LINUX_ORACLE_HARNESS_ERROR:",
     '(?i)\bpanic(?:ked)?\b',

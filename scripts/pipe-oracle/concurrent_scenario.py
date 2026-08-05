@@ -2,7 +2,8 @@
 
 import hashlib
 from dataclasses import dataclass
-from typing import Iterable, Tuple, Union
+from enum import Enum
+from typing import Iterable, Optional, Tuple, Union
 
 import blocking_scenario as blocking
 import scenario as simple
@@ -20,6 +21,10 @@ POLLIN = 1
 POLLOUT = 4
 POLLHUP = 16
 POLL_EVENTS = (POLLIN, POLLOUT)
+SIGUSR1 = 10
+SA_RESTART = 268435456
+SIGNAL_FLAGS = (0, SA_RESTART)
+MAX_TIMEOUT_NS = 1_000_000_000
 
 Scenario = blocking.Scenario
 ScenarioDocument = blocking.ScenarioDocument
@@ -65,6 +70,38 @@ class StartPoll:
     timeout_ms: int
 
 
+class SignalMask(str, Enum):
+    EMPTY = "empty"
+    USR1 = "usr1"
+
+
+@dataclass(frozen=True)
+class StartPpoll:
+    actor: int
+    slot: int
+    events: int
+    timeout_ns: Optional[int]
+    sigmask: SignalMask
+
+
+@dataclass(frozen=True)
+class SignalConfig:
+    signo: int
+    flags: int
+
+
+@dataclass(frozen=True)
+class SendSignal:
+    actor: int
+    signo: int
+
+
+@dataclass(frozen=True)
+class AssertSignalHandled:
+    actor: int
+    count: int
+
+
 @dataclass(frozen=True)
 class AssertPending:
     actor: int
@@ -92,6 +129,10 @@ ConcurrentOperation = Union[
     StartRead,
     StartWrite,
     StartPoll,
+    StartPpoll,
+    SignalConfig,
+    SendSignal,
+    AssertSignalHandled,
     AssertPending,
     AssertAllPending,
     Join,
@@ -107,10 +148,35 @@ class ResourceState(blocking.ResourceState):
         super().__init__()
         self.workers = controlled_actor.ControlledWorkers[ConcurrentOperation, int]()
         self._next_completion_ordinal = 1
+        self.signal_flags: Optional[int] = None
+        self.signal_counts = {actor: 0 for actor in controlled_actor.WORKER_ACTORS}
+        self.pending_signal_counts = {
+            actor: 0 for actor in controlled_actor.WORKER_ACTORS
+        }
+        self.worker_write_progress = {
+            actor: 0 for actor in controlled_actor.WORKER_ACTORS
+        }
 
     def apply(self, operation: Operation, line_number: int = 0) -> None:
-        if isinstance(operation, (StartRead, StartWrite, StartPoll)):
+        if isinstance(operation, (StartRead, StartWrite, StartPoll, StartPpoll)):
             self._start(operation, line_number)
+        elif isinstance(operation, SignalConfig):
+            if self.workers.active_actors:
+                blocking._raise(
+                    line_number,
+                    CodecErrorCategory.RESOURCE_CONFLICT,
+                    "signal-config requires idle workers",
+                )
+            self.signal_flags = operation.flags
+        elif isinstance(operation, SendSignal):
+            self._send_signal(operation, line_number)
+        elif isinstance(operation, AssertSignalHandled):
+            if self.signal_counts[operation.actor] != operation.count:
+                blocking._raise(
+                    line_number,
+                    CodecErrorCategory.BLOCKING_IO,
+                    "unexpected signal handler count",
+                )
         elif isinstance(operation, AssertPending):
             self._transition(
                 line_number, lambda: self.workers.assert_pending(operation.actor)
@@ -118,11 +184,14 @@ class ResourceState(blocking.ResourceState):
         elif isinstance(operation, AssertAllPending):
             self._transition(line_number, self.workers.assert_all_pending)
         elif isinstance(operation, Join):
+            self._complete_timeout(operation.actor, line_number)
             self._transition(
                 line_number,
                 lambda: self.workers.join(operation.actor, lambda _worker: None),
             )
         elif isinstance(operation, JoinSet):
+            for actor in operation.actors:
+                self._complete_timeout(actor, line_number)
             self._transition(
                 line_number,
                 lambda: self.workers.join_set(operation.actors, lambda _workers: None),
@@ -136,13 +205,16 @@ class ResourceState(blocking.ResourceState):
         self._transition(line_number, self.workers.finish_scenario)
 
     def _start(
-        self, operation: Union[StartRead, StartWrite, StartPoll], line_number: int
+        self,
+        operation: Union[StartRead, StartWrite, StartPoll, StartPpoll],
+        line_number: int,
     ) -> None:
         def identify_pipe() -> int:
             endpoint = (
                 "reader"
                 if isinstance(operation, StartRead)
-                or isinstance(operation, StartPoll) and operation.events == POLLIN
+                or isinstance(operation, (StartPoll, StartPpoll))
+                and operation.events == POLLIN
                 else "writer"
             )
             resource = self._require_endpoint(operation.slot, endpoint, line_number)
@@ -159,9 +231,12 @@ class ResourceState(blocking.ResourceState):
                 invalid = (
                     description.nonblocking
                     or operation.length <= 0
-                    or operation.length > PIPE_BUF
+                    or operation.length > MAX_IO_BYTES
                     or pipe.readers == 0
-                    or pipe.can_write_record(operation.length)
+                    or (
+                        operation.length <= PIPE_BUF
+                        and pipe.can_write_record(operation.length)
+                    )
                     or pipe.available_buffer_slots != 0
                 )
             else:
@@ -170,7 +245,13 @@ class ResourceState(blocking.ResourceState):
                     if operation.events == POLLIN
                     else pipe.available_buffer_slots > 0 or pipe.readers == 0
                 )
-                invalid = operation.timeout_ms != -1 or initially_ready
+                timeout_too_short = (
+                    0 <= operation.timeout_ms < 100
+                    if isinstance(operation, StartPoll)
+                    else operation.timeout_ns is not None
+                    and operation.timeout_ns < 100_000_000
+                )
+                invalid = timeout_too_short or initially_ready
             if invalid:
                 blocking._raise(
                     line_number,
@@ -185,6 +266,73 @@ class ResourceState(blocking.ResourceState):
                 operation.actor, operation, identify_pipe
             ),
         )
+        self.worker_write_progress[operation.actor] = 0
+
+    def _send_signal(self, operation: SendSignal, line_number: int) -> None:
+        if self.signal_flags is None:
+            blocking._raise(
+                line_number,
+                CodecErrorCategory.RESOURCE_CONFLICT,
+                "send-signal requires signal-config",
+            )
+        worker = self.workers.worker(operation.actor)
+        if worker is None:
+            blocking._raise(
+                line_number,
+                CodecErrorCategory.RESOURCE_CONFLICT,
+                "send-signal requires an active worker",
+            )
+        self._transition(
+            line_number,
+            lambda: self.workers.before_trigger((operation.actor,)),
+        )
+        if (
+            isinstance(worker.operation, StartPpoll)
+            and worker.operation.sigmask is SignalMask.USR1
+        ):
+            self.pending_signal_counts[operation.actor] += 1
+            return
+        self.signal_counts[operation.actor] += 1
+        interrupted = (
+            isinstance(worker.operation, (StartPoll, StartPpoll))
+            or self.signal_flags == 0
+            or isinstance(worker.operation, StartWrite)
+            and self.worker_write_progress[operation.actor] > 0
+        )
+        if interrupted:
+            self._mark_completed(operation.actor, line_number)
+
+    def _complete_timeout(self, actor: int, line_number: int) -> None:
+        worker = self.workers.worker(actor)
+        if worker is None or worker.completed:
+            return
+        operation = worker.operation
+        finite = (
+            isinstance(operation, StartPoll) and operation.timeout_ms >= 0
+        ) or (
+            isinstance(operation, StartPpoll) and operation.timeout_ns is not None
+        )
+        if finite:
+            self._mark_completed(actor, line_number)
+
+    def _mark_completed(self, actor: int, line_number: int) -> None:
+        self._deliver_pending_signals(actor)
+        self._transition(
+            line_number,
+            lambda: self.workers.update_completable(actor, True),
+        )
+        ordinal = self._next_completion_ordinal
+        self._next_completion_ordinal += 1
+        self._transition(
+            line_number,
+            lambda: self.workers.mark_completed(actor, ordinal),
+        )
+
+    def _deliver_pending_signals(self, actor: int) -> None:
+        pending = self.pending_signal_counts[actor]
+        if pending:
+            self.signal_counts[actor] += pending
+            self.pending_signal_counts[actor] = 0
 
     def _apply_trigger(self, operation: simple.Operation, line_number: int) -> None:
         if not isinstance(operation, (Read, Write, Close)):
@@ -230,9 +378,20 @@ class ResourceState(blocking.ResourceState):
                     if ready and pipe.queued_bytes:
                         pipe.read_bytes(operation.length)
                 elif isinstance(operation, StartWrite):
-                    ready = pipe.readers == 0 or pipe.can_write_record(operation.length)
-                    if ready and pipe.readers:
-                        pipe.write_record(operation.length, 64 + actor)
+                    if pipe.readers == 0:
+                        ready = True
+                    elif operation.length <= PIPE_BUF:
+                        ready = pipe.can_write_record(operation.length)
+                        if ready:
+                            pipe.write_record(operation.length, 64 + actor)
+                    elif pipe.available_buffer_slots > 0:
+                        remaining = (
+                            operation.length - self.worker_write_progress[actor]
+                        )
+                        chunk = min(remaining, PIPE_BUF)
+                        pipe.write_record(chunk, 64 + actor)
+                        self.worker_write_progress[actor] += chunk
+                        ready = self.worker_write_progress[actor] == operation.length
                 elif operation.events == POLLIN:
                     ready = pipe.queued_bytes != 0 or pipe.writers == 0
                 else:
@@ -240,18 +399,7 @@ class ResourceState(blocking.ResourceState):
                 del resource
                 if not ready:
                     continue
-                self._transition(
-                    line_number,
-                    lambda actor=actor: self.workers.update_completable(actor, True),
-                )
-                ordinal = self._next_completion_ordinal
-                self._next_completion_ordinal += 1
-                self._transition(
-                    line_number,
-                    lambda actor=actor, ordinal=ordinal: self.workers.mark_completed(
-                        actor, ordinal
-                    ),
-                )
+                self._mark_completed(actor, line_number)
                 made_progress = True
 
     @staticmethod
@@ -392,6 +540,14 @@ def operation_name(operation: Operation) -> str:
         return "start-write"
     if isinstance(operation, StartPoll):
         return "start-poll"
+    if isinstance(operation, StartPpoll):
+        return "start-ppoll"
+    if isinstance(operation, SignalConfig):
+        return "signal-config"
+    if isinstance(operation, SendSignal):
+        return "send-signal"
+    if isinstance(operation, AssertSignalHandled):
+        return "assert-signal-handled"
     if isinstance(operation, AssertPending):
         return "assert-pending"
     if isinstance(operation, AssertAllPending):
@@ -425,7 +581,7 @@ def _parse_operation(fields: Tuple[str, ...], line_number: int) -> Operation:
             simple._range(
                 simple._parse_integer(values[2], line_number),
                 1,
-                PIPE_BUF,
+                MAX_IO_BYTES,
                 line_number,
                 "worker write length",
             ),
@@ -442,6 +598,62 @@ def _parse_operation(fields: Tuple[str, ...], line_number: int) -> Operation:
             simple._slot(simple._parse_integer(values[1], line_number), line_number),
             events,
             timeout_ms,
+        )
+    if keyword == "start-ppoll" and len(values) == 5:
+        events = simple._parse_integer(values[2], line_number)
+        if events not in POLL_EVENTS:
+            blocking._raise(
+                line_number, CodecErrorCategory.OUT_OF_RANGE, "unsupported ppoll events"
+            )
+        timeout_ns = (
+            None
+            if values[3] == "null"
+            else simple._range(
+                simple._parse_integer(values[3], line_number),
+                0,
+                MAX_TIMEOUT_NS,
+                line_number,
+                "ppoll timeout",
+            )
+        )
+        try:
+            sigmask = SignalMask(values[4])
+        except ValueError:
+            blocking._raise(
+                line_number, CodecErrorCategory.OUT_OF_RANGE, "unsupported ppoll mask"
+            )
+        return StartPpoll(
+            _actor(values[0], line_number),
+            simple._slot(simple._parse_integer(values[1], line_number), line_number),
+            events,
+            timeout_ns,
+            sigmask,
+        )
+    if keyword == "signal-config" and len(values) == 2:
+        signo = simple._parse_integer(values[0], line_number)
+        flags = simple._parse_integer(values[1], line_number)
+        if signo != SIGUSR1 or flags not in SIGNAL_FLAGS:
+            blocking._raise(
+                line_number, CodecErrorCategory.OUT_OF_RANGE, "unsupported signal config"
+            )
+        return SignalConfig(signo, flags)
+    if keyword == "send-signal" and len(values) == 2:
+        signo = simple._parse_integer(values[1], line_number)
+        if signo != SIGUSR1:
+            blocking._raise(
+                line_number, CodecErrorCategory.OUT_OF_RANGE, "unsupported signal"
+            )
+        return SendSignal(_actor(values[0], line_number), signo)
+    if keyword == "assert-signal-handled" and len(values) == 2:
+        return AssertSignalHandled(
+            _actor(values[0], line_number),
+            simple._range(
+                simple._parse_integer(values[1], line_number),
+                0,
+                MAX_OPS_PER_SCENARIO,
+                line_number,
+                "signal handler count",
+            ),
         )
     if keyword in ("assert-pending", "join") and len(values) == 1:
         operation_type = AssertPending if keyword == "assert-pending" else Join
@@ -473,6 +685,18 @@ def _serialize_operation(operation: Operation) -> str:
             f"start-poll {operation.actor} {operation.slot} "
             f"{operation.events} {operation.timeout_ms}"
         )
+    if isinstance(operation, StartPpoll):
+        timeout = "null" if operation.timeout_ns is None else operation.timeout_ns
+        return (
+            f"start-ppoll {operation.actor} {operation.slot} "
+            f"{operation.events} {timeout} {operation.sigmask.value}"
+        )
+    if isinstance(operation, SignalConfig):
+        return f"signal-config {operation.signo} {operation.flags}"
+    if isinstance(operation, SendSignal):
+        return f"send-signal {operation.actor} {operation.signo}"
+    if isinstance(operation, AssertSignalHandled):
+        return f"assert-signal-handled {operation.actor} {operation.count}"
     if isinstance(operation, (AssertPending, Join)):
         return f"{operation_name(operation)} {operation.actor}"
     if isinstance(operation, AssertAllPending):

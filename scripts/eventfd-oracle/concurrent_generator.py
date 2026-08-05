@@ -5,10 +5,13 @@ from typing import Optional
 
 from concurrent_scenario import (
     AssertAllPending,
+    AssertPending,
+    AssertSignalHandled,
     Dup,
     EFD_SEMAPHORE,
     EventFd,
     EventFd2,
+    Join,
     JoinSet,
     MAX_COUNTER,
     O_NONBLOCK,
@@ -16,10 +19,16 @@ from concurrent_scenario import (
     POLLOUT,
     PointerMode,
     Read,
+    SA_RESTART,
+    SIGUSR1,
     Scenario,
     ScenarioDocument,
+    SendSignal,
     SetStatusFlags,
+    SignalMask,
+    SignalConfig,
     StartPoll,
+    StartPpoll,
     StartRead,
     StartWrite,
     Write,
@@ -31,7 +40,7 @@ from poll_generator import CampaignRng
 
 
 GENERATOR_VERSION = "eventfd-concurrent-generator-v1"
-STORY_COUNT = 6
+STORY_COUNT = 9
 _FULL_COUNTER_INCREMENT = MAX_COUNTER - ((1 << 32) - 1)
 
 
@@ -80,7 +89,13 @@ def generate_scenario(rng: CampaignRng, story: Optional[int] = None) -> Scenario
                 JoinSet((1, 2)),
             )
         )
-    return _poll_story(first, POLLOUT)
+    if story_index == 5:
+        return _poll_story(first, POLLOUT)
+    if story_index == 6:
+        return _signal_story(rng, actors[0])
+    if story_index == 7:
+        return _timeout_story(first, second, actors[0])
+    return _ppoll_story(rng, actors[0])
 
 
 def generate_document(rng: CampaignRng) -> ScenarioDocument:
@@ -142,9 +157,127 @@ def _poll_story(slot, events):
     )
 
 
+def _signal_story(rng: CampaignRng, actor: int) -> Scenario:
+    read_interrupt, read_restart, poll_interrupt, write_interrupt, write_restart = (
+        _distinct_slots(rng, 5)
+    )
+    return Scenario(
+        (
+            SignalConfig(SIGUSR1, 0),
+            EventFd(read_interrupt, 0),
+            StartRead(actor, read_interrupt, 8),
+            AssertPending(actor),
+            SendSignal(actor, SIGUSR1),
+            AssertSignalHandled(actor, 1),
+            Join(actor),
+            SignalConfig(SIGUSR1, SA_RESTART),
+            EventFd(read_restart, 0),
+            StartRead(actor, read_restart, 8),
+            AssertPending(actor),
+            SendSignal(actor, SIGUSR1),
+            AssertSignalHandled(actor, 2),
+            AssertPending(actor),
+            Write(read_restart, 8, PointerMode.VALID, 1),
+            Join(actor),
+            SignalConfig(SIGUSR1, SA_RESTART),
+            EventFd(poll_interrupt, 0),
+            StartPoll(actor, poll_interrupt, POLLIN, -1),
+            AssertPending(actor),
+            SendSignal(actor, SIGUSR1),
+            AssertSignalHandled(actor, 3),
+            Join(actor),
+            SignalConfig(SIGUSR1, 0),
+            EventFd(write_interrupt, (1 << 32) - 1),
+            Write(
+                write_interrupt,
+                8,
+                PointerMode.VALID,
+                _FULL_COUNTER_INCREMENT,
+            ),
+            StartWrite(actor, write_interrupt, MAX_COUNTER),
+            AssertPending(actor),
+            SendSignal(actor, SIGUSR1),
+            AssertSignalHandled(actor, 4),
+            Join(actor),
+            SignalConfig(SIGUSR1, SA_RESTART),
+            EventFd(write_restart, (1 << 32) - 1),
+            Write(
+                write_restart,
+                8,
+                PointerMode.VALID,
+                _FULL_COUNTER_INCREMENT,
+            ),
+            StartWrite(actor, write_restart, MAX_COUNTER),
+            AssertPending(actor),
+            SendSignal(actor, SIGUSR1),
+            AssertSignalHandled(actor, 5),
+            AssertPending(actor),
+            Read(write_restart, 8, PointerMode.VALID),
+            Join(actor),
+        )
+    )
+
+
+def _timeout_story(first: int, second: int, actor: int) -> Scenario:
+    return Scenario(
+        (
+            EventFd(first, 0),
+            StartPoll(actor, first, POLLIN, 200),
+            AssertPending(actor),
+            Join(actor),
+            EventFd(second, 0),
+            StartPoll(actor, second, POLLIN, 1000),
+            AssertPending(actor),
+            Write(second, 8, PointerMode.VALID, 1),
+            Join(actor),
+        )
+    )
+
+
+def _ppoll_story(rng: CampaignRng, actor: int) -> Scenario:
+    masked, interrupted, expired, ready = _distinct_slots(rng, 4)
+    return Scenario(
+        (
+            SignalConfig(SIGUSR1, SA_RESTART),
+            EventFd(masked, 0),
+            StartPpoll(actor, masked, POLLIN, None, SignalMask.USR1),
+            AssertPending(actor),
+            SendSignal(actor, SIGUSR1),
+            AssertSignalHandled(actor, 0),
+            AssertPending(actor),
+            Write(masked, 8, PointerMode.VALID, 1),
+            Join(actor),
+            AssertSignalHandled(actor, 1),
+            EventFd(interrupted, 0),
+            StartPpoll(actor, interrupted, POLLIN, None, SignalMask.EMPTY),
+            AssertPending(actor),
+            SendSignal(actor, SIGUSR1),
+            AssertSignalHandled(actor, 2),
+            Join(actor),
+            EventFd(expired, 0),
+            StartPpoll(actor, expired, POLLIN, 200_000_000, SignalMask.EMPTY),
+            AssertPending(actor),
+            Join(actor),
+            EventFd(ready, 0),
+            StartPpoll(actor, ready, POLLIN, 1_000_000_000, SignalMask.EMPTY),
+            AssertPending(actor),
+            Write(ready, 8, PointerMode.VALID, 1),
+            Join(actor),
+        )
+    )
+
+
 def _different_slot(rng: CampaignRng, first: int) -> int:
     candidate = rng.range(0, 15)
     return candidate if candidate < first else candidate + 1
+
+
+def _distinct_slots(rng: CampaignRng, count: int) -> tuple[int, ...]:
+    available = list(range(16))
+    for index in range(count):
+        selected = rng.range(index, len(available))
+        available[index], available[selected] = available[selected], available[index]
+    return tuple(available[:count])
 
 
 __all__ = [

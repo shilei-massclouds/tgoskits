@@ -57,6 +57,7 @@ def record_host_converged(
         magic=TRACE_MAGIC,
         version=7,
         temporary_prefix=".pipe-concurrent-v1-host-",
+        deterministic=(6, 7),
         indexed_record_once=record_host_scheduled,
     )
 

@@ -52,3 +52,93 @@ start-poll 2 0 1 -1
 assert-all-pending
 close 1
 join-set 1 2
+scenario generated-0007
+signal-config 10 0
+pipe2 0 1 0
+start-read 1 0 1
+assert-pending 1
+send-signal 1 10
+assert-signal-handled 1 1
+join 1
+signal-config 10 268435456
+pipe2 2 3 0
+start-read 1 2 1
+assert-pending 1
+send-signal 1 10
+assert-signal-handled 1 2
+assert-pending 1
+write 3 1 65
+join 1
+signal-config 10 268435456
+pipe2 4 5 0
+start-poll 1 4 1 -1
+assert-pending 1
+send-signal 1 10
+assert-signal-handled 1 3
+join 1
+signal-config 10 0
+pipe2 6 7 0
+set-size 7 4096
+write 7 4096 17
+start-write 1 7 4096
+assert-pending 1
+send-signal 1 10
+assert-signal-handled 1 4
+join 1
+signal-config 10 268435456
+pipe2 8 9 0
+set-size 9 4096
+write 9 4096 34
+start-write 1 9 4096
+assert-pending 1
+send-signal 1 10
+assert-signal-handled 1 5
+assert-pending 1
+read 8 4096
+join 1
+signal-config 10 268435456
+pipe2 10 11 0
+set-size 11 4096
+write 11 4096 51
+start-write 1 11 8192
+assert-pending 1
+read 10 4096
+assert-pending 1
+send-signal 1 10
+assert-signal-handled 1 6
+join 1
+scenario generated-0008
+pipe2 0 1 0
+start-poll 1 0 1 200
+assert-pending 1
+join 1
+pipe2 2 3 0
+start-poll 1 2 1 1000
+assert-pending 1
+write 3 1 68
+join 1
+signal-config 10 268435456
+pipe2 4 5 0
+start-ppoll 1 4 1 null usr1
+assert-pending 1
+send-signal 1 10
+assert-signal-handled 1 0
+assert-pending 1
+write 5 1 85
+join 1
+assert-signal-handled 1 1
+pipe2 6 7 0
+start-ppoll 1 6 1 null empty
+assert-pending 1
+send-signal 1 10
+assert-signal-handled 1 2
+join 1
+pipe2 8 9 0
+start-ppoll 1 8 1 200000000 empty
+assert-pending 1
+join 1
+pipe2 10 11 0
+start-ppoll 1 10 1 1000000000 empty
+assert-pending 1
+write 11 1 102
+join 1

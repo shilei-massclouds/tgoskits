@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "concurrent_trace.h"
@@ -28,6 +29,11 @@
 #define O_NONBLOCK_FLAG 2048L
 #define O_CLOEXEC_FLAG 524288L
 #define MAX_EVENTFD_COUNTER (UINT64_MAX - UINT64_C(1))
+#define SIGUSR1_NUMBER 10L
+#define SA_RESTART_FLAG 268435456L
+#define MAX_TIMEOUT_NS UINT64_C(1000000000)
+#define KERNEL_SIGSET_SIZE 8U
+#define SIGUSR1_MASK (UINT64_C(1) << (SIGUSR1 - 1))
 
 static const unsigned char raw_magic[8] = {
     'E', 'V', 'F', 'D', 'R', 'U', 'N', '4',
@@ -57,12 +63,17 @@ enum operation_kind {
     OP_START_POLL,
     OP_ASSERT_ALL_PENDING,
     OP_JOIN_SET,
+    OP_SIGNAL_CONFIG,
+    OP_SEND_SIGNAL,
+    OP_ASSERT_SIGNAL_HANDLED,
+    OP_START_PPOLL,
 };
 
 enum worker_kind {
     WORKER_READ,
     WORKER_WRITE,
     WORKER_POLL,
+    WORKER_PPOLL,
 };
 
 struct event_object {
@@ -86,6 +97,12 @@ struct concurrent_worker_state {
     uint64_t value;
     struct pollfd poll_fd;
     int timeout_ms;
+    int64_t timeout_ns;
+    int block_sigusr1;
+    atomic_uint *handler_count;
+    int clock_failed;
+    int mask_failed;
+    int timeout_too_early;
 };
 
 struct concurrent_context {
@@ -104,7 +121,12 @@ struct concurrent_context {
     uint32_t operation_index;
     uint32_t total_operations;
     unsigned int accounted_actor_mask;
+    atomic_uint signal_counts[CONTROLLED_WORKER_COUNT];
+    long signal_flags;
+    int signal_configured;
 };
+
+static _Thread_local atomic_uint *current_handler_count;
 
 static int fail(const char *message)
 {
@@ -135,6 +157,15 @@ static int fail_schedule_timeout(unsigned int line_number, const char *line)
 {
     fprintf(stderr,
             "STARRY_EVENTFD_LINUX_ORACLE_SCHEDULE_TIMEOUT: line=%u "
+            "operation=\"%s\"\n",
+            line_number, line);
+    return 1;
+}
+
+static int fail_syscall_timeout(unsigned int line_number, const char *line)
+{
+    fprintf(stderr,
+            "STARRY_EVENTFD_LINUX_ORACLE_SYSCALL_TIMEOUT: line=%u "
             "operation=\"%s\"\n",
             line_number, line);
     return 1;
@@ -185,6 +216,20 @@ static int parse_u64_value(const char *text, uint64_t *value)
     return 0;
 }
 
+static int parse_timeout_ns(const char *text, int64_t *timeout_ns)
+{
+    uint64_t parsed;
+
+    if (text != NULL && strcmp(text, "null") == 0) {
+        *timeout_ns = -1;
+        return 0;
+    }
+    if (parse_u64_value(text, &parsed) != 0 || parsed > MAX_TIMEOUT_NS)
+        return -1;
+    *timeout_ns = (int64_t)parsed;
+    return 0;
+}
+
 static int parse_slot(const char *text, int *slot)
 {
     long parsed;
@@ -212,9 +257,25 @@ static void finish_syscall_result(struct concurrent_operation_result *result,
     result->error_number = syscall_result < 0 ? errno : 0;
 }
 
-static void no_op_signal_handler(int signal_number)
+static void count_signal_handler(int signal_number)
 {
     (void)signal_number;
+    if (current_handler_count != NULL)
+        atomic_fetch_add_explicit(current_handler_count, 1U,
+                                  memory_order_relaxed);
+}
+
+static int configure_count_signal_handler(int signal_number, long flags,
+                                          struct sigaction *previous_action)
+{
+    struct sigaction action;
+
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = count_signal_handler;
+    action.sa_flags = (int)flags;
+    if (sigemptyset(&action.sa_mask) != 0)
+        return -1;
+    return sigaction(signal_number, &action, previous_action);
 }
 
 static int cleanup_workers(void *argument)
@@ -225,10 +286,20 @@ static int cleanup_workers(void *argument)
 
     for (actor = 1; actor <= CONTROLLED_WORKER_COUNT; actor++) {
         struct concurrent_worker_state *worker = &context->workers[actor - 1];
+        uint64_t value = 1;
+        long syscall_result;
 
-        if (worker->active && worker->controller->started &&
-            controlled_worker_send_signal(worker->controller, SIGUSR1) !=
-                CONTROLLED_WORKER_OK)
+        if (!worker->active || !worker->controller->started)
+            continue;
+        errno = 0;
+        if (worker->kind == WORKER_WRITE ||
+            ((worker->kind == WORKER_POLL || worker->kind == WORKER_PPOLL) &&
+             worker->poll_fd.events == POLLOUT)) {
+            syscall_result = syscall(SYS_read, worker->fd, &value, sizeof(value));
+        } else {
+            syscall_result = syscall(SYS_write, worker->fd, &value, sizeof(value));
+        }
+        if (syscall_result != (long)sizeof(value))
             status = -1;
     }
     return status;
@@ -251,6 +322,10 @@ static void initialize_scenario(struct concurrent_context *context)
     controlled_workers_initialize(&context->controllers);
     for (index = 0; index < CONTROLLED_WORKER_COUNT; index++)
         context->workers[index].controller = &context->controllers.slots[index];
+    for (index = 0; index < CONTROLLED_WORKER_COUNT; index++)
+        atomic_init(&context->signal_counts[index], 0U);
+    context->signal_flags = 0;
+    context->signal_configured = 0;
 }
 
 static int cleanup_scenario(struct concurrent_context *context)
@@ -272,6 +347,8 @@ static int cleanup_scenario(struct concurrent_context *context)
             context->slot_objects[index] = -1;
         }
     }
+    if (configure_count_signal_handler(SIGUSR1, 0, NULL) != 0)
+        status = -1;
     return status;
 }
 
@@ -299,10 +376,95 @@ static int create_object(struct concurrent_context *context, int slot,
     return 0;
 }
 
+static uint64_t timespec_nanoseconds(const struct timespec *value)
+{
+    return (uint64_t)value->tv_sec * UINT64_C(1000000000) +
+           (uint64_t)value->tv_nsec;
+}
+
+static int wait_for_handler_count(atomic_uint *count, unsigned int target)
+{
+    struct timespec delay = {.tv_sec = 0, .tv_nsec = 1000000L};
+    unsigned int attempt;
+
+    for (attempt = 0; attempt < 5000U; attempt++) {
+        if (atomic_load_explicit(count, memory_order_acquire) >= target)
+            return 0;
+        while (nanosleep(&delay, &delay) != 0) {
+            if (errno != EINTR)
+                return -2;
+            delay.tv_sec = 0;
+            delay.tv_nsec = 1000000L;
+        }
+        delay.tv_sec = 0;
+        delay.tv_nsec = 1000000L;
+    }
+    return -4;
+}
+
+static void record_poll_revents(struct concurrent_worker_state *worker)
+{
+    uint16_t revents = (uint16_t)worker->poll_fd.revents;
+
+    worker->syscall_result.data_length = sizeof(revents);
+    worker->syscall_result.data[0] = (unsigned char)revents;
+    worker->syscall_result.data[1] = (unsigned char)(revents >> 8);
+}
+
+static void run_ppoll_worker(struct concurrent_worker_state *worker)
+{
+    struct timespec timeout;
+    struct timespec started;
+    struct timespec completed;
+    const struct timespec *timeout_pointer = NULL;
+    uint64_t empty_mask = 0;
+    uint64_t original_mask = 0;
+    uint64_t restored_mask = 0;
+    uint64_t temporary_mask = worker->block_sigusr1 ? SIGUSR1_MASK : 0;
+    long syscall_result;
+
+    if (syscall(SYS_rt_sigprocmask, SIG_SETMASK, &empty_mask, &original_mask,
+                KERNEL_SIGSET_SIZE) != 0)
+        worker->mask_failed = 1;
+    if (worker->timeout_ns >= 0) {
+        timeout.tv_sec = (time_t)((uint64_t)worker->timeout_ns / MAX_TIMEOUT_NS);
+        timeout.tv_nsec = (long)((uint64_t)worker->timeout_ns % MAX_TIMEOUT_NS);
+        timeout_pointer = &timeout;
+    }
+    controlled_worker_publish_entered(worker->controller);
+    if (clock_gettime(CLOCK_MONOTONIC, &started) != 0)
+        worker->clock_failed = 1;
+    errno = 0;
+    syscall_result = syscall(SYS_ppoll, &worker->poll_fd, 1U, timeout_pointer,
+                             &temporary_mask, KERNEL_SIGSET_SIZE);
+    finish_syscall_result(&worker->syscall_result, syscall_result);
+    if (clock_gettime(CLOCK_MONOTONIC, &completed) != 0) {
+        worker->clock_failed = 1;
+    } else if (!worker->clock_failed && syscall_result == 0 &&
+               worker->timeout_ns > 0 &&
+               timespec_nanoseconds(&completed) + UINT64_C(10000000) <
+                   timespec_nanoseconds(&started) +
+                       (uint64_t)worker->timeout_ns) {
+        worker->timeout_too_early = 1;
+    }
+    if (syscall(SYS_rt_sigprocmask, SIG_SETMASK, NULL, &restored_mask,
+                KERNEL_SIGSET_SIZE) != 0)
+        worker->mask_failed = 1;
+    worker->syscall_result.value =
+        (temporary_mask & SIGUSR1_MASK ? UINT64_C(1) : UINT64_C(0)) |
+        (restored_mask & SIGUSR1_MASK ? UINT64_C(2) : UINT64_C(0));
+    if (syscall(SYS_rt_sigprocmask, SIG_SETMASK, &original_mask, NULL,
+                KERNEL_SIGSET_SIZE) != 0)
+        worker->mask_failed = 1;
+    record_poll_revents(worker);
+}
+
 static void *run_worker(void *argument)
 {
     struct concurrent_worker_state *worker = argument;
     long syscall_result;
+
+    current_handler_count = worker->handler_count;
 
     if (worker->kind == WORKER_READ) {
         unsigned char buffer[CONCURRENT_RESULT_DATA_MAX];
@@ -323,20 +485,34 @@ static void *run_worker(void *argument)
         syscall_result = syscall(SYS_write, worker->fd, &worker->value,
                                  sizeof(worker->value));
         finish_syscall_result(&worker->syscall_result, syscall_result);
-    } else {
-        uint16_t revents;
+    } else if (worker->kind == WORKER_POLL) {
+        struct timespec started;
+        struct timespec completed;
 
         controlled_worker_publish_entered(worker->controller);
+        if (clock_gettime(CLOCK_MONOTONIC, &started) != 0)
+            worker->clock_failed = 1;
         errno = 0;
         syscall_result = syscall(SYS_poll, &worker->poll_fd, 1U,
                                  worker->timeout_ms);
         finish_syscall_result(&worker->syscall_result, syscall_result);
-        revents = (uint16_t)worker->poll_fd.revents;
-        worker->syscall_result.data_length = sizeof(revents);
-        worker->syscall_result.data[0] = (unsigned char)revents;
-        worker->syscall_result.data[1] = (unsigned char)(revents >> 8);
+        if (clock_gettime(CLOCK_MONOTONIC, &completed) != 0) {
+            worker->clock_failed = 1;
+        } else if (!worker->clock_failed && syscall_result == 0 &&
+                   worker->timeout_ms > 0 &&
+                   timespec_nanoseconds(&completed) + UINT64_C(10000000) <
+                       timespec_nanoseconds(&started) +
+                           (uint64_t)worker->timeout_ms * UINT64_C(1000000)) {
+            worker->timeout_too_early = 1;
+        }
+        record_poll_revents(worker);
+    } else {
+        run_ppoll_worker(worker);
     }
+    worker->syscall_result.handler_count =
+        atomic_load_explicit(worker->handler_count, memory_order_acquire);
     controlled_worker_publish_completed(worker->controller);
+    current_handler_count = NULL;
     return NULL;
 }
 
@@ -570,11 +746,18 @@ static int execute_start_worker(struct concurrent_context *context, char *save,
     char *actor_text = strtok_r(NULL, " \t", &save);
     char *slot_text = strtok_r(NULL, " \t", &save);
     char *argument_text = strtok_r(NULL, " \t", &save);
-    char *timeout_text = kind == WORKER_POLL ? strtok_r(NULL, " \t", &save) : NULL;
+    char *timeout_text =
+        kind == WORKER_POLL || kind == WORKER_PPOLL ?
+            strtok_r(NULL, " \t", &save) :
+            NULL;
+    char *sigmask_text =
+        kind == WORKER_PPOLL ? strtok_r(NULL, " \t", &save) : NULL;
     struct concurrent_worker_state *worker;
     struct event_object *object;
     uint64_t argument;
     long timeout = -1;
+    int64_t timeout_ns = -1;
+    int block_sigusr1 = 0;
     int actor;
     int slot;
 
@@ -582,8 +765,15 @@ static int execute_start_worker(struct concurrent_context *context, char *save,
         parse_u64_value(argument_text, &argument) != 0 ||
         (kind == WORKER_POLL &&
          parse_long_value(timeout_text, -1, 1000, &timeout) != 0) ||
+        (kind == WORKER_PPOLL && parse_timeout_ns(timeout_text, &timeout_ns) != 0) ||
+        (kind == WORKER_PPOLL &&
+         (sigmask_text == NULL ||
+          (strcmp(sigmask_text, "empty") != 0 &&
+           strcmp(sigmask_text, "usr1") != 0))) ||
         strtok_r(NULL, " \t", &save) != NULL || context->slots[slot] < 0)
         return -1;
+    if (kind == WORKER_PPOLL)
+        block_sigusr1 = strcmp(sigmask_text, "usr1") == 0;
     worker = &context->workers[actor - 1];
     object = object_for_slot(context, slot);
     if (worker->active || object == NULL)
@@ -595,11 +785,22 @@ static int execute_start_worker(struct concurrent_context *context, char *save,
         (object->nonblocking || argument == UINT64_MAX ||
          argument <= MAX_EVENTFD_COUNTER - object->count))
         return -1;
-    if (kind == WORKER_POLL &&
-        ((argument != POLLIN && argument != POLLOUT) || timeout != -1 ||
+    if ((kind == WORKER_POLL || kind == WORKER_PPOLL) &&
+        ((argument != POLLIN && argument != POLLOUT) ||
+         (kind == WORKER_POLL && timeout >= 0 && timeout < 100) ||
+         (kind == WORKER_PPOLL && timeout_ns >= 0 &&
+          timeout_ns < INT64_C(100000000)) ||
          (argument == POLLIN && object->count != 0) ||
          (argument == POLLOUT && object->count != MAX_EVENTFD_COUNTER)))
         return -1;
+    {
+        struct controlled_worker *controller = worker->controller;
+
+        memset(worker, 0, sizeof(*worker));
+        worker->controller = controller;
+        worker->handler_count = &context->signal_counts[actor - 1];
+    }
+    context->accounted_actor_mask &= ~(1U << (actor - 1));
     worker->kind = kind;
     worker->active = 1;
     worker->slot = slot;
@@ -609,6 +810,8 @@ static int execute_start_worker(struct concurrent_context *context, char *save,
     worker->length = kind == WORKER_READ ? (size_t)argument : 8U;
     worker->value = argument;
     worker->timeout_ms = (int)timeout;
+    worker->timeout_ns = timeout_ns;
+    worker->block_sigusr1 = block_sigusr1;
     worker->poll_fd.fd = worker->fd;
     worker->poll_fd.events = (short)argument;
     worker->poll_fd.revents = POLL_REVENTS_SENTINEL;
@@ -618,7 +821,8 @@ static int execute_start_worker(struct concurrent_context *context, char *save,
         return -2;
     }
     result->kind = kind == WORKER_READ ? OP_START_READ :
-                   kind == WORKER_WRITE ? OP_START_WRITE : OP_START_POLL;
+                   kind == WORKER_WRITE ? OP_START_WRITE :
+                   kind == WORKER_POLL ? OP_START_POLL : OP_START_PPOLL;
     result->actor = (uint32_t)actor;
     result->value = argument;
     return 0;
@@ -645,7 +849,7 @@ static int execute_assert_pending(struct concurrent_context *context, char *save
         struct concurrent_worker_state *worker = &context->workers[actor - 1];
         enum controlled_worker_status status;
 
-        if (!worker->active || worker->pending_confirmed)
+        if (!worker->active)
             return -1;
         status = controlled_worker_observe_pending(worker->controller);
         if (status == CONTROLLED_WORKER_COMPLETION_TIMEOUT)
@@ -674,6 +878,10 @@ static int copy_completed_worker(struct concurrent_context *context, int actor)
         return -4;
     if (status != CONTROLLED_WORKER_OK)
         return -2;
+    if (worker->clock_failed || worker->mask_failed)
+        return -2;
+    if (worker->timeout_too_early)
+        return -5;
     account_worker(context, actor);
     start = &context->results[worker->start_result_index];
     start->result = worker->syscall_result.result;
@@ -684,6 +892,29 @@ static int copy_completed_worker(struct concurrent_context *context, int actor)
     start->completion_ordinal =
         controlled_worker_completion_ordinal(worker->controller);
     memcpy(start->data, worker->syscall_result.data, sizeof(start->data));
+    return 0;
+}
+
+static int execute_join(struct concurrent_context *context, char *save,
+                        struct concurrent_operation_result *result)
+{
+    char *actor_text = strtok_r(NULL, " \t", &save);
+    struct concurrent_worker_state *worker;
+    int actor;
+    int status;
+
+    if (parse_actor(actor_text, &actor) != 0 ||
+        strtok_r(NULL, " \t", &save) != NULL)
+        return -1;
+    status = copy_completed_worker(context, actor);
+    if (status != 0)
+        return status;
+    worker = &context->workers[actor - 1];
+    if (controlled_worker_join(worker->controller) != CONTROLLED_WORKER_OK)
+        return -2;
+    worker->active = 0;
+    result->kind = OP_JOIN;
+    result->actor = (uint32_t)actor;
     return 0;
 }
 
@@ -715,6 +946,103 @@ static int execute_join_set(struct concurrent_context *context, char *save,
     return 0;
 }
 
+static int execute_signal_config(struct concurrent_context *context, char *save,
+                                 struct concurrent_operation_result *result)
+{
+    char *signo_text = strtok_r(NULL, " \t", &save);
+    char *flags_text = strtok_r(NULL, " \t", &save);
+    long signo;
+    long flags;
+
+    if (parse_long_value(signo_text, SIGUSR1_NUMBER, SIGUSR1_NUMBER, &signo) != 0 ||
+        parse_long_value(flags_text, 0, SA_RESTART_FLAG, &flags) != 0 ||
+        (flags != 0 && flags != SA_RESTART_FLAG) ||
+        strtok_r(NULL, " \t", &save) != NULL ||
+        context->workers[0].active || context->workers[1].active)
+        return -1;
+    if (configure_count_signal_handler((int)signo, flags, NULL) != 0)
+        return -2;
+    context->signal_flags = flags;
+    context->signal_configured = 1;
+    result->kind = OP_SIGNAL_CONFIG;
+    result->value = (uint64_t)flags;
+    return 0;
+}
+
+static int execute_send_signal(struct concurrent_context *context, char *save,
+                               struct concurrent_operation_result *result)
+{
+    char *actor_text = strtok_r(NULL, " \t", &save);
+    char *signo_text = strtok_r(NULL, " \t", &save);
+    struct concurrent_worker_state *worker;
+    enum controlled_worker_status worker_status;
+    unsigned int target_count;
+    long signo;
+    int actor;
+    int status;
+
+    if (parse_actor(actor_text, &actor) != 0 ||
+        parse_long_value(signo_text, SIGUSR1_NUMBER, SIGUSR1_NUMBER, &signo) != 0 ||
+        strtok_r(NULL, " \t", &save) != NULL || !context->signal_configured)
+        return -1;
+    worker = &context->workers[actor - 1];
+    if (!worker->active || !worker->pending_confirmed || worker->accounted)
+        return -1;
+    target_count =
+        atomic_load_explicit(worker->handler_count, memory_order_acquire) + 1U;
+    if (controlled_worker_send_signal(worker->controller, (int)signo) !=
+        CONTROLLED_WORKER_OK)
+        return -2;
+    if (worker->kind == WORKER_PPOLL && worker->block_sigusr1) {
+        status = 0;
+    } else {
+        status = wait_for_handler_count(worker->handler_count, target_count);
+        if (status != 0)
+            return status;
+    }
+    if ((worker->kind == WORKER_POLL || worker->kind == WORKER_PPOLL ||
+         context->signal_flags == 0) &&
+        !(worker->kind == WORKER_PPOLL && worker->block_sigusr1)) {
+        worker_status =
+            controlled_worker_wait_for_completion(worker->controller);
+        if (worker_status == CONTROLLED_WORKER_COMPLETION_TIMEOUT)
+            return -4;
+        if (worker_status != CONTROLLED_WORKER_OK)
+            return -2;
+        account_worker(context, actor);
+    }
+    result->kind = OP_SEND_SIGNAL;
+    result->actor = (uint32_t)actor;
+    result->value = (uint64_t)signo;
+    result->handler_count = atomic_load_explicit(worker->handler_count,
+                                                  memory_order_acquire);
+    return 0;
+}
+
+static int execute_assert_signal_handled(
+    struct concurrent_context *context, char *save,
+    struct concurrent_operation_result *result)
+{
+    char *actor_text = strtok_r(NULL, " \t", &save);
+    char *count_text = strtok_r(NULL, " \t", &save);
+    unsigned int actual;
+    long count;
+    int actor;
+
+    if (parse_actor(actor_text, &actor) != 0 ||
+        parse_long_value(count_text, 0, CONCURRENT_MAX_OPERATIONS, &count) != 0 ||
+        strtok_r(NULL, " \t", &save) != NULL)
+        return -1;
+    actual = atomic_load_explicit(&context->signal_counts[actor - 1],
+                                  memory_order_acquire);
+    if (actual != (unsigned int)count)
+        return -1;
+    result->kind = OP_ASSERT_SIGNAL_HANDLED;
+    result->actor = (uint32_t)actor;
+    result->handler_count = actual;
+    return 0;
+}
+
 static int execute_operation(struct concurrent_context *context, char *line,
                              struct concurrent_operation_result *result)
 {
@@ -743,12 +1071,22 @@ static int execute_operation(struct concurrent_context *context, char *line,
         return execute_start_worker(context, save, result, WORKER_WRITE);
     if (strcmp(operation, "start-poll") == 0)
         return execute_start_worker(context, save, result, WORKER_POLL);
+    if (strcmp(operation, "start-ppoll") == 0)
+        return execute_start_worker(context, save, result, WORKER_PPOLL);
     if (strcmp(operation, "assert-pending") == 0)
         return execute_assert_pending(context, save, result, 0);
     if (strcmp(operation, "assert-all-pending") == 0)
         return execute_assert_pending(context, save, result, 1);
+    if (strcmp(operation, "join") == 0)
+        return execute_join(context, save, result);
     if (strcmp(operation, "join-set") == 0)
         return execute_join_set(context, save, result);
+    if (strcmp(operation, "signal-config") == 0)
+        return execute_signal_config(context, save, result);
+    if (strcmp(operation, "send-signal") == 0)
+        return execute_send_signal(context, save, result);
+    if (strcmp(operation, "assert-signal-handled") == 0)
+        return execute_assert_signal_handled(context, save, result);
     return -1;
 }
 
@@ -775,6 +1113,8 @@ static int process_operation(struct concurrent_context *context,
                          "worker completed before pending guard");
     if (status == -4)
         return fail_schedule_timeout(line_number, display_line);
+    if (status == -5)
+        return fail_syscall_timeout(line_number, display_line);
     if (status != 0)
         return fail_line(line_number, display_line, "invalid operation");
     context->operation_index++;
@@ -945,7 +1285,6 @@ int eventfd_concurrent_run(int record_mode, const char *corpus_path,
                            const char *trace_path, uint64_t corpus_digest)
 {
     struct concurrent_context context;
-    struct sigaction action;
     struct sigaction previous_action;
     int status;
 
@@ -953,10 +1292,10 @@ int eventfd_concurrent_run(int record_mode, const char *corpus_path,
     context.record_mode = record_mode;
     context.corpus_digest = corpus_digest;
     initialize_scenario(&context);
-    memset(&action, 0, sizeof(action));
-    action.sa_handler = no_op_signal_handler;
-    sigemptyset(&action.sa_mask);
-    if (sigaction(SIGUSR1, &action, &previous_action) != 0)
+    if (!atomic_is_lock_free(&context.signal_counts[0]) ||
+        !atomic_is_lock_free(&context.signal_counts[1]))
+        return fail("signal handler counter is not lock-free");
+    if (configure_count_signal_handler(SIGUSR1, 0, &previous_action) != 0)
         return fail("cannot install concurrent cleanup signal handler");
     if (record_mode) {
         if (concurrent_raw_open(&context.raw_writer, trace_path, raw_magic,

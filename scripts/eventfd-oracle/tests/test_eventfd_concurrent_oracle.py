@@ -2,6 +2,7 @@ import hashlib
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -14,6 +15,9 @@ CORPUS_PATH = CASE_DIR / "c/corpus/eventfd-concurrent.ops"
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import concurrent_adapter  # noqa: E402
+import concurrent_coverage  # noqa: E402
+import concurrent_generator  # noqa: E402
+import concurrent_mutation  # noqa: E402
 import concurrent_scenario  # noqa: E402
 import fuzz  # noqa: E402
 import guest_result  # noqa: E402
@@ -22,6 +26,82 @@ from linux_oracle.outcomes import AllowedTrace, decode_raw_run_trace, fnv1a64  #
 
 
 class EventFdConcurrentCodecTests(unittest.TestCase):
+    def test_signal_restart_and_finite_timeout_story_round_trips(self):
+        encoded = (
+            "version 4\n"
+            "scenario signal-timeout\n"
+            "signal-config 10 268435456\n"
+            "eventfd 0 0\n"
+            "start-read 1 0 8\n"
+            "assert-pending 1\n"
+            "send-signal 1 10\n"
+            "assert-signal-handled 1 1\n"
+            "assert-pending 1\n"
+            "write 0 8 0 1\n"
+            "join 1\n"
+            "eventfd 1 0\n"
+            "start-poll 2 1 1 200\n"
+            "assert-pending 2\n"
+            "join 2\n"
+        )
+
+        document = concurrent_scenario.parse_document(encoded)
+        canonical = concurrent_scenario.serialize_document(document)
+
+        self.assertEqual(concurrent_scenario.parse_document(canonical), document)
+        self.assertIn("send-signal 1 10", canonical)
+        self.assertIn("start-poll 2 1 1 200", canonical)
+
+    def test_signal_rejects_wrong_signo_flags_and_count(self):
+        prefix = "version 4\nscenario x\n"
+        for operation in (
+            "signal-config 12 0",
+            "signal-config 10 1",
+            "assert-signal-handled 1 -1",
+        ):
+            with self.subTest(operation=operation), self.assertRaises(
+                concurrent_scenario.ScenarioCodecError
+            ):
+                concurrent_scenario.parse_document(prefix + operation + "\n")
+
+    def test_ppoll_timeout_and_atomic_mask_round_trip(self):
+        encoded = (
+            "version 4\n"
+            "scenario ppoll-mask\n"
+            "signal-config 10 268435456\n"
+            "eventfd 0 0\n"
+            "start-ppoll 1 0 1 null usr1\n"
+            "assert-pending 1\n"
+            "send-signal 1 10\n"
+            "assert-signal-handled 1 0\n"
+            "assert-pending 1\n"
+            "write 0 8 0 1\n"
+            "join 1\n"
+            "assert-signal-handled 1 1\n"
+            "eventfd 1 0\n"
+            "start-ppoll 2 1 1 200000000 empty\n"
+            "assert-pending 2\n"
+            "join 2\n"
+        )
+
+        document = concurrent_scenario.parse_document(encoded)
+        canonical = concurrent_scenario.serialize_document(document)
+
+        self.assertEqual(concurrent_scenario.parse_document(canonical), document)
+        self.assertIn("start-ppoll 1 0 1 null usr1", canonical)
+
+    def test_ppoll_rejects_invalid_timeout_and_mask(self):
+        prefix = "version 4\nscenario x\neventfd 0 0\n"
+        for operation in (
+            "start-ppoll 1 0 1 -1 empty",
+            "start-ppoll 1 0 1 1000000001 empty",
+            "start-ppoll 1 0 1 null all",
+        ):
+            with self.subTest(operation=operation), self.assertRaises(
+                concurrent_scenario.ScenarioCodecError
+            ):
+                concurrent_scenario.parse_document(prefix + operation + "\n")
+
     def test_v4_round_trip_preserves_two_worker_lifecycle(self):
         encoded = (
             "version 4\n"
@@ -86,10 +166,59 @@ class EventFdConcurrentRoutingTests(unittest.TestCase):
             concurrent_adapter.SPEC.coverage.target_set_id,
             "eventfd-concurrent-v1",
         )
+        self.assertIn(
+            "os/StarryOS/kernel/src/task/signal.rs",
+            concurrent_coverage.TARGET_SOURCE_PATHS,
+        )
         self.assertEqual(models.spec_for_model("simple-single").adapter_id, "eventfd-v1")
         self.assertEqual(
             models.spec_for_model("blocking").adapter_id, "eventfd-blocking-v2"
         )
+
+    def test_generator_and_mutation_cover_signal_and_timeout_stories(self):
+        generated = []
+        for story in range(9):
+            scenario = concurrent_generator.generate_scenario(
+                concurrent_generator.CampaignRng(42 + story), story=story
+            )
+            concurrent_scenario.analyze_scenario(scenario)
+            generated.append(scenario)
+
+        self.assertTrue(
+            any(
+                isinstance(operation, concurrent_scenario.SignalConfig)
+                for operation in generated[6].operations
+            )
+        )
+        self.assertTrue(
+            any(
+                isinstance(operation, concurrent_scenario.StartPoll)
+                and operation.timeout_ms >= 100
+                for operation in generated[7].operations
+            )
+        )
+        self.assertTrue(
+            any(
+                isinstance(operation, concurrent_scenario.StartPpoll)
+                for operation in generated[8].operations
+            )
+        )
+
+        parent = concurrent_scenario.ScenarioDocument((generated[0],), version=4)
+        donor = concurrent_scenario.ScenarioDocument((generated[6],), version=4)
+        for index, kind in enumerate(concurrent_mutation.MUTATION_KINDS):
+            with self.subTest(kind=kind):
+                candidate = concurrent_mutation.mutate_document(
+                    concurrent_generator.CampaignRng(100 + index),
+                    parent,
+                    donor,
+                    requested_kind=kind,
+                )
+                self.assertIs(
+                    candidate.classification,
+                    concurrent_mutation.CandidateClassification.EXECUTABLE,
+                )
+                concurrent_scenario.validate_entry_limits(candidate.document)
 
     def test_cli_routes_concurrent_without_changing_default(self):
         with mock.patch.object(fuzz, "_run_common_campaign", return_value=0) as run:
@@ -124,6 +253,23 @@ class EventFdConcurrentRoutingTests(unittest.TestCase):
         self.assertEqual(result.difference.scenario_index, 2)
         self.assertEqual(result.difference.byte_offset, 16)
         self.assertEqual(result.difference.actual_vector, vector)
+
+    def test_syscall_schedule_and_qemu_timeouts_are_distinct(self):
+        syscall_timeout = guest_result.classify_guest_execution(
+            "STARRY_EVENTFD_LINUX_ORACLE_SYSCALL_TIMEOUT: line=1", 1
+        )
+        schedule_timeout = guest_result.classify_guest_execution(
+            "STARRY_EVENTFD_LINUX_ORACLE_SCHEDULE_TIMEOUT: line=1", 1
+        )
+        qemu_timeout = guest_result.classify_guest_execution("", None, timed_out=True)
+
+        self.assertIs(
+            syscall_timeout.category, guest_result.GuestResultCategory.SYSCALL_TIMEOUT
+        )
+        self.assertIs(
+            schedule_timeout.category, guest_result.GuestResultCategory.SCHEDULE_TIMEOUT
+        )
+        self.assertIs(qemu_timeout.category, guest_result.GuestResultCategory.TIMEOUT)
 
 
 class EventFdConcurrentHarnessTests(unittest.TestCase):
@@ -166,8 +312,8 @@ class EventFdConcurrentHarnessTests(unittest.TestCase):
                 expected_version=4,
                 expected_corpus_digest=corpus_digest,
             )
-            self.assertEqual(len(scenarios), 6)
-            self.assertEqual(sum(item.operation_count for item in scenarios), 46)
+            self.assertEqual(len(scenarios), 8)
+            self.assertEqual(sum(item.operation_count for item in scenarios), 121)
 
             aggregate = root / "linux.trace"
             result = concurrent_adapter.record_host_converged(
@@ -180,7 +326,9 @@ class EventFdConcurrentHarnessTests(unittest.TestCase):
                 expected_version=4,
                 expected_corpus_digest=corpus_digest,
             )
-            self.assertEqual(len(allowed.scenarios), 6)
+            self.assertEqual(len(allowed.scenarios), 8)
+            self.assertEqual(len(allowed.scenarios[6].alternatives), 1)
+            self.assertEqual(len(allowed.scenarios[7].alternatives), 1)
             compared = subprocess.run(
                 [str(self.oracle), "--compare", str(CORPUS_PATH), str(aggregate)],
                 capture_output=True,
@@ -188,6 +336,32 @@ class EventFdConcurrentHarnessTests(unittest.TestCase):
             )
         self.assertEqual(compared.returncode, 0, compared.stderr)
         self.assertIn("STARRY_EVENTFD_LINUX_ORACLE_PASSED", compared.stdout)
+
+    def test_cleanup_joins_restarted_and_masked_workers(self):
+        corpora = (
+            "version 4\nscenario cleanup\nsignal-config 10 268435456\n"
+            "eventfd 0 0\nstart-read 1 0 8\nassert-pending 1\n"
+            "send-signal 1 10\nassert-signal-handled 1 1\ninvalid\n",
+            "version 4\nscenario cleanup\nsignal-config 10 268435456\n"
+            "eventfd 0 0\nstart-ppoll 1 0 1 null usr1\nassert-pending 1\n"
+            "send-signal 1 10\nassert-signal-handled 1 0\ninvalid\n",
+        )
+        for index, encoded in enumerate(corpora):
+            with self.subTest(index=index), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                corpus = root / "cleanup.ops"
+                trace = root / "cleanup.trace"
+                corpus.write_text(encoded)
+                started = time.monotonic()
+                result = subprocess.run(
+                    [str(self.oracle), "--record", str(corpus), str(trace)],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                )
+                self.assertLess(time.monotonic() - started, 3)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('operation="invalid" invalid operation', result.stderr)
 
 
 if __name__ == "__main__":

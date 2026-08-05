@@ -2,6 +2,7 @@ import hashlib
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -14,6 +15,9 @@ CORPUS_PATH = CASE_DIR / "c/corpus/pipe-concurrent.ops"
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import concurrent_adapter  # noqa: E402
+import concurrent_coverage  # noqa: E402
+import concurrent_generator  # noqa: E402
+import concurrent_mutation  # noqa: E402
 import concurrent_scenario  # noqa: E402
 import fuzz  # noqa: E402
 import guest_result  # noqa: E402
@@ -22,6 +26,54 @@ from linux_oracle.outcomes import AllowedTrace, decode_raw_run_trace, fnv1a64  #
 
 
 class PipeConcurrentCodecTests(unittest.TestCase):
+    def test_signal_timeout_and_ppoll_atomic_mask_round_trip(self):
+        encoded = (
+            "version 7\nscenario signal-timeout\n"
+            "signal-config 10 268435456\n"
+            "pipe2 0 1 0\n"
+            "start-read 1 0 1\n"
+            "assert-pending 1\n"
+            "send-signal 1 10\n"
+            "assert-signal-handled 1 1\n"
+            "assert-pending 1\n"
+            "write 1 1 65\n"
+            "join 1\n"
+            "pipe2 2 3 0\n"
+            "start-ppoll 2 2 1 null usr1\n"
+            "assert-pending 2\n"
+            "send-signal 2 10\n"
+            "assert-signal-handled 2 0\n"
+            "assert-pending 2\n"
+            "write 3 1 66\n"
+            "join 2\n"
+            "assert-signal-handled 2 1\n"
+            "pipe2 4 5 0\n"
+            "start-poll 1 4 1 200\n"
+            "assert-pending 1\n"
+            "join 1\n"
+        )
+
+        document = concurrent_scenario.parse_document(encoded)
+        canonical = concurrent_scenario.serialize_document(document)
+
+        self.assertEqual(concurrent_scenario.parse_document(canonical), document)
+        self.assertIn("start-ppoll 2 2 1 null usr1", canonical)
+
+    def test_signal_and_ppoll_reject_invalid_arguments(self):
+        prefix = "version 7\nscenario x\npipe2 0 1 0\n"
+        for operation in (
+            "signal-config 12 0",
+            "signal-config 10 1",
+            "assert-signal-handled 1 -1",
+            "start-ppoll 1 0 1 -1 empty",
+            "start-ppoll 1 0 1 1000000001 empty",
+            "start-ppoll 1 0 1 null all",
+        ):
+            with self.subTest(operation=operation), self.assertRaises(
+                concurrent_scenario.ScenarioCodecError
+            ):
+                concurrent_scenario.parse_document(prefix + operation + "\n")
+
     def test_v7_round_trip_preserves_two_worker_lifecycle(self):
         encoded = (
             "version 7\nscenario readers\npipe2 0 1 0\n"
@@ -70,6 +122,9 @@ class PipeConcurrentRoutingTests(unittest.TestCase):
         self.assertEqual(
             concurrent_adapter.SPEC.coverage.target_set_id, "pipe-concurrent-v1"
         )
+        self.assertIn(
+            "kernel/src/task/signal.rs", concurrent_coverage.TARGET_SOURCE_PATHS
+        )
         self.assertEqual(models.spec_for_model("simple-single").adapter_id, "pipe-v4")
         self.assertEqual(models.spec_for_model("blocking").adapter_id, "pipe-blocking-v2")
 
@@ -97,6 +152,56 @@ class PipeConcurrentRoutingTests(unittest.TestCase):
         result = guest_result.classify_guest_execution(log, 1)
         self.assertIs(result.category, guest_result.GuestResultCategory.SEMANTIC_MISMATCH)
         self.assertEqual(result.difference.byte_offset, 24)
+
+    def test_generator_mutation_and_timeout_categories_cover_new_stories(self):
+        generated = []
+        for story in range(9):
+            scenario = concurrent_generator.generate_scenario(
+                concurrent_generator.CampaignRng(42 + story), story=story
+            )
+            concurrent_scenario.analyze_scenario(scenario)
+            generated.append(scenario)
+        self.assertTrue(
+            any(
+                isinstance(operation, concurrent_scenario.SignalConfig)
+                for operation in generated[6].operations
+            )
+        )
+        self.assertTrue(
+            any(
+                isinstance(operation, concurrent_scenario.StartPpoll)
+                for operation in generated[8].operations
+            )
+        )
+
+        parent = concurrent_scenario.ScenarioDocument((generated[0],), version=7)
+        donor = concurrent_scenario.ScenarioDocument((generated[8],), version=7)
+        for index, kind in enumerate(concurrent_mutation.MUTATION_KINDS):
+            candidate = concurrent_mutation.mutate_document(
+                concurrent_generator.CampaignRng(100 + index),
+                parent,
+                donor,
+                requested_kind=kind,
+            )
+            self.assertIs(
+                candidate.classification,
+                concurrent_mutation.CandidateClassification.EXECUTABLE,
+            )
+
+        syscall_timeout = guest_result.classify_guest_execution(
+            "STARRY_PIPE_LINUX_ORACLE_SYSCALL_TIMEOUT: line=1", 1
+        )
+        schedule_timeout = guest_result.classify_guest_execution(
+            "STARRY_PIPE_LINUX_ORACLE_SCHEDULE_TIMEOUT: line=1", 1
+        )
+        qemu_timeout = guest_result.classify_guest_execution("", None, timed_out=True)
+        self.assertIs(
+            syscall_timeout.category, guest_result.GuestResultCategory.SYSCALL_TIMEOUT
+        )
+        self.assertIs(
+            schedule_timeout.category, guest_result.GuestResultCategory.SCHEDULE_TIMEOUT
+        )
+        self.assertIs(qemu_timeout.category, guest_result.GuestResultCategory.TIMEOUT)
 
 
 class PipeConcurrentHarnessTests(unittest.TestCase):
@@ -153,12 +258,42 @@ class PipeConcurrentHarnessTests(unittest.TestCase):
                 expected_corpus_digest=corpus_digest,
             )
             self.assertEqual(len(allowed.scenarios), len(scenarios))
+            self.assertEqual(len(allowed.scenarios[6].alternatives), 1)
+            self.assertEqual(len(allowed.scenarios[7].alternatives), 1)
             compared = subprocess.run(
                 [str(self.oracle), "--compare", str(CORPUS_PATH), str(aggregate)],
                 capture_output=True,
                 text=True,
             )
         self.assertEqual(compared.returncode, 0, compared.stderr)
+
+    def test_cleanup_joins_restart_mask_and_large_write_workers(self):
+        corpora = (
+            "version 7\nscenario cleanup\nsignal-config 10 268435456\n"
+            "pipe2 0 1 0\nstart-read 1 0 1\nassert-pending 1\n"
+            "send-signal 1 10\nassert-signal-handled 1 1\ninvalid\n",
+            "version 7\nscenario cleanup\nsignal-config 10 268435456\n"
+            "pipe2 0 1 0\nstart-ppoll 1 0 1 null usr1\nassert-pending 1\n"
+            "send-signal 1 10\nassert-signal-handled 1 0\ninvalid\n",
+            "version 7\nscenario cleanup\npipe2 0 1 0\nset-size 1 4096\n"
+            "write 1 4096 17\nstart-write 1 1 8192\nassert-pending 1\ninvalid\n",
+        )
+        for index, encoded in enumerate(corpora):
+            with self.subTest(index=index), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                corpus = root / "cleanup.ops"
+                trace = root / "cleanup.trace"
+                corpus.write_text(encoded)
+                started = time.monotonic()
+                result = subprocess.run(
+                    [str(self.oracle), "--record", str(corpus), str(trace)],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                )
+                self.assertLess(time.monotonic() - started, 3)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('operation="invalid" invalid operation', result.stderr)
 
 
 if __name__ == "__main__":
