@@ -17,11 +17,10 @@ conversion, report schema v2, and deterministic admission selection on
 2026-08-01 without changing the oracle IR, trace, harness, coverage target, or
 Starry syscall ABI. Stage 4.3 added explicit, auditable vector-slice projection
 for mixed programs on 2026-08-02. Stage 5 added the shared multi-adapter
-framework and eventfd synchronous oracle. Stages 6.1, 6.2a, 6.2b, and 6.3a
-then added controlled eventfd and pipe blocking I/O, extracted their shared
-single-worker lifecycle and pthread harness, and covered eventfd blocking
-`poll(2)`. Stage 6.3b is the current independently designed extension for
-controlled pipe blocking `poll(2)`.
+framework and eventfd synchronous oracle. Stages 6.1, 6.2a, 6.2b, 6.3a, and
+6.3b then added controlled eventfd and pipe blocking I/O, extracted their
+shared single-worker lifecycle and pthread harness, and covered controlled
+eventfd and pipe blocking `poll(2)`. Stage 6.3b was accepted on 2026-08-05.
 
 ## Decision
 
@@ -1600,11 +1599,14 @@ independently.
 - Stage 6.3a is complete: the independently versioned eventfd blocking-poll
   adapter proves one sleeping `poll(2)` waiter is woken for `POLLIN` and
   `POLLOUT`; historical eventfd adapters remain replayable by exact ID.
-- Stage 6.3b is current: an independently versioned pipe blocking-poll adapter
-  will cover empty-read-end `POLLIN`, full-write-end `POLLOUT`, and
-  final-writer-close `POLLHUP` with one controlled worker. It does not expand
-  into `POLLERR`, `EPIPE`, close races, multiple fds/workers, timeouts,
-  signals, `ppoll`, or `epoll`.
+- Stage 6.3b is complete: the independently versioned pipe blocking-poll
+  adapter covers empty-read-end `POLLIN`, full-write-end `POLLOUT`, and
+  final-writer-close `POLLHUP` with one controlled worker. Historical v4/v5
+  inputs and traces remain byte-compatible, and bounded recovery completed
+  every v2 attribution and minimization task without changing production pipe,
+  wait-queue, synchronization, or syscall code. See
+  `book/design/starry-pipe-blocking-poll-oracle.md` for the design and
+  acceptance evidence.
 - Later Stage 6 work may add multiple waiters and fairness, allowed-result
   sets, signal/`EINTR`, timeout/epoll behavior, and close/lifetime races.
 - Stage 7 returns to evidence- and priority-driven continuous extension after

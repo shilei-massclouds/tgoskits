@@ -9,6 +9,9 @@ pipe readiness transition. The implementation is test infrastructure only: it
 does not change StarryOS production pipe, wait-queue, synchronization, or
 syscall code.
 
+Stage 6.3b was accepted on 2026-08-05. The acceptance evidence is recorded at
+the end of this document.
+
 The stage adds a new `pipe-blocking-v2` adapter selected by
 `fuzz.py --model blocking`. The default `simple-single` model remains
 `pipe-v4`. Historical `pipe-blocking-v1` artifacts remain replayable by their
@@ -327,7 +330,7 @@ Serial acceptance is:
 5. fixed v6 checked corpus and generator seed bytes/digests, three stable host
    traces, and host self-compare;
 6. `cargo fmt` and `cargo xtask clippy --package starry-kernel`;
-7. raw `qemu/system/syscall-test-pipe`;
+7. raw `qemu/system/syscall-test-pipe-syscalls`;
 8. pipe simple QEMU compare, v1 blocking artifact replay, and v6 artifact
    injection through the existing pipe case;
 9. bounded `pipe-blocking-v2` campaign and recovery-only run; and
@@ -368,3 +371,103 @@ and `EINTR`, `ppoll`, `epoll`, cross-architecture behavior, and default CI. It
 does not claim performance or scheduling fairness. Those concerns remain
 independent later Stage 6 work; Stage 7 continues evidence- and priority-driven
 oracle expansion after the bounded concurrency slices.
+
+## Acceptance evidence
+
+Stage 6.3b was accepted on 2026-08-05. No Linux/Starry semantic difference was
+observed, so no production kernel, pipe, wait-queue, synchronization, syscall,
+QEMU discovery, or QEMU configuration file changed. The fail-first Python
+test initially stopped at `ModuleNotFoundError: No module named
+'poll_adapter'`; the same test and the complete suite passed after the v6
+adapter was implemented.
+
+The pre-implementation compatibility snapshot and post-implementation replay
+produced these byte-identical values on Linux 5.15.0-186-generic x86_64:
+
+| Corpus | Operations | Canonical SHA-256 | Host trace SHA-256 | Stability |
+|---|---:|---|---|---|
+| v4 simple | 162 | `82a44681f889b990cf85b587fd41802a16c4283c9bd90d2100d7441965fc50cc` | `76b332079e375fccd16d5f2ff7d2a9b202fd087ed02fe6699ca58fadeb34a497` | The checked corpus and three post-change traces each matched the frozen pre-change bytes. |
+| v5 blocking read (`pipe-blocking-v1`) | 28 | `4d8fd3d216ac1c9989880bb192ee6a87a11ee26f8fe668a97a96e8560e2df366` | `b818e0d580eebbb018dc1a1a9430b4ce5ecb9ff2a81308d083ed1c6fa0fcc3db` | The checked corpus and three post-change traces each matched the frozen pre-change bytes. |
+| v5 blocking write (`pipe-blocking-v1`) | 16 | `3135128891b64e2f29ec7c4484c0d00cdee6f4bf3d7c284aa3b51706591210f5` | `eb7810191b936973b9dc6c66839d34917136b4e297db6dec72b7e4f628d3a77e` | The checked corpus and three post-change traces each matched the frozen pre-change bytes. |
+| v6 blocking poll (`pipe-blocking-v2`) | 49 | `0b8bbd92dc1dbfbdc7234d0d78f2d53e987b7b1bec6bd5393bfaa1187fd5e10c` | `354dcd9e9ce723b01e360950646338191c9cfba521185a9f8a3249526e99bcd9` | Three traces were byte-identical and host self-compare passed. |
+
+The frozen historical host executable had SHA-256
+`6c17e76fecb0095ed6dac4fc7a5c289a49a91f4ee1c7befee5dbcd417fe0f29f`.
+The compact historical failure fingerprint retained SHA-256
+`1084162c6a444b7af2c2c1b17c9a05e15c6edcdd9d5d65ce2381c23fd37fed5c`.
+Before and after the upgrade, all six historical v1 attribution/minimization
+jobs were `completed`; no historical campaign state was migrated or rewritten.
+
+The v6 trace retained `PIPEORC1` with exact trace version 6. Its seven `join`
+records each returned one ready descriptor with `errno` zero and the expected
+`revents` sequence `POLLIN, POLLIN, POLLIN, POLLHUP, POLLOUT, POLLOUT,
+POLLOUT`. `join` retained fingerprint ID 24 and `start-poll` appended ID 25.
+Strict codec, C parser, persistence, failure-artifact, replay, and adapter-ID
+tests rejected cross-loading among corpus/trace versions 1 through 6.
+
+Generator seeds zero through seven were frozen as follows:
+
+| Seed | Canonical bytes | SHA-256 |
+|---:|---:|---|
+| 0 | 154 | `b1452e956862c71872b6a85d3d7e54cc14297acc47d4ebe372ee5d273b19525e` |
+| 1 | 246 | `3185de66c8f6bd958ae39be7669213ba64713006e8aea577a89cacbe4ea5e4a9` |
+| 2 | 251 | `c82274e803f571f053736de93c8036db5579c14834ff9cc114b69d563144ffa8` |
+| 3 | 245 | `a18e255e25b1dc4f989e04f1fb8167cdb4d73102ec2974e7e2b869b4551a40b8` |
+| 4 | 154 | `b0b6c8331a10da5b9fdc4811bbc6b96fa65dd9d25eb9bd267df5970b48a17dd5` |
+| 5 | 164 | `5469459f04bc9aea1f1bd7852764fbcb52c3bf0e9f748557a36f80619ca6c4e2` |
+| 6 | 152 | `9ba1566d2428a9b68691623bb332ca4f9fb686946437862e363ecbd3f6ecaa9d` |
+| 7 | 230 | `c8f4c725843c220f3194a90bcfcb2cea4640baaeb92a0e7c64b1e4ea9361b4e2` |
+
+Static and host validation completed with these results:
+
+- common Python suite: 22 tests passed;
+- pipe Python suite: 221 tests passed with one expected skip, including all 19
+  dedicated v6 tests;
+- retained eventfd Python suite: 57 tests passed;
+- affected Python modules passed `py_compile`;
+- the common controlled-worker CMake/CTest suite passed, and the pipe host
+  harness built with `-Wall -Wextra -Werror`;
+- the checked v6 corpus exercised direct descriptors, aliases,
+  `O_NONBLOCK`, zero write, phased slot release, ordinary `POLLIN`/`POLLOUT`,
+  and final-writer `POLLHUP`;
+- `cargo fmt` completed without Rust changes;
+- `cargo xtask clippy --package starry-kernel` passed all 23 checks; and
+- `git diff --check` passed.
+
+All runtime tests were run serially. The raw pipe-syscall case passed 39 tests.
+The existing pipe Linux-oracle case passed the default 162-operation v4
+corpus, injected historical v5 read and write artifacts with 28 and 16
+operations, and the injected 49-operation v6 blocking-poll artifact. All
+injected artifacts used the existing `STARRY_PIPE_ORACLE_ARTIFACT_DIR` path.
+
+The bounded command
+
+```text
+python3 scripts/pipe-oracle/fuzz.py --model blocking --seed 42 \
+    --batches 3 --batch-size 16 --max-qemu 32
+```
+
+completed three batches and 48 candidates with 32 QEMU executions, seven
+loaded corpus entries, no semantic failure, and two deliberately deferred
+background tasks. The required recovery-only command
+
+```text
+python3 scripts/pipe-oracle/fuzz.py --model blocking --seed 42 \
+    --batches 0 --max-qemu 64
+```
+
+completed with 55 QEMU executions, nine loaded corpus entries, and
+`background_pending=0`. All three attribution tasks and all three minimization
+tasks were `completed`; each attribution admitted one representative proving
+776 target regions, and the campaign failure directory remained empty. The
+completed reductions were 798 to 592 bytes, 591 to 417 bytes, and 713 to 507
+bytes, each within eight attempts.
+
+`cargo xtask sync-lint` was not applicable because the accepted diff contains
+only the design record, pipe-oracle Python/C test infrastructure, and the
+checked v6 corpus. The work was kept in local commits and was not pushed.
+
+Stage 6 still leaves multiple waiters and fairness, allowed-result sets,
+signal/`EINTR`, timeout/epoll behavior, and close/lifetime races for separately
+designed extensions. Stage 7 remains the evidence- and priority-driven
+continuous-extension phase after those bounded concurrency slices.
