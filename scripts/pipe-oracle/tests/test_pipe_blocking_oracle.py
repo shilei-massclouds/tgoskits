@@ -245,7 +245,7 @@ class PipeBlockingCampaignTests(unittest.TestCase):
     def test_model_selection_preserves_simple_default_and_adapter_identity(self):
         self.assertIs(models.spec_for_model("simple-single"), models.DEFAULT_SPEC)
         self.assertEqual(models.DEFAULT_SPEC.adapter_id, "pipe-v4")
-        self.assertEqual(models.spec_for_model("blocking").adapter_id, "pipe-blocking-v1")
+        self.assertEqual(models.spec_for_model("blocking").adapter_id, "pipe-blocking-v2")
         self.assertIs(
             models.spec_for_adapter_id("pipe-blocking-v1"), blocking_adapter.SPEC
         )
@@ -284,7 +284,7 @@ class PipeBlockingCampaignTests(unittest.TestCase):
                 ),
                 0,
             )
-        self.assertEqual(run.call_args.args[0].adapter_id, "pipe-blocking-v1")
+        self.assertEqual(run.call_args.args[0].adapter_id, "pipe-blocking-v2")
 
     def test_blocking_adapter_has_isolated_campaign_and_wait_coverage(self):
         spec = blocking_adapter.SPEC

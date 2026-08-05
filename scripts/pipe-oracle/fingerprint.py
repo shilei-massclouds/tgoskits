@@ -32,6 +32,7 @@ _OPERATION_KINDS = {
     "start-write": 22,
     "assert-pending": 23,
     "join": 24,
+    "start-poll": 25,
 }
 _DIFFERENCE_FIELDS = ("result", "errno", "value", "data_len", "data")
 _RESULT_CLASSES = {"error", "zero", "positive"}
