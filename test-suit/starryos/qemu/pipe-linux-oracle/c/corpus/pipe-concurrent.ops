@@ -1,0 +1,54 @@
+version 7
+scenario generated-0001
+pipe2 0 1 0
+start-read 1 0 1
+start-read 2 0 1
+assert-all-pending
+write 1 1 65
+write 1 1 66
+join-set 1 2
+scenario generated-0002
+pipe2 0 1 2048
+dup 0 2
+set-status-flags 2 0
+start-read 1 0 1
+start-read 2 2 1
+assert-all-pending
+write 1 1 67
+write 1 1 68
+join-set 1 2
+scenario generated-0003
+pipe2 0 1 0
+set-size 1 4096
+write 1 4096 17
+start-write 1 1 4096
+start-write 2 1 4096
+assert-all-pending
+read 0 4096
+read 0 4096
+join-set 1 2
+scenario generated-0004
+pipe2 0 1 0
+start-poll 1 0 1 -1
+start-poll 2 0 1 -1
+assert-all-pending
+write 1 1 69
+join-set 1 2
+scenario generated-0005
+pipe2 0 1 0
+set-size 1 4096
+write 1 4096 85
+start-poll 1 1 4 -1
+start-poll 2 1 4 -1
+assert-all-pending
+read 0 1
+assert-all-pending
+read 0 4095
+join-set 1 2
+scenario generated-0006
+pipe2 0 1 0
+start-poll 1 0 1 -1
+start-poll 2 0 1 -1
+assert-all-pending
+close 1
+join-set 1 2

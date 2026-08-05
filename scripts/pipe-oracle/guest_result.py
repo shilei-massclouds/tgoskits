@@ -1,10 +1,11 @@
 """Typed classification and semantic-difference parsing for guest replays."""
 
+import hashlib
 import re
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterable, Optional, Tuple
+from typing import Any, Iterable, Optional, Tuple, Union
 
 
 class GuestResultCategory(str, Enum):
@@ -37,12 +38,26 @@ class OperationDifference:
 
 
 @dataclass(frozen=True)
+class ConcurrentScenarioDifference:
+    scenario_index: int
+    alternative_index: int
+    byte_offset: int
+    expected_length: int
+    actual_length: int
+    expected_byte: int
+    actual_byte: int
+    allowed_set_digest: str
+    actual_digest: str
+    actual_vector: str
+
+
+@dataclass(frozen=True)
 class GuestExecutionResult:
     category: GuestResultCategory
     log: str
     profraw_paths: Tuple[Path, ...]
     returncode: Optional[int]
-    difference: Optional[OperationDifference] = None
+    difference: Optional[Union[OperationDifference, ConcurrentScenarioDifference]] = None
 
     @property
     def passed(self) -> bool:
@@ -76,10 +91,22 @@ _DIFFERENCE_RE = re.compile(
     r"errno=(?P<actual_errno>-?[0-9]+),value=(?P<actual_value>-?[0-9]+),"
     r"data_len=(?P<actual_data_len>[0-9]+)\}",
 )
+_CONCURRENT_DIFFERENCE_RE = re.compile(
+    r"STARRY_PIPE_CONCURRENT_MISMATCH:\s+scenario=(?P<scenario>[0-9]+)\s+"
+    r"alternative=(?P<alternative>[0-9]+)\s+byte_offset=(?P<byte_offset>[0-9]+)\s+"
+    r"expected_length=(?P<expected_length>[0-9]+)\s+"
+    r"actual_length=(?P<actual_length>[0-9]+)\s+"
+    r"expected_byte=(?P<expected_byte>[0-9]+)\s+"
+    r"actual_byte=(?P<actual_byte>[0-9]+)\s+"
+    r"set_digest=(?P<set_digest>[0-9a-f]{64})\s+"
+    r"actual_digest=(?P<actual_digest>[0-9a-f]{64})\s+"
+    r"actual_vector=(?P<actual_vector>[0-9a-f]+)"
+)
 
 _PANIC_RE = re.compile(r"(?i)\bpanic(?:ked)?\b")
 _LOCKDEP_RE = re.compile(r"(?m)^lockdep fatal violation\s*$", re.IGNORECASE)
 _ORACLE_FAILURE_MARKER = "STARRY_PIPE_LINUX_ORACLE_FAILED:"
+_CONCURRENT_MISMATCH_MARKER = "STARRY_PIPE_CONCURRENT_MISMATCH:"
 _SCHEDULE_TIMEOUT_MARKER = "STARRY_PIPE_LINUX_ORACLE_SCHEDULE_TIMEOUT:"
 _HARNESS_ERROR_MARKER = "STARRY_PIPE_LINUX_ORACLE_HARNESS_ERROR:"
 
@@ -124,6 +151,23 @@ def classify_guest_execution(
     if _HARNESS_ERROR_MARKER in log:
         return GuestExecutionResult(
             GuestResultCategory.HARNESS_ERROR,
+            log,
+            paths,
+            returncode,
+        )
+
+    concurrent_difference = parse_concurrent_difference(log)
+    if concurrent_difference is not None:
+        return GuestExecutionResult(
+            GuestResultCategory.SEMANTIC_MISMATCH,
+            log,
+            paths,
+            returncode,
+            concurrent_difference,
+        )
+    if _CONCURRENT_MISMATCH_MARKER in log:
+        return GuestExecutionResult(
+            GuestResultCategory.ORACLE_FAILURE,
             log,
             paths,
             returncode,
@@ -237,11 +281,53 @@ def parse_operation_difference(log: str) -> Optional[OperationDifference]:
     )
 
 
+def parse_concurrent_difference(
+    log: str,
+) -> Optional[ConcurrentScenarioDifference]:
+    matches = tuple(_CONCURRENT_DIFFERENCE_RE.finditer(log))
+    if len(matches) != 1:
+        return None
+    fields = matches[0].groupdict()
+    expected_length = int(fields["expected_length"])
+    actual_length = int(fields["actual_length"])
+    byte_offset = int(fields["byte_offset"])
+    expected_byte = int(fields["expected_byte"])
+    actual_byte = int(fields["actual_byte"])
+    actual_vector = fields["actual_vector"]
+    if (
+        expected_length <= 0
+        or actual_length <= 0
+        or expected_length % 112 != 0
+        or actual_length % 112 != 0
+        or len(actual_vector) != actual_length * 2
+        or byte_offset > min(expected_length, actual_length)
+        or expected_byte > 255
+        or actual_byte > 255
+        or hashlib.sha256(bytes.fromhex(actual_vector)).hexdigest()
+        != fields["actual_digest"]
+    ):
+        return None
+    return ConcurrentScenarioDifference(
+        int(fields["scenario"]),
+        int(fields["alternative"]),
+        byte_offset,
+        expected_length,
+        actual_length,
+        expected_byte,
+        actual_byte,
+        fields["set_digest"],
+        fields["actual_digest"],
+        actual_vector,
+    )
+
+
 __all__ = [
+    "ConcurrentScenarioDifference",
     "GuestExecutionResult",
     "GuestResultCategory",
     "OperationDifference",
     "classify_guest_execution",
     "normalize_guest_execution",
+    "parse_concurrent_difference",
     "parse_operation_difference",
 ]

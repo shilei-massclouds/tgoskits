@@ -1,0 +1,165 @@
+import hashlib
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+
+WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
+SCRIPT_DIR = WORKSPACE_ROOT / "scripts/pipe-oracle"
+CASE_DIR = WORKSPACE_ROOT / "test-suit/starryos/qemu/pipe-linux-oracle"
+CORPUS_PATH = CASE_DIR / "c/corpus/pipe-concurrent.ops"
+sys.path.insert(0, str(SCRIPT_DIR))
+
+import concurrent_adapter  # noqa: E402
+import concurrent_scenario  # noqa: E402
+import fuzz  # noqa: E402
+import guest_result  # noqa: E402
+import models  # noqa: E402
+from linux_oracle.outcomes import AllowedTrace, decode_raw_run_trace, fnv1a64  # noqa: E402
+
+
+class PipeConcurrentCodecTests(unittest.TestCase):
+    def test_v7_round_trip_preserves_two_worker_lifecycle(self):
+        encoded = (
+            "version 7\nscenario readers\npipe2 0 1 0\n"
+            "start-read 1 0 1\nstart-read 2 0 1\n"
+            "assert-all-pending\nwrite 1 1 65\nwrite 1 1 66\njoin-set 1 2\n"
+        )
+        document = concurrent_scenario.parse_document(encoded)
+        canonical = concurrent_scenario.serialize_document(document)
+
+        self.assertEqual(concurrent_scenario.parse_document(canonical), document)
+        self.assertIn("start-read 2 0 1", canonical)
+        self.assertIn("join-set 1 2", canonical)
+
+    def test_v7_rejects_invalid_actor_and_cross_version(self):
+        with self.assertRaises(concurrent_scenario.ScenarioCodecError):
+            concurrent_scenario.parse_document(
+                "version 7\nscenario x\npipe2 0 1 0\nstart-read 3 0 1\n"
+            )
+        with self.assertRaises(concurrent_scenario.ScenarioCodecError):
+            concurrent_scenario.parse_document(
+                "version 6\nscenario x\npipe2 0 1 0\n"
+            )
+
+    def test_checked_corpus_is_canonical_and_bounded(self):
+        encoded = CORPUS_PATH.read_bytes()
+        document = concurrent_scenario.parse_document(encoded)
+
+        concurrent_scenario.validate_entry_limits(document)
+        self.assertEqual(concurrent_scenario.serialize_document(document).encode(), encoded)
+        self.assertLessEqual(len(document.scenarios), 8)
+        self.assertEqual(
+            concurrent_scenario.canonical_digest(document),
+            hashlib.sha256(encoded).hexdigest(),
+        )
+
+
+class PipeConcurrentRoutingTests(unittest.TestCase):
+    def test_concurrent_model_and_campaign_identity_are_exact(self):
+        self.assertIs(models.spec_for_model("concurrent"), concurrent_adapter.SPEC)
+        self.assertEqual(concurrent_adapter.SPEC.adapter_id, "pipe-concurrent-v1")
+        self.assertEqual(concurrent_adapter.SPEC.corpus_version, 7)
+        self.assertEqual(
+            concurrent_adapter.SPEC.campaign.root,
+            Path("coverage/pipe-concurrent-v1-oracle-fuzz"),
+        )
+        self.assertEqual(
+            concurrent_adapter.SPEC.coverage.target_set_id, "pipe-concurrent-v1"
+        )
+        self.assertEqual(models.spec_for_model("simple-single").adapter_id, "pipe-v4")
+        self.assertEqual(models.spec_for_model("blocking").adapter_id, "pipe-blocking-v2")
+
+    def test_cli_routes_concurrent_without_changing_default(self):
+        with mock.patch.object(fuzz, "_run_common_campaign", return_value=0) as run:
+            self.assertEqual(fuzz.main(["--batches", "0"]), 0)
+            self.assertEqual(run.call_args.args[0].adapter_id, "pipe-v4")
+        with mock.patch.object(fuzz, "_run_common_campaign", return_value=0) as run:
+            self.assertEqual(fuzz.main(["--model", "concurrent", "--batches", "0"]), 0)
+            self.assertEqual(run.call_args.args[0].adapter_id, "pipe-concurrent-v1")
+
+    def test_complete_scenario_mismatch_is_typed(self):
+        vector = "00" * 112
+        vector_digest = hashlib.sha256(bytes.fromhex(vector)).hexdigest()
+        log = (
+            "STARRY_PIPE_CONCURRENT_MISMATCH: scenario=1 alternative=0 "
+            "byte_offset=24 expected_length=112 actual_length=112 "
+            "expected_byte=0 actual_byte=4 set_digest="
+            + "11" * 32
+            + " actual_digest="
+            + vector_digest
+            + " actual_vector="
+            + vector
+        )
+        result = guest_result.classify_guest_execution(log, 1)
+        self.assertIs(result.category, guest_result.GuestResultCategory.SEMANTIC_MISMATCH)
+        self.assertEqual(result.difference.byte_offset, 24)
+
+
+class PipeConcurrentHarnessTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._temporary = tempfile.TemporaryDirectory()
+        cls.build = Path(cls._temporary.name) / "build"
+        subprocess.run(
+            ["cmake", "-S", str(CASE_DIR / "c"), "-B", str(cls.build)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["cmake", "--build", str(cls.build), "--target", "pipe-linux-oracle"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        cls.oracle = cls.build / "pipe-linux-oracle"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._temporary.cleanup()
+
+    def test_v7_raw_record_converges_and_aggregate_self_compares(self):
+        corpus_digest = fnv1a64(CORPUS_PATH.read_bytes())
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            raw = root / "raw.trace"
+            recorded = subprocess.run(
+                [str(self.oracle), "--record", str(CORPUS_PATH), str(raw)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(recorded.returncode, 0, recorded.stderr)
+            scenarios = decode_raw_run_trace(
+                raw.read_bytes(),
+                expected_magic=b"PIPERUN7",
+                expected_version=7,
+                expected_corpus_digest=corpus_digest,
+            )
+            self.assertGreaterEqual(len(scenarios), 6)
+
+            aggregate = root / "linux.trace"
+            result = concurrent_adapter.record_host_converged(
+                self.oracle, CORPUS_PATH, aggregate
+            )
+            self.assertTrue(result.passed, result.log)
+            allowed = AllowedTrace.from_bytes(
+                aggregate.read_bytes(),
+                expected_magic=b"PIPEORC1",
+                expected_version=7,
+                expected_corpus_digest=corpus_digest,
+            )
+            self.assertEqual(len(allowed.scenarios), len(scenarios))
+            compared = subprocess.run(
+                [str(self.oracle), "--compare", str(CORPUS_PATH), str(aggregate)],
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(compared.returncode, 0, compared.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

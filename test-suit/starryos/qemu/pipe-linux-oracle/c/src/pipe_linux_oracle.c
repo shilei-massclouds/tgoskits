@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include "controlled_worker.h"
+#include "pipe_concurrent_oracle.h"
 
 #define LEGACY_TRACE_VERSION 1U
 #define FD_TRACE_VERSION 2U
@@ -30,6 +31,7 @@
 #define CORPUS_VERSION 4L
 #define BLOCKING_CORPUS_VERSION 5L
 #define POLL_CORPUS_VERSION 6L
+#define CONCURRENT_CORPUS_VERSION 7L
 #define MAX_SLOTS 16
 #define MAX_PIPE_OBJECTS 16
 #define DUP_TARGET_FD_BASE 64
@@ -1471,6 +1473,36 @@ static int digest_file(const char *path, uint64_t *digest)
     return 0;
 }
 
+static int read_corpus_version(const char *path, long *version)
+{
+    FILE *corpus = fopen(path, "r");
+    char raw_line[MAX_LINE_BYTES];
+    int status = -1;
+
+    if (corpus == NULL)
+        return -1;
+    while (fgets(raw_line, sizeof(raw_line), corpus) != NULL) {
+        char *comment = strchr(raw_line, '#');
+        char *line;
+
+        if (comment != NULL)
+            *comment = '\0';
+        line = trim(raw_line);
+        if (*line == '\0')
+            continue;
+        if (strncmp(line, "version ", 8) == 0 &&
+            parse_long_value(trim(line + 8), LEGACY_CORPUS_VERSION,
+                             CONCURRENT_CORPUS_VERSION, version) == 0)
+            status = 0;
+        break;
+    }
+    if (ferror(corpus) != 0)
+        status = -1;
+    if (fclose(corpus) != 0)
+        status = -1;
+    return status;
+}
+
 static void copy_metadata(char *destination, size_t capacity, const char *source)
 {
     size_t length = strnlen(source, capacity - 1U);
@@ -1608,6 +1640,7 @@ int main(int argc, char **argv)
 {
     enum run_mode mode;
     uint64_t corpus_digest;
+    long corpus_version;
 
     if (argc != 4)
         return fail("usage: pipe-linux-oracle --record|--compare CORPUS TRACE");
@@ -1621,6 +1654,11 @@ int main(int argc, char **argv)
         return fail("cannot ignore SIGPIPE");
     if (digest_file(argv[2], &corpus_digest) != 0)
         return fail("cannot digest operation corpus");
+    if (read_corpus_version(argv[2], &corpus_version) != 0)
+        return fail("invalid corpus version");
+    if (corpus_version == CONCURRENT_CORPUS_VERSION)
+        return pipe_concurrent_run(mode == MODE_RECORD, argv[2], argv[3],
+                                   corpus_digest);
 
     if (mode == MODE_RECORD)
         return record_trace(argv[2], argv[3], corpus_digest);

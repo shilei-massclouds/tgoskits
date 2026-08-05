@@ -52,7 +52,9 @@ else()
     add_executable(
         pipe-linux-oracle
         src/pipe_linux_oracle.c
+        src/pipe_concurrent_oracle.c
         "${LINUX_ORACLE_COMMON_DIR}/controlled_worker.c"
+        "${LINUX_ORACLE_COMMON_DIR}/concurrent_trace.c"
     )
     target_include_directories(
         pipe-linux-oracle PRIVATE "${LINUX_ORACLE_COMMON_DIR}"

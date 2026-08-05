@@ -103,6 +103,34 @@ class StableHostRecordTests(unittest.TestCase):
 
 
 class ConvergedHostRecordTests(unittest.TestCase):
+    def test_indexed_recorder_receives_every_run_number(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            scenario = root / "scenario.ops"
+            scenario.write_bytes(b"version 7\nscenario checked\n")
+            trace = root / "linux.trace"
+            indexes = []
+
+            def record_indexed(_elf, _scenario, destination, run_index):
+                indexes.append(run_index)
+                destination.write_bytes(bytes((run_index % 2,)))
+                return HostRecordResult(True, False, f"run {run_index}")
+
+            result = record_converged_host(
+                lambda *_args: self.fail("plain recorder must not be called"),
+                lambda path: (ScenarioRun(0, 1, path.read_bytes()),),
+                Path("oracle"),
+                scenario,
+                trace,
+                magic=b"PIPEORC1",
+                version=7,
+                temporary_prefix=".test-indexed-concurrent-",
+                indexed_record_once=record_indexed,
+            )
+
+            self.assertTrue(result.passed)
+            self.assertEqual(indexes, list(range(32)))
+
     def test_records_32_runs_and_writes_one_canonical_allowed_trace(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

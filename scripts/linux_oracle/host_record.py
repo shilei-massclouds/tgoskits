@@ -3,7 +3,7 @@
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Optional
 
 from .batch import HostRecordResult
 from .outcomes import (
@@ -15,6 +15,7 @@ from .outcomes import (
 
 
 HostRecorder = Callable[[Path, Path, Path], HostRecordResult]
+IndexedHostRecorder = Callable[[Path, Path, Path, int], HostRecordResult]
 RunTraceDecoder = Callable[[Path], Iterable[ScenarioRun]]
 
 
@@ -29,6 +30,7 @@ def record_converged_host(
     version: int,
     temporary_prefix: str,
     deterministic: Iterable[int] = (),
+    indexed_record_once: Optional[IndexedHostRecorder] = None,
 ) -> HostRecordResult:
     """Record 32 host runs and atomically persist one converged allowed set."""
     trace_path.parent.mkdir(parents=True, exist_ok=True)
@@ -41,7 +43,11 @@ def record_converged_host(
             temporary = Path(temporary_directory)
             for index in range(recorder.expected_runs):
                 raw_trace = temporary / f"linux-{index:02d}.trace"
-                result = record_once(elf, scenario_path, raw_trace)
+                result = (
+                    indexed_record_once(elf, scenario_path, raw_trace, index)
+                    if indexed_record_once is not None
+                    else record_once(elf, scenario_path, raw_trace)
+                )
                 logs.append(result.log)
                 if not result.passed:
                     return HostRecordResult(
@@ -97,6 +103,7 @@ def record_stable_host(
 
 __all__ = [
     "HostRecorder",
+    "IndexedHostRecorder",
     "RunTraceDecoder",
     "record_converged_host",
     "record_stable_host",

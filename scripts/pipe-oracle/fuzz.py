@@ -41,7 +41,7 @@ from legacy_campaign import (
     run_guest_compare,
 )
 from linux_oracle.campaign import CampaignRequest
-from linux_oracle.driver import run_campaign
+from linux_oracle.driver import run_campaign as _run_common_campaign
 from linux_oracle.persistence import PersistentStateError
 from minimization_store import MinimizationStore
 from models import DEFAULT_MODEL, MODEL_NAMES, spec_for_model
@@ -55,6 +55,11 @@ WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 _LEGACY_RUN_BATCH = _legacy._run_batch
 _LEGACY_RUN_CAMPAIGN = _legacy._run_campaign
 _LEGACY_RESUME_ATTRIBUTION = _legacy._resume_attribution_job
+
+
+def run_campaign(*args, **kwargs):
+    """Keep the historical patch point while routing through the common driver."""
+    return _run_common_campaign(*args, **kwargs)
 
 
 def _sync_legacy_hooks() -> None:

@@ -169,6 +169,13 @@ The concurrent recorder executes the complete canonical corpus 32 times on
 one host executable and kernel. Each raw run produces one vector per scenario.
 After every run, the recorder updates per-scenario alternative counts.
 
+An adapter may use the recorder's zero-based run index to alternate a bounded
+worker-entry delay. This changes only which real pthread reaches the kernel
+wait queue first; it does not choose a winner, synthesize a return value, or
+alter the corpus. The delay is host-record-only and is absent from guest
+comparison. Its purpose is to repeat legal but strongly biased Linux orders
+often enough for the minimum-observation rule to remain meaningful.
+
 Admission requires all of the following:
 
 - no scenario exceeds four alternatives;
@@ -250,4 +257,3 @@ three times and self-compared.
 
 Rollback removes only the new concurrent adapters, campaign roots, and v4/v7
 branches. Historical code and persisted artifacts require no migration.
-
