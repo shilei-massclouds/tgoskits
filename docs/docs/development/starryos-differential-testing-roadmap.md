@@ -678,25 +678,61 @@ Linux/Starry mismatch、提前完成、panic、timeout、harness error 或 cover
 因此没有修改 StarryOS 生产等待或原子实现。完整设计、兼容边界和非目标见
 `book/design/starry-eventfd-blocking-oracle.md`。
 
-### 10.2 Stage 6.2：剩余受控并发模型
+### 10.2 Stage 6.2：pipe 阻塞模型与公共单 worker 协议
 
-**状态：未开始。**
+**状态：已完成（2026-08-05）。**
 
-Stage 6.2 明确保留以下工作，不把它们反向塞入 Stage 6.1：
+Stage 6.2a 增加 `pipe-blocking-v1`（corpus/trace version 5），覆盖受控阻塞 read、
+原子 write、EOF、pipe buffer slot 释放、alias 和共享 `O_NONBLOCK`。Stage 6.2b 在
+eventfd 与 pipe 两个真实使用者成立后，提取了公共 `SingleWorkerLifecycle`、三次
+稳定 host recorder 和 `controlled_worker` pthread harness。公共层只拥有 actor
+生命周期、pending guard、completion deadline 和 typed helper status；eventfd
+counter 与 pipe buffer/OFD 状态仍由各自 adapter 拥有。
 
-- eventfd 多等待者、多 reader/writer、公平性和唤醒数量；
-- pipe 阻塞 read/write、多 writer 下的 `PIPE_BUF` 原子性，以及 EOF/`EPIPE` 状态
-  转换；
-- comparator 的允许结果集合和跨 actor 不变量，替代对自然调度顺序的比较；
-- signal、`EINTR`、`SA_RESTART` 及信号与阻塞 syscall 的受控交错；
-- 非零 timeout 的 poll 与 epoll 注册、状态变化、唤醒和超时交错；
-- close/lifetime 竞争，以及这些场景所需但 Stage 6.1 明确禁止的资源转换。
+提取前后的 checked corpus、canonical digest、host trace、fingerprint、CLI 默认值、
+artifact replay 和 campaign root 均保持不变。设计与验收证据见
+`book/design/starry-controlled-worker-oracle.md`、
+`book/design/starry-pipe-blocking-oracle.md`。
 
-pipe 提供第二个真实阻塞实现后，才能从 eventfd 中提取公共 actor/barrier/join
-抽象。Stage 6.2 仍须满足：固定场景可稳定重放；watchdog、schedule timeout、
-harness failure 与语义 mismatch 分开；宿主重复稳定性达到适配器声明的门槛；
-comparator 对每个字段明确采用 exact result、允许结果集合或不变量；不得通过扩大
-timeout 或降低生成权重掩盖死锁、丢失唤醒和不稳定场景。
+### 10.3 Stage 6.3：受控 blocking poll
+
+**状态：已完成（2026-08-05）。**
+
+Stage 6.3a 增加 `eventfd-blocking-v2`（version 3），Stage 6.3b 增加
+`pipe-blocking-v2`（version 6）。两个 adapter 都复用单 worker 协议，证明先进入
+无限 `poll(2)`、再由同一资源 readiness transition 唤醒；覆盖 eventfd `POLLIN` /
+`POLLOUT`，以及 pipe `POLLIN`、`POLLOUT`、`POLLHUP`、零长度 write 和分阶段释放
+pipe buffer slot。默认 `simple-single` 和历史 replay routing 未改变。
+
+设计与验收证据见 `book/design/starry-eventfd-blocking-poll-oracle.md` 和
+`book/design/starry-pipe-blocking-poll-oracle.md`。
+
+### 10.4 Stage 6.4：并发、signal、timeout、epoll 与生命周期闭环
+
+**状态：进行中。**
+
+Stage 6 的最终纵向能力使用两个独立的新 adapter，绝不升级或迁移历史格式：
+
+| 资源 | adapter | corpus/trace | trace identity | campaign root |
+|---|---|---:|---|---|
+| eventfd | `eventfd-concurrent-v1` | 4 | `EVFDORC4` + version 4 | `coverage/eventfd-concurrent-v1-oracle-fuzz` |
+| pipe | `pipe-concurrent-v1` | 7 | `PIPEORC1` + version 7 | `coverage/pipe-concurrent-v1-oracle-fuzz` |
+
+显式 `--model concurrent` 才选择新 adapter；无参数仍选择 `simple-single`，显式
+`--model blocking` 仍选择已验收的 blocking-poll adapter。replay 必须先按 artifact
+中的精确 adapter ID 分派，再解析版本化内容。
+
+最终范围固定为两个受控 worker、场景级有限结果集合、multi-waiter 有界进展、
+`SIGUSR1`/`EINTR`/`SA_RESTART`、`poll`/`ppoll` 有限 timeout、pipe/eventfd 的 epoll
+LT/ET/ONESHOT/EXCLUSIVE、多 fd 轮转，以及 alias/OFD/peer 生命周期、`POLLERR`、
+`SIGPIPE` 和 `EPIPE`。自然调度只允许以完整场景结果向量形成至多四个 alternative，
+不得对单条 operation 分别取并集。
+
+网络 EPOLLET 留给 Stage 7。另一个线程关闭正被 `poll` 监视的同一 fd 只作为
+Linux-specific 诊断，不作为兼容 gate；panic、UAF、harness failure 或无法清理的
+线程仍是缺陷。公共协议见
+`book/design/starry-linux-oracle-concurrent-outcomes.md`，资源与 syscall 设计见
+`book/design/starry-eventfd-pipe-concurrent-oracle.md`。
 
 ## 11. 阶段 7：持续扩展与优先级管理
 
