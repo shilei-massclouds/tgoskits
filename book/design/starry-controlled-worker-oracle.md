@@ -2,11 +2,11 @@
 
 ## Status
 
-Proposed on 2026-08-05. This document is the independently reviewable
+Accepted on 2026-08-05. This document is the independently reviewable
 high-risk design for Stage 6.2b of the Starry Linux differential-testing
 roadmap. Stage 6.2b is a behavior-preserving refactor of the accepted eventfd
 v2 and pipe v5 blocking adapters. Design, Python extraction, C extraction, and
-acceptance evidence remain separately reviewable commits.
+acceptance evidence are separately reviewable commits.
 
 This stage does not add a scenario operation, actor, syscall model, trace
 field, persistence field, command-line choice, coverage target, or StarryOS
@@ -213,8 +213,8 @@ configuration, success/fail regexes, and discovery behavior.
 
 ### Synchronization and timing
 
-The phase values are idle, started, entered, and completed. Initialization
-happens before `pthread_create`. The worker publishes entered with release
+The phase values are idle, entered, and completed. Initialization happens
+before `pthread_create`. The worker publishes entered with release
 ordering immediately before the raw syscall. It stores its complete local
 result, then publishes completed with release ordering. Controller loads use
 acquire ordering so observing a phase also observes the worker argument and
@@ -306,6 +306,58 @@ Only host C atomics change. No production Rust synchronization, wait queue, or
 syscall implementation changes, so `cargo xtask sync-lint` is not applicable.
 If implementation touches one of those production boundaries, Stage 6.2b
 stops and the expanded risk is redesigned separately.
+
+## Acceptance evidence
+
+Acceptance completed on 2026-08-05 without a StarryOS production change. The
+pre-refactor baseline retained the old host executables, all five checked
+corpora, three independently recorded traces per checked corpus, and generated
+canonical inputs and old-host traces for seeds 0 through 4 of all four models.
+The checked results remained:
+
+| Model | Operations | Corpus SHA-256 | Trace SHA-256 |
+|---|---:|---|---|
+| eventfd v1 simple | 107 | `09a00230ddaa7703b4f81e685c29a020a45de7441a7301bdd4519acd5e3ded70` | `b56f8d2e740c45e3f54a38d2993d8d747864b248626b842cf5cc38b058bda9e4` |
+| eventfd v2 blocking | 57 | `2a539e3c47b403c0103e3c77768ed0632fde7bca70d758a10f28538c80695b4e` | `9a42f7b5e48b2a3974c2806d5fece49fbbb738b1053aea99f798ceedb1357147` |
+| pipe v4 simple | 162 | `82a44681f889b990cf85b587fd41802a16c4283c9bd90d2100d7441965fc50cc` | `76b332079e375fccd16d5f2ff7d2a9b202fd087ed02fe6699ca58fadeb34a497` |
+| pipe v5 blocking read | 28 | `4d8fd3d216ac1c9989880bb192ee6a87a11ee26f8fe668a97a96e8560e2df366` | `b818e0d580eebbb018dc1a1a9430b4ce5ecb9ff2a81308d083ed1c6fa0fcc3db` |
+| pipe v5 blocking write | 16 | `3135128891b64e2f29ec7c4484c0d00cdee6f4bf3d7c284aa3b51706591210f5` | `eb7810191b936973b9dc6c66839d34917136b4e297db6dec72b7e4f628d3a77e` |
+
+Each blocking checked corpus again produced three byte-identical host traces,
+and every checked trace compared byte-for-byte with its pre-refactor trace.
+All 20 generated canonical inputs and all 20 traces produced by the new host
+harnesses likewise compared byte-for-byte with the baseline. Because the trace
+headers are unchanged, this also preserves their corpus digests, version,
+record count, and host metadata. The stable blocking-fingerprint and strict
+legacy/common replay-isolation tests passed for both adapters.
+
+The serial Python results were 22 common-framework tests, 37 eventfd tests,
+and 202 pipe tests with one environment-dependent skip. Python bytecode
+compilation passed. The common C test covered pending/wake/join, immediate
+completion, completion timeout, and injected pthread, clock, and sleep errors.
+Both host harnesses built with warnings as errors and static linking. Workspace
+rustfmt made no changes, all 23 targeted `starry-kernel` clippy checks passed,
+and `git diff --check` passed.
+
+The serial x86_64 QEMU results were 92 raw eventfd2 checks, 39 raw pipe syscall
+checks, eventfd v1 with 107 operations, and pipe v4 with 162 operations. The
+same existing cases then accepted temporary artifact-directory injection for
+eventfd v2 with 57 operations, pipe v5 blocking read with 28 operations, and
+pipe v5 blocking write with 16 operations. No semantic mismatch, early
+completion, schedule timeout, harness error, panic, outer timeout, or missing
+coverage was observed.
+
+Recovery-only runs used `--model blocking --batches 0 --max-qemu 64` for both
+adapters. Each used zero QEMU launches, loaded ten active corpus entries, and
+reported `background_pending=0`. SHA-256 snapshots of every file under both
+blocking campaign roots were identical before and after recovery, so neither
+run created a baseline, batch, attribution, minimization, or other persistent
+state. All persisted attribution and minimization jobs remained completed.
+
+Only the host oracle's pthread and atomic coordination changed. No production
+Rust synchronization, wait queue, syscall implementation, QEMU configuration,
+test regex, or discovery path changed, so `cargo xtask sync-lint` remained not
+applicable.
 
 ## Non-goals and rollback
 
