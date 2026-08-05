@@ -25,6 +25,7 @@ _KINDS = {
     "start-write": 15,
     "assert-pending": 16,
     "join": 17,
+    "start-poll": 18,
 }
 _FIELD_ORDER = ("result", "errno", "value", "data_len", "data")
 

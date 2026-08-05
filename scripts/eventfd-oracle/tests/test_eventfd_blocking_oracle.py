@@ -20,6 +20,7 @@ import blocking_reducer  # noqa: E402
 import blocking_scenario  # noqa: E402
 import fuzz  # noqa: E402
 import models  # noqa: E402
+import poll_adapter  # noqa: E402
 import fingerprint  # noqa: E402
 import guest_result  # noqa: E402
 from linux_oracle.persistence import CampaignStore, PersistentStateError  # noqa: E402
@@ -211,8 +212,9 @@ class EventFdBlockingCampaignTests(unittest.TestCase):
         self.assertIs(models.spec_for_model("simple-single"), models.DEFAULT_SPEC)
         self.assertEqual(models.DEFAULT_SPEC.adapter_id, "eventfd-v1")
         self.assertEqual(
-            models.spec_for_model("blocking").adapter_id, "eventfd-blocking-v1"
+            models.spec_for_model("blocking").adapter_id, "eventfd-blocking-v2"
         )
+        self.assertIs(models.spec_for_model("blocking"), poll_adapter.SPEC)
         self.assertIs(
             models.spec_for_adapter_id("eventfd-blocking-v1"),
             blocking_adapter.SPEC,
@@ -240,7 +242,7 @@ class EventFdBlockingCampaignTests(unittest.TestCase):
                 ),
                 0,
             )
-            self.assertEqual(run.call_args.args[0].adapter_id, "eventfd-blocking-v1")
+            self.assertEqual(run.call_args.args[0].adapter_id, "eventfd-blocking-v2")
 
     def test_blocking_adapter_has_isolated_campaign_and_wait_coverage(self):
         spec = blocking_adapter.SPEC
@@ -323,7 +325,7 @@ class EventFdBlockingCampaignTests(unittest.TestCase):
 
     def test_simple_and_blocking_persistence_fail_closed_across_models(self):
         simple = models.spec_for_model("simple-single")
-        blocking = models.spec_for_model("blocking")
+        blocking = blocking_adapter.SPEC
         generated = blocking_generator.canonicalize_seed(4)
         with tempfile.TemporaryDirectory() as temporary_directory:
             workspace = Path(temporary_directory)

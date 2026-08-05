@@ -17,6 +17,7 @@
 
 #define SIMPLE_CORPUS_VERSION 1L
 #define BLOCKING_CORPUS_VERSION 2L
+#define POLL_CORPUS_VERSION 3L
 #define MAX_SLOTS 16
 #define MAX_OBJECTS 32
 #define MAX_IO_BYTES 16
@@ -33,6 +34,7 @@
 
 static const unsigned char trace_magic_v1[8] = {'E', 'V', 'F', 'D', 'O', 'R', 'C', '1'};
 static const unsigned char trace_magic_v2[8] = {'E', 'V', 'F', 'D', 'O', 'R', 'C', '2'};
+static const unsigned char trace_magic_v3[8] = {'E', 'V', 'F', 'D', 'O', 'R', 'C', '3'};
 
 enum operation_kind {
     OP_EVENTFD = 1,
@@ -52,6 +54,7 @@ enum operation_kind {
     OP_START_WRITE,
     OP_ASSERT_PENDING,
     OP_JOIN,
+    OP_START_POLL,
 };
 
 enum operation_difference {
@@ -100,6 +103,7 @@ enum run_mode {
 enum worker_kind {
     WORKER_READ,
     WORKER_WRITE,
+    WORKER_POLL,
 };
 
 struct worker_state {
@@ -113,6 +117,7 @@ struct worker_state {
     int fd;
     int object;
     uint64_t value;
+    struct pollfd poll_fd;
 };
 
 struct run_context {
@@ -260,6 +265,22 @@ static int supported_poll_literal(long fd)
     return fd == -2 || fd == -1 || fd == INT_MAX;
 }
 
+static int controlled_corpus_version(long version)
+{
+    return version == BLOCKING_CORPUS_VERSION || version == POLL_CORPUS_VERSION;
+}
+
+static const unsigned char *trace_magic_for_version(long version)
+{
+    if (version == SIMPLE_CORPUS_VERSION)
+        return trace_magic_v1;
+    if (version == BLOCKING_CORPUS_VERSION)
+        return trace_magic_v2;
+    if (version == POLL_CORPUS_VERSION)
+        return trace_magic_v3;
+    return NULL;
+}
+
 static int destination_fd(const struct run_context *context, int slot)
 {
     return context->slots[slot] >= 0 ? context->slots[slot]
@@ -290,11 +311,22 @@ static void *run_worker(void *argument)
         worker->result.value = decoded;
         worker->result.data_len = sizeof(buffer);
         memcpy(worker->result.data, buffer, sizeof(buffer));
-    } else {
+    } else if (worker->kind == WORKER_WRITE) {
         controlled_worker_publish_entered(&worker->controller);
         errno = 0;
         syscall_result = syscall(SYS_write, worker->fd, &worker->value, 8U);
         finish_syscall_result(&worker->result, syscall_result);
+    } else {
+        uint16_t revents;
+
+        controlled_worker_publish_entered(&worker->controller);
+        errno = 0;
+        syscall_result = syscall(SYS_poll, &worker->poll_fd, 1U, -1L);
+        finish_syscall_result(&worker->result, syscall_result);
+        revents = (uint16_t)worker->poll_fd.revents;
+        worker->result.data_len = sizeof(revents);
+        worker->result.data[0] = (unsigned char)(revents & 0xffU);
+        worker->result.data[1] = (unsigned char)(revents >> 8);
     }
     controlled_worker_publish_completed(&worker->controller);
     return NULL;
@@ -330,9 +362,13 @@ static void update_worker_completable(struct run_context *context)
     object = &context->objects[context->worker.object];
     if (context->worker.kind == WORKER_READ)
         context->worker.completable = object->count > 0;
-    else
+    else if (context->worker.kind == WORKER_WRITE)
         context->worker.completable =
             UINT64_MAX - object->count > context->worker.value;
+    else if (context->worker.poll_fd.events == POLLIN)
+        context->worker.completable = object->count > 0;
+    else
+        context->worker.completable = UINT64_MAX - 1U > object->count;
 }
 
 static int create_object(struct run_context *context, int slot, uint64_t initval,
@@ -695,6 +731,50 @@ static int execute_start_worker(struct run_context *context, char *save,
     return 0;
 }
 
+static int execute_start_poll(struct run_context *context, char *save,
+                              struct operation_result *result)
+{
+    char *actor_text = strtok_r(NULL, " \t", &save);
+    char *slot_text = strtok_r(NULL, " \t", &save);
+    char *events_text = strtok_r(NULL, " \t", &save);
+    struct event_object *object;
+    long actor;
+    long events;
+    int slot;
+
+    if (context->corpus_version != POLL_CORPUS_VERSION ||
+        parse_long_value(actor_text, WORKER_ACTOR, WORKER_ACTOR, &actor) != 0 ||
+        parse_slot(slot_text, &slot) != 0 ||
+        parse_long_value(events_text, POLLIN, POLLOUT, &events) != 0 ||
+        (events != POLLIN && events != POLLOUT) ||
+        strtok_r(NULL, " \t", &save) != NULL || context->worker.active ||
+        context->slots[slot] < 0 || context->slot_objects[slot] < 0)
+        return -1;
+    object = object_for_slot(context, slot);
+    if (object == NULL || (events == POLLIN && object->count != 0) ||
+        (events == POLLOUT && object->count != UINT64_MAX - 1U))
+        return -1;
+
+    memset(&context->worker, 0, sizeof(context->worker));
+    controlled_worker_initialize(&context->worker.controller);
+    context->worker.kind = WORKER_POLL;
+    context->worker.active = 1;
+    context->worker.slot = slot;
+    context->worker.fd = context->slots[slot];
+    context->worker.object = context->slot_objects[slot];
+    context->worker.poll_fd.fd = context->slots[slot];
+    context->worker.poll_fd.events = (short)events;
+    context->worker.poll_fd.revents = POLL_REVENTS_SENTINEL;
+    if (controlled_worker_start(&context->worker.controller, run_worker,
+                                &context->worker) != CONTROLLED_WORKER_OK) {
+        context->worker.active = 0;
+        return -2;
+    }
+    result->kind = OP_START_POLL;
+    result->value = (uint64_t)events;
+    return 0;
+}
+
 static int execute_assert_pending(struct run_context *context, char *save,
                                   struct operation_result *result)
 {
@@ -702,7 +782,7 @@ static int execute_assert_pending(struct run_context *context, char *save,
     long actor;
     enum controlled_worker_status pending_status;
 
-    if (context->corpus_version != BLOCKING_CORPUS_VERSION ||
+    if (!controlled_corpus_version(context->corpus_version) ||
         parse_long_value(actor_text, WORKER_ACTOR, WORKER_ACTOR, &actor) != 0 ||
         strtok_r(NULL, " \t", &save) != NULL || !context->worker.active ||
         context->worker.completable)
@@ -731,7 +811,7 @@ static int execute_join(struct run_context *context, char *save,
     long actor;
     enum controlled_worker_status wait_status;
 
-    if (context->corpus_version != BLOCKING_CORPUS_VERSION ||
+    if (!controlled_corpus_version(context->corpus_version) ||
         parse_long_value(actor_text, WORKER_ACTOR, WORKER_ACTOR, &actor) != 0 ||
         strtok_r(NULL, " \t", &save) != NULL || !context->worker.active ||
         !context->worker.pending_confirmed || !context->worker.completable)
@@ -758,7 +838,7 @@ static int execute_join(struct run_context *context, char *save,
         uint64_t consumed = object->semaphore ? 1 : object->count;
 
         object->count -= consumed;
-    } else {
+    } else if (context->worker.kind == WORKER_WRITE) {
         object->count += context->worker.value;
     }
     context->worker.active = 0;
@@ -811,6 +891,8 @@ static int execute_operation(struct run_context *context, char *line,
         return execute_start_worker(context, save, result, 0);
     if (strcmp(operation, "start-write") == 0)
         return execute_start_worker(context, save, result, 1);
+    if (strcmp(operation, "start-poll") == 0)
+        return execute_start_poll(context, save, result);
     if (strcmp(operation, "assert-pending") == 0)
         return execute_assert_pending(context, save, result);
     if (strcmp(operation, "join") == 0)
@@ -1017,7 +1099,7 @@ static int read_corpus_version(const char *path, long *version)
             continue;
         if (strncmp(line, "version ", 8) == 0 &&
             parse_long_value(trim(line + 8), SIMPLE_CORPUS_VERSION,
-                             BLOCKING_CORPUS_VERSION, version) == 0)
+                             POLL_CORPUS_VERSION, version) == 0)
             status = 0;
         break;
     }
@@ -1039,13 +1121,14 @@ static void copy_metadata(char *destination, size_t capacity, const char *source
 static int initialize_record_header(struct trace_header *header,
                                     uint64_t corpus_digest, long corpus_version)
 {
+    const unsigned char *magic = trace_magic_for_version(corpus_version);
     struct utsname system_name;
     long page_size;
 
+    if (magic == NULL)
+        return -1;
     memset(header, 0, sizeof(*header));
-    memcpy(header->magic,
-           corpus_version == SIMPLE_CORPUS_VERSION ? trace_magic_v1 : trace_magic_v2,
-           sizeof(header->magic));
+    memcpy(header->magic, magic, sizeof(header->magic));
     header->version = (uint32_t)corpus_version;
     header->corpus_digest = corpus_digest;
     if (uname(&system_name) != 0)
@@ -1100,9 +1183,12 @@ static int compare_trace(const char *corpus_path, const char *trace_path,
                          uint64_t corpus_digest, long corpus_version)
 {
     struct run_context context;
+    const unsigned char *magic = trace_magic_for_version(corpus_version);
     unsigned char trailing_byte;
     int status;
 
+    if (magic == NULL)
+        return fail("invalid corpus version");
     memset(&context, 0, sizeof(context));
     context.mode = MODE_COMPARE;
     context.corpus_version = corpus_version;
@@ -1111,10 +1197,7 @@ static int compare_trace(const char *corpus_path, const char *trace_path,
     if (context.trace == NULL)
         return fail("cannot open expected trace");
     if (fread(&context.header, sizeof(context.header), 1, context.trace) != 1 ||
-        memcmp(context.header.magic,
-               corpus_version == SIMPLE_CORPUS_VERSION ? trace_magic_v1
-                                                       : trace_magic_v2,
-               sizeof(context.header.magic)) != 0 ||
+        memcmp(context.header.magic, magic, sizeof(context.header.magic)) != 0 ||
         context.header.version != (uint32_t)corpus_version ||
         context.header.corpus_digest != corpus_digest) {
         fclose(context.trace);
