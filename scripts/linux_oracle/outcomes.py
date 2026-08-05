@@ -13,6 +13,8 @@ CONVERGENCE_RUNS = 8
 _TRACE_HEADER = struct.Struct("<8sIIQ32s")
 _SCENARIO_HEADER = struct.Struct("<III32s")
 _ALTERNATIVE_HEADER = struct.Struct("<I")
+_RAW_HEADER = struct.Struct("<8sIIQ")
+_RAW_SCENARIO_HEADER = struct.Struct("<III")
 
 
 def fnv1a64(encoded: bytes) -> int:
@@ -22,6 +24,85 @@ def fnv1a64(encoded: bytes) -> int:
         value ^= byte
         value = value * 1099511628211 & ((1 << 64) - 1)
     return value
+
+
+def encode_raw_run_trace(
+    scenarios: Sequence["ScenarioRun"],
+    *,
+    magic: bytes,
+    version: int,
+    corpus_digest: int,
+) -> bytes:
+    """Encode one host execution before allowed-set aggregation."""
+    current = tuple(scenarios)
+    indexes = tuple(scenario.scenario_index for scenario in current)
+    if (
+        len(magic) != 8
+        or version <= 0
+        or not current
+        or indexes != tuple(range(len(current)))
+    ):
+        raise AllowedOutcomeError("raw trace identity is invalid")
+    encoded = bytearray(
+        _RAW_HEADER.pack(magic, version, len(current), corpus_digest)
+    )
+    for scenario in current:
+        encoded.extend(
+            _RAW_SCENARIO_HEADER.pack(
+                scenario.scenario_index,
+                scenario.operation_count,
+                len(scenario.payload),
+            )
+        )
+        encoded.extend(scenario.payload)
+    return bytes(encoded)
+
+
+def decode_raw_run_trace(
+    encoded: bytes,
+    *,
+    expected_magic: bytes,
+    expected_version: int,
+    expected_corpus_digest: int,
+) -> Tuple["ScenarioRun", ...]:
+    """Decode one strict host execution before allowed-set aggregation."""
+    if len(encoded) < _RAW_HEADER.size:
+        raise AllowedOutcomeError("raw trace is truncated")
+    magic, version, scenario_count, corpus_digest = _RAW_HEADER.unpack_from(encoded)
+    if (
+        magic != expected_magic
+        or version != expected_version
+        or corpus_digest != expected_corpus_digest
+        or scenario_count == 0
+    ):
+        raise AllowedOutcomeError("raw trace identity is invalid")
+    offset = _RAW_HEADER.size
+    scenarios = []
+    for expected_index in range(scenario_count):
+        if offset + _RAW_SCENARIO_HEADER.size > len(encoded):
+            raise AllowedOutcomeError("raw scenario header is truncated")
+        scenario_index, operation_count, payload_length = (
+            _RAW_SCENARIO_HEADER.unpack_from(encoded, offset)
+        )
+        offset += _RAW_SCENARIO_HEADER.size
+        if (
+            scenario_index != expected_index
+            or operation_count == 0
+            or payload_length == 0
+            or offset + payload_length > len(encoded)
+        ):
+            raise AllowedOutcomeError("raw scenario identity is invalid")
+        scenarios.append(
+            ScenarioRun(
+                scenario_index,
+                operation_count,
+                encoded[offset : offset + payload_length],
+            )
+        )
+        offset += payload_length
+    if offset != len(encoded):
+        raise AllowedOutcomeError("raw trace has trailing bytes")
+    return tuple(scenarios)
 
 
 class AllowedOutcomeError(ValueError):
@@ -265,5 +346,7 @@ __all__ = [
     "AllowedScenario",
     "AllowedTrace",
     "ScenarioRun",
+    "decode_raw_run_trace",
+    "encode_raw_run_trace",
     "fnv1a64",
 ]

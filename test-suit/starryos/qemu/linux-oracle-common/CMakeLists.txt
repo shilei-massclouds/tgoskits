@@ -24,3 +24,11 @@ target_link_options(
         -Wl,--wrap=nanosleep
 )
 add_test(NAME controlled-worker-test COMMAND controlled-worker-test)
+
+add_executable(
+    concurrent-trace-test
+    concurrent_trace.c
+    tests/concurrent_trace_test.c
+)
+target_compile_options(concurrent-trace-test PRIVATE -Wall -Wextra -Werror)
+add_test(NAME concurrent-trace-test COMMAND concurrent-trace-test)

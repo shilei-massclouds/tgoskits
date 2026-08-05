@@ -14,6 +14,8 @@ from linux_oracle.outcomes import (
     AllowedOutcomeRecorder,
     AllowedTrace,
     ScenarioRun,
+    decode_raw_run_trace,
+    encode_raw_run_trace,
 )
 
 
@@ -117,6 +119,35 @@ class AllowedOutcomeRecorderTests(unittest.TestCase):
                 expected_magic=b"EVFDORC4",
                 expected_version=4,
                 expected_corpus_digest=9,
+            )
+
+    def test_raw_run_trace_round_trip_is_strict(self):
+        scenarios = (
+            ScenarioRun(0, 2, b"first-vector"),
+            ScenarioRun(1, 3, b"second-vector"),
+        )
+        encoded = encode_raw_run_trace(
+            scenarios,
+            magic=b"EVFDRUN4",
+            version=4,
+            corpus_digest=17,
+        )
+
+        self.assertEqual(
+            decode_raw_run_trace(
+                encoded,
+                expected_magic=b"EVFDRUN4",
+                expected_version=4,
+                expected_corpus_digest=17,
+            ),
+            scenarios,
+        )
+        with self.assertRaisesRegex(AllowedOutcomeError, "raw trace identity"):
+            decode_raw_run_trace(
+                encoded,
+                expected_magic=b"PIPERUN7",
+                expected_version=4,
+                expected_corpus_digest=17,
             )
 
 
