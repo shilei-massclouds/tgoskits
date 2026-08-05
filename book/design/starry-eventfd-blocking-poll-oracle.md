@@ -326,6 +326,82 @@ or scheduling fairness.
 
 ## Acceptance evidence
 
-Acceptance evidence is added only after implementation and all applicable
-gates complete. A Linux/Starry difference blocks this section and is handled as
-a separate regression and production fix.
+Stage 6.3a was accepted on 2026-08-05. No Linux/Starry semantic difference was
+observed, and no production kernel, wait-queue, synchronization, syscall,
+QEMU discovery, or QEMU configuration file changed.
+
+The pre-implementation compatibility snapshot and post-implementation replay
+produced these byte-identical values on Linux 5.15.0-186-generic x86_64:
+
+| Corpus | Operations | Canonical SHA-256 | Host trace SHA-256 | Stability |
+|---|---:|---|---|---|
+| v1 simple | 107 | `09a00230ddaa7703b4f81e685c29a020a45de7441a7301bdd4519acd5e3ded70` | `b56f8d2e740c45e3f54a38d2993d8d747864b248626b842cf5cc38b058bda9e4` | Three post-change traces each matched the frozen pre-change trace byte for byte. |
+| v2 blocking (`eventfd-blocking-v1`) | 57 | `2a539e3c47b403c0103e3c77768ed0632fde7bca70d758a10f28538c80695b4e` | `9a42f7b5e48b2a3974c2806d5fece49fbbb738b1053aea99f798ceedb1357147` | Three post-change traces each matched the frozen pre-change trace byte for byte. |
+| v3 blocking poll (`eventfd-blocking-v2`) | 31 | `e501023e9e5156583819fbd10583079faf7a3c22e80c465d06d538674124d4c3` | `5746bf054777c63f5bd64b824543744db78cbe270f8948c60668d18a958a0990` | Three traces were byte-identical and host self-compare passed. |
+
+The v3 trace used `EVFDORC3`. Its five `join` records each contained poll
+result `1`, `errno` zero, a two-byte `revents`, and the expected sequence
+`POLLIN, POLLIN, POLLIN, POLLOUT, POLLOUT`. The existing `join` fingerprint ID
+remained 17 and `start-poll` appended ID 18. Strict codec, C parser, trace
+magic, persistence, failure-artifact, and adapter-ID tests rejected every
+v1/v2/v3 cross-load attempted by the suite. Before the upgrade, the historical
+v1 campaign had zero pending or running attribution/minimization tasks; only
+its saved artifact was replayed, and no new v1 campaign was started.
+
+Generator seeds zero through four were frozen as follows:
+
+| Seed | Canonical bytes | SHA-256 |
+|---:|---:|---|
+| 0 | 250 | `86de0d7d857ca9e47662aacd52e2a74d20321a033e75724ff7d83396b850003d` |
+| 1 | 154 | `62978e646a69d4da8d11a09d65974a10442ff997e900004c393877810aa34d65` |
+| 2 | 245 | `b887d5116cf4d9dbfa481ab9edf2b1e40de850f157fef984d3c4e0439ce520c5` |
+| 3 | 249 | `58b163939c7b654cff7cf192b41879fe1626939fbdbfc16ef5909bf1d8feef6b` |
+| 4 | 272 | `316f3acff5a9abe21970d784f03e3b82f6877933853363b0f1800170cd2a22f9` |
+
+Static and host validation completed with these results:
+
+- common Python suite: 22 tests passed;
+- eventfd Python suite: 57 tests passed, including all v3 mutation kinds,
+  resource-aware reduction, typed early-completion/timeout/helper errors, and
+  replay routing;
+- retained pipe Python suite: 202 tests passed with one expected skip;
+- affected Python modules passed `py_compile`;
+- the common controlled-worker CMake/CTest suite passed, and the eventfd host
+  harness built with `-Wall -Wextra -Werror`;
+- `cargo fmt` completed without Rust changes;
+- `cargo xtask clippy --package starry-kernel` passed all 23 checks; and
+- `git diff --check` passed.
+
+All runtime tests were run serially. The raw eventfd2 case passed 92 tests.
+The existing eventfd Linux-oracle case passed the default 107-operation simple
+corpus, an injected historical 57-operation v2 blocking artifact, and the
+injected 31-operation v3 blocking-poll artifact. Both injected artifacts used
+the existing `STARRY_EVENTFD_ORACLE_ARTIFACT_DIR` path; no case or discovery
+configuration was added.
+
+The bounded command
+
+```text
+python3 scripts/eventfd-oracle/fuzz.py --model blocking --seed 42 \
+    --batches 3 --batch-size 16 --max-qemu 32
+```
+
+completed all three foreground batches with 32 QEMU executions, eight loaded
+corpus entries, no semantic failure, and two deliberately deferred attribution
+tasks. The required recovery-only command
+
+```text
+python3 scripts/eventfd-oracle/fuzz.py --model blocking --seed 42 \
+    --batches 0 --max-qemu 64
+```
+
+completed with 61 QEMU executions, 11 loaded corpus entries, and
+`background_pending=0`. All three attribution tasks and all six minimization
+tasks were `completed`; the campaign failure directory remained empty. The
+successful minimizations included 351 to 249 bytes, 556 to 252 bytes, 368 to
+263 bytes, and 428 to 397 bytes, providing runtime evidence that reduced v3
+inputs retain their blocking and completion proofs.
+
+`cargo xtask sync-lint` was not applicable because the accepted diff contains
+only the design record, eventfd oracle Python/C test infrastructure, and the
+checked v3 corpus. The work was kept in local commits and was not pushed.
