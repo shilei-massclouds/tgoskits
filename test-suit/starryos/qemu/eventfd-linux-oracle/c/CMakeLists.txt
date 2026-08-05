@@ -47,7 +47,16 @@ else()
     set(EVENTFD_ORACLE_CORPUS "${CMAKE_CURRENT_SOURCE_DIR}/corpus/eventfd.ops")
     set(EVENTFD_ORACLE_TRACE "${CMAKE_CURRENT_BINARY_DIR}/linux.trace")
 
-    add_executable(eventfd-linux-oracle src/eventfd_linux_oracle.c)
+    set(LINUX_ORACLE_COMMON_DIR
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../linux-oracle-common")
+    add_executable(
+        eventfd-linux-oracle
+        src/eventfd_linux_oracle.c
+        "${LINUX_ORACLE_COMMON_DIR}/controlled_worker.c"
+    )
+    target_include_directories(
+        eventfd-linux-oracle PRIVATE "${LINUX_ORACLE_COMMON_DIR}"
+    )
     target_compile_options(eventfd-linux-oracle PRIVATE -Wall -Wextra -Werror)
     target_link_libraries(eventfd-linux-oracle PRIVATE Threads::Threads)
     target_link_options(eventfd-linux-oracle PRIVATE -static)

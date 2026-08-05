@@ -47,7 +47,16 @@ else()
     set(PIPE_ORACLE_CORPUS "${CMAKE_CURRENT_SOURCE_DIR}/corpus/pipe.ops")
     set(PIPE_ORACLE_TRACE "${CMAKE_CURRENT_BINARY_DIR}/linux.trace")
 
-    add_executable(pipe-linux-oracle src/pipe_linux_oracle.c)
+    set(LINUX_ORACLE_COMMON_DIR
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../linux-oracle-common")
+    add_executable(
+        pipe-linux-oracle
+        src/pipe_linux_oracle.c
+        "${LINUX_ORACLE_COMMON_DIR}/controlled_worker.c"
+    )
+    target_include_directories(
+        pipe-linux-oracle PRIVATE "${LINUX_ORACLE_COMMON_DIR}"
+    )
     target_compile_options(pipe-linux-oracle PRIVATE -Wall -Wextra -Werror)
     target_link_libraries(pipe-linux-oracle PRIVATE Threads::Threads)
     target_link_options(pipe-linux-oracle PRIVATE -static)

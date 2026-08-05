@@ -5,10 +5,8 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <poll.h>
-#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
-#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,8 +14,9 @@
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/utsname.h>
-#include <time.h>
 #include <unistd.h>
+
+#include "controlled_worker.h"
 
 #define LEGACY_TRACE_VERSION 1U
 #define FD_TRACE_VERSION 2U
@@ -43,9 +42,6 @@
 #define POLL_REVENTS_SENTINEL ((short)0x5a5a)
 #define WORKER_ACTOR 1L
 #define PIPE_BUFFER_BYTES 4096L
-#define PENDING_GUARD_NANOSECONDS UINT64_C(50000000)
-#define COMPLETION_TIMEOUT_NANOSECONDS UINT64_C(5000000000)
-#define WAIT_POLL_NANOSECONDS 1000000L
 
 static const unsigned char trace_magic[8] = {'P', 'I', 'P', 'E', 'O', 'R', 'C', '1'};
 
@@ -119,12 +115,6 @@ enum endpoint_kind {
     ENDPOINT_WRITER,
 };
 
-enum worker_phase {
-    WORKER_IDLE,
-    WORKER_ENTERED,
-    WORKER_COMPLETED,
-};
-
 enum worker_kind {
     WORKER_READ,
     WORKER_WRITE,
@@ -136,8 +126,7 @@ struct pipe_object {
 };
 
 struct worker_state {
-    pthread_t thread;
-    atomic_int phase;
+    struct controlled_worker controller;
     enum worker_kind kind;
     struct operation_result result;
     int active;
@@ -212,7 +201,7 @@ static void close_slots(struct run_context *context)
     memset(context->pipe_objects, 0, sizeof(context->pipe_objects));
     context->pipe_object_count = 0;
     memset(&context->worker, 0, sizeof(context->worker));
-    atomic_init(&context->worker.phase, WORKER_IDLE);
+    controlled_worker_initialize(&context->worker.controller);
 }
 
 static void initialize_slots(struct run_context *context)
@@ -227,7 +216,7 @@ static void initialize_slots(struct run_context *context)
     memset(context->pipe_objects, 0, sizeof(context->pipe_objects));
     context->pipe_object_count = 0;
     memset(&context->worker, 0, sizeof(context->worker));
-    atomic_init(&context->worker.phase, WORKER_IDLE);
+    controlled_worker_initialize(&context->worker.controller);
 }
 
 static char *trim(char *text)
@@ -325,75 +314,6 @@ static void finish_syscall_result(struct operation_result *result, long syscall_
     result->error = syscall_result < 0 ? errno : 0;
 }
 
-static int monotonic_nanoseconds(uint64_t *value)
-{
-    struct timespec now;
-
-    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0 ||
-        now.tv_nsec < 0)
-        return -1;
-    *value = (uint64_t)now.tv_sec * UINT64_C(1000000000) +
-             (uint64_t)now.tv_nsec;
-    return 0;
-}
-
-static int sleep_wait_interval(void)
-{
-    struct timespec delay = {.tv_sec = 0, .tv_nsec = WAIT_POLL_NANOSECONDS};
-
-    while (nanosleep(&delay, &delay) != 0) {
-        if (errno != EINTR)
-            return -1;
-    }
-    return 0;
-}
-
-static int wait_for_worker_phase(struct worker_state *worker, int target,
-                                 uint64_t timeout_nanoseconds)
-{
-    uint64_t started;
-
-    if (monotonic_nanoseconds(&started) != 0)
-        return -1;
-    for (;;) {
-        uint64_t now;
-
-        if (atomic_load_explicit(&worker->phase, memory_order_acquire) >= target)
-            return 0;
-        if (monotonic_nanoseconds(&now) != 0)
-            return -1;
-        if (now - started >= timeout_nanoseconds)
-            return 1;
-        if (sleep_wait_interval() != 0)
-            return -1;
-    }
-}
-
-static int observe_pending_guard(struct worker_state *worker)
-{
-    uint64_t started;
-    int status = wait_for_worker_phase(worker, WORKER_ENTERED,
-                                       COMPLETION_TIMEOUT_NANOSECONDS);
-
-    if (status != 0)
-        return status == 1 ? 2 : -1;
-    if (monotonic_nanoseconds(&started) != 0)
-        return -1;
-    for (;;) {
-        uint64_t now;
-
-        if (atomic_load_explicit(&worker->phase, memory_order_acquire) ==
-            WORKER_COMPLETED)
-            return 1;
-        if (monotonic_nanoseconds(&now) != 0)
-            return -1;
-        if (now - started >= PENDING_GUARD_NANOSECONDS)
-            return 0;
-        if (sleep_wait_interval() != 0)
-            return -1;
-    }
-}
-
 static void *run_worker(void *argument)
 {
     struct worker_state *worker = argument;
@@ -402,8 +322,7 @@ static void *run_worker(void *argument)
 
     if (worker->kind == WORKER_READ) {
         memset(buffer, 0, sizeof(buffer));
-        atomic_store_explicit(&worker->phase, WORKER_ENTERED,
-                              memory_order_release);
+        controlled_worker_publish_entered(&worker->controller);
         errno = 0;
         syscall_result = syscall(SYS_read, worker->fd, buffer,
                                  (size_t)worker->length);
@@ -415,15 +334,13 @@ static void *run_worker(void *argument)
     } else {
         memset(buffer, (unsigned char)worker->byte_value,
                (size_t)worker->length);
-        atomic_store_explicit(&worker->phase, WORKER_ENTERED,
-                              memory_order_release);
+        controlled_worker_publish_entered(&worker->controller);
         errno = 0;
         syscall_result = syscall(SYS_write, worker->fd, buffer,
                                  (size_t)worker->length);
         finish_syscall_result(&worker->result, syscall_result);
     }
-    atomic_store_explicit(&worker->phase, WORKER_COMPLETED,
-                          memory_order_release);
+    controlled_worker_publish_completed(&worker->controller);
     return NULL;
 }
 
@@ -1088,7 +1005,7 @@ static int execute_start_worker(struct run_context *context, char *save,
         return -1;
 
     memset(&context->worker, 0, sizeof(context->worker));
-    atomic_init(&context->worker.phase, WORKER_IDLE);
+    controlled_worker_initialize(&context->worker.controller);
     context->worker.kind = is_write ? WORKER_WRITE : WORKER_READ;
     context->worker.active = 1;
     context->worker.slot = slot;
@@ -1097,8 +1014,8 @@ static int execute_start_worker(struct run_context *context, char *save,
     context->worker.length = length;
     context->worker.byte_value = byte_value;
     context->worker.write_release_remaining = queued;
-    if (pthread_create(&context->worker.thread, NULL, run_worker,
-                       &context->worker) != 0) {
+    if (controlled_worker_start(&context->worker.controller, run_worker,
+                                &context->worker) != CONTROLLED_WORKER_OK) {
         context->worker.active = 0;
         return -2;
     }
@@ -1116,21 +1033,24 @@ static int execute_assert_pending(struct run_context *context, char *save,
 {
     char *actor_text = strtok_r(NULL, " \t", &save);
     long actor;
-    int pending_status;
+    enum controlled_worker_status pending_status;
 
     if (context->corpus_version != BLOCKING_CORPUS_VERSION ||
         parse_long_value(actor_text, WORKER_ACTOR, WORKER_ACTOR, &actor) != 0 ||
         strtok_r(NULL, " \t", &save) != NULL || !context->worker.active ||
         context->worker.completable)
         return -1;
-    pending_status = observe_pending_guard(&context->worker);
-    if (pending_status < 0)
-        return -2;
-    if (pending_status == 2)
+    pending_status =
+        controlled_worker_observe_pending(&context->worker.controller);
+    if (pending_status == CONTROLLED_WORKER_COMPLETION_TIMEOUT)
         return -4;
+    if (pending_status != CONTROLLED_WORKER_OK &&
+        pending_status != CONTROLLED_WORKER_COMPLETED_EARLY)
+        return -2;
     result->kind = OP_ASSERT_PENDING;
-    result->result = pending_status == 1 ? 1 : 0;
-    if (pending_status == 1)
+    result->result =
+        pending_status == CONTROLLED_WORKER_COMPLETED_EARLY ? 1 : 0;
+    if (pending_status == CONTROLLED_WORKER_COMPLETED_EARLY)
         return context->mode == MODE_RECORD ? -3 : 0;
     context->worker.pending_confirmed = 1;
     return 0;
@@ -1141,20 +1061,21 @@ static int execute_join(struct run_context *context, char *save,
 {
     char *actor_text = strtok_r(NULL, " \t", &save);
     long actor;
-    int wait_status;
+    enum controlled_worker_status wait_status;
 
     if (context->corpus_version != BLOCKING_CORPUS_VERSION ||
         parse_long_value(actor_text, WORKER_ACTOR, WORKER_ACTOR, &actor) != 0 ||
         strtok_r(NULL, " \t", &save) != NULL || !context->worker.active ||
         !context->worker.pending_confirmed || !context->worker.completable)
         return -1;
-    wait_status = wait_for_worker_phase(&context->worker, WORKER_COMPLETED,
-                                        COMPLETION_TIMEOUT_NANOSECONDS);
-    if (wait_status < 0)
-        return -2;
-    if (wait_status > 0)
+    wait_status =
+        controlled_worker_wait_for_completion(&context->worker.controller);
+    if (wait_status == CONTROLLED_WORKER_COMPLETION_TIMEOUT)
         return -4;
-    if (pthread_join(context->worker.thread, NULL) != 0)
+    if (wait_status != CONTROLLED_WORKER_OK)
+        return -2;
+    if (controlled_worker_join(&context->worker.controller) !=
+        CONTROLLED_WORKER_OK)
         return -2;
 
     result->kind = OP_JOIN;
