@@ -10,7 +10,9 @@ if str(SCRIPTS_ROOT) not in sys.path:
 
 from linux_oracle.actor import (
     CONTROLLER_ACTOR,
+    WORKER_ACTORS,
     WORKER_ACTOR,
+    ControlledWorkers,
     SingleWorkerLifecycle,
     WorkerLifecycleError,
     WorkerLifecycleErrorKind,
@@ -126,6 +128,117 @@ class SingleWorkerLifecycleTests(unittest.TestCase):
             self.lifecycle.finish_scenario,
             WorkerLifecycleErrorKind.LIFECYCLE,
             "scenario ends with an unfinished worker",
+        )
+
+    def _assert_error(self, action, kind, detail) -> None:
+        with self.assertRaises(WorkerLifecycleError) as raised:
+            action()
+        self.assertIs(raised.exception.kind, kind)
+        self.assertEqual(raised.exception.detail, detail)
+
+
+class ControlledWorkersTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.workers = ControlledWorkers[str, int]()
+
+    def test_two_workers_complete_and_join_as_one_result_vector(self):
+        self.assertEqual(WORKER_ACTORS, (1, 2))
+        self.workers.start(1, "read-a", lambda: 7)
+        self.workers.start(2, "read-b", lambda: 7)
+        self.workers.assert_all_pending()
+        self.workers.update_completable(1, True)
+        self.workers.update_completable(2, True)
+        self.workers.mark_completed(2, 1)
+        self.workers.mark_completed(1, 2)
+        completed = []
+
+        self.workers.join_set((1, 2), lambda calls: completed.extend(calls))
+
+        self.assertEqual(
+            [(call.operation, call.completion_ordinal) for call in completed],
+            [("read-a", 2), ("read-b", 1)],
+        )
+        self.workers.finish_scenario()
+
+    def test_actor_validation_and_independent_lifecycle(self):
+        self._assert_error(
+            lambda: self.workers.start(0, "read", lambda: 7),
+            WorkerLifecycleErrorKind.LIFECYCLE,
+            "worker actor must be 1 or 2",
+        )
+        self.workers.start(1, "read", lambda: 7)
+        self._assert_error(
+            lambda: self.workers.assert_pending(2),
+            WorkerLifecycleErrorKind.LIFECYCLE,
+            "assert-pending actor 2 requires an active worker",
+        )
+
+    def test_grouped_pending_requires_both_workers(self):
+        self.workers.start(1, "read", lambda: 7)
+        self._assert_error(
+            self.workers.assert_all_pending,
+            WorkerLifecycleErrorKind.LIFECYCLE,
+            "assert-all-pending requires active workers 1 and 2",
+        )
+
+    def test_completion_ordinals_are_positive_and_unique(self):
+        for actor in WORKER_ACTORS:
+            self.workers.start(actor, "read", lambda: 7)
+            self.workers.assert_pending(actor)
+            self.workers.update_completable(actor, True)
+        self.workers.mark_completed(1, 1)
+        self._assert_error(
+            lambda: self.workers.mark_completed(2, 1),
+            WorkerLifecycleErrorKind.LIFECYCLE,
+            "completion ordinal 1 is already used",
+        )
+        self._assert_error(
+            lambda: self.workers.mark_completed(2, 0),
+            WorkerLifecycleErrorKind.LIFECYCLE,
+            "completion ordinal must be positive",
+        )
+
+    def test_join_set_is_atomic_on_adapter_failure(self):
+        for actor in WORKER_ACTORS:
+            self.workers.start(actor, "read", lambda: 7)
+            self.workers.assert_pending(actor)
+            self.workers.update_completable(actor, True)
+            self.workers.mark_completed(actor, actor)
+
+        with self.assertRaisesRegex(RuntimeError, "combined transition failed"):
+            self.workers.join_set(
+                (1, 2),
+                lambda _calls: (_ for _ in ()).throw(
+                    RuntimeError("combined transition failed")
+                ),
+            )
+
+        self.assertIsNotNone(self.workers.worker(1))
+        self.assertIsNotNone(self.workers.worker(2))
+
+    def test_join_set_rejects_partial_completion_and_duplicate_actor(self):
+        for actor in WORKER_ACTORS:
+            self.workers.start(actor, "read", lambda: 7)
+            self.workers.assert_pending(actor)
+            self.workers.update_completable(actor, True)
+        self.workers.mark_completed(1, 1)
+        self._assert_error(
+            lambda: self.workers.join_set((1, 2), lambda _calls: None),
+            WorkerLifecycleErrorKind.BLOCKING_PROOF,
+            "worker actor 2 is not completed before grouped join",
+        )
+        self._assert_error(
+            lambda: self.workers.join_set((1, 1), lambda _calls: None),
+            WorkerLifecycleErrorKind.LIFECYCLE,
+            "join-set actors must be unique",
+        )
+
+    def test_unfinished_scenario_lists_active_actors(self):
+        self.workers.start(2, "read", lambda: 7)
+        self._assert_error(
+            self.workers.finish_scenario,
+            WorkerLifecycleErrorKind.LIFECYCLE,
+            "scenario ends with unfinished workers: 2",
         )
 
     def _assert_error(self, action, kind, detail) -> None:

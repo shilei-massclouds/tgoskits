@@ -71,6 +71,11 @@ struct pending_worker {
     atomic_int wake;
 };
 
+struct grouped_workers {
+    struct controlled_workers *controllers;
+    atomic_int wake[CONTROLLED_WORKER_COUNT];
+};
+
 static void reset_failures(void)
 {
     fail_pthread_create = 0;
@@ -99,6 +104,27 @@ static void *run_immediate_worker(void *argument)
     controlled_worker_publish_entered(worker);
     controlled_worker_publish_completed(worker);
     return NULL;
+}
+
+static void *run_grouped_worker(void *argument)
+{
+    struct pending_worker *worker = argument;
+
+    controlled_worker_publish_entered(worker->controller);
+    while (atomic_load_explicit(&worker->wake, memory_order_acquire) == 0)
+        sched_yield();
+    controlled_worker_publish_completed(worker->controller);
+    return NULL;
+}
+
+static int wake_group(void *argument)
+{
+    struct grouped_workers *workers = argument;
+    int index;
+
+    for (index = 0; index < CONTROLLED_WORKER_COUNT; index++)
+        atomic_store_explicit(&workers->wake[index], 1, memory_order_release);
+    return 0;
 }
 
 static int test_pending_wake_join(void)
@@ -178,10 +204,79 @@ static int test_platform_failures(void)
     return 0;
 }
 
+static int test_two_worker_group(void)
+{
+    struct controlled_workers controllers;
+    struct grouped_workers group = {.controllers = &controllers};
+    struct pending_worker arguments[CONTROLLED_WORKER_COUNT];
+    struct controlled_worker *actor1;
+    struct controlled_worker *actor2;
+    int index;
+
+    reset_failures();
+    controlled_workers_initialize(&controllers);
+    for (index = 0; index < CONTROLLED_WORKER_COUNT; index++) {
+        arguments[index].controller = &controllers.slots[index];
+        atomic_init(&arguments[index].wake, 0);
+        atomic_init(&group.wake[index], 0);
+        CHECK(controlled_worker_start(&controllers.slots[index],
+                                      run_grouped_worker,
+                                      &arguments[index]) == CONTROLLED_WORKER_OK);
+    }
+    actor1 = controlled_workers_actor(&controllers, 1);
+    actor2 = controlled_workers_actor(&controllers, 2);
+    CHECK(actor1 == &controllers.slots[0]);
+    CHECK(actor2 == &controllers.slots[1]);
+    CHECK(controlled_workers_actor(&controllers, 0) == NULL);
+    CHECK(controlled_workers_observe_all_pending(&controllers) ==
+          CONTROLLED_WORKER_OK);
+    CHECK(controlled_worker_tid(actor1) > 0);
+    CHECK(controlled_worker_tid(actor2) > 0);
+
+    atomic_store_explicit(&arguments[1].wake, 1, memory_order_release);
+    CHECK(controlled_worker_wait_for_completion(actor2) == CONTROLLED_WORKER_OK);
+    atomic_store_explicit(&arguments[0].wake, 1, memory_order_release);
+    CHECK(controlled_workers_wait_for_all(&controllers) == CONTROLLED_WORKER_OK);
+    CHECK(controlled_worker_completion_ordinal(actor2) == 1U);
+    CHECK(controlled_worker_completion_ordinal(actor1) == 2U);
+    CHECK(controlled_workers_join_all(&controllers) == CONTROLLED_WORKER_OK);
+    return 0;
+}
+
+static int test_group_cleanup_joins_started_workers(void)
+{
+    struct controlled_workers controllers;
+    struct grouped_workers group = {.controllers = &controllers};
+    struct pending_worker arguments[CONTROLLED_WORKER_COUNT];
+    int index;
+
+    reset_failures();
+    controlled_workers_initialize(&controllers);
+    for (index = 0; index < CONTROLLED_WORKER_COUNT; index++) {
+        arguments[index].controller = &controllers.slots[index];
+        atomic_init(&arguments[index].wake, 0);
+        atomic_init(&group.wake[index], 0);
+        CHECK(controlled_worker_start(&controllers.slots[index],
+                                      run_grouped_worker,
+                                      &arguments[index]) == CONTROLLED_WORKER_OK);
+    }
+    CHECK(controlled_workers_observe_all_pending(&controllers) ==
+          CONTROLLED_WORKER_OK);
+    for (index = 0; index < CONTROLLED_WORKER_COUNT; index++)
+        atomic_store_explicit(&arguments[index].wake, 1, memory_order_release);
+    CHECK(controlled_workers_cleanup(&controllers, wake_group, &group) ==
+          CONTROLLED_WORKER_OK);
+    CHECK(controllers.slots[0].started == 0);
+    CHECK(controllers.slots[1].started == 0);
+    return 0;
+}
+
 int main(void)
 {
     if (test_pending_wake_join() != 0 || test_immediate_completion() != 0 ||
-        test_completion_timeout() != 0 || test_platform_failures() != 0)
+        test_completion_timeout() != 0 || test_platform_failures() != 0 ||
+        test_two_worker_group() != 0 ||
+        test_group_cleanup_joins_started_workers() != 0)
         return 1;
     return 0;
 }
