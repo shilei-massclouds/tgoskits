@@ -185,6 +185,15 @@ Admission requires all of the following:
   alternative.
 
 Failure is `host-unstable`; it does not run QEMU and does not enter the corpus.
+
+This policy is an admission heuristic, not a proof that the observed set is
+the complete mathematical support of the scheduler. Without a lower bound on
+an outcome's probability, no finite number of repetitions can prove that a
+rare legal outcome is absent. Controlled entry orders and resource stories
+must therefore witness every branch predicted by the adapter model; larger
+uncontrolled stress runs remain diagnostics for finding missing branches.
+The comparator claims exact membership in the converged, witnessed Linux set,
+not equality of scheduler distributions or formal outcome completeness.
 On success, the recorder writes one canonical aggregate trace atomically. The
 checked aggregate is independently recorded three times and must be
 byte-identical. Elapsed times and pthread identities never enter results.
