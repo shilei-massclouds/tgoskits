@@ -15,11 +15,13 @@ syzkaller program importer, external-source provenance, and opt-in stable-input
 admission on 2026-08-01. Stage 4.2 added lossless pinned `readv`/`writev`
 conversion, report schema v2, and deterministic admission selection on
 2026-08-01 without changing the oracle IR, trace, harness, coverage target, or
-Starry syscall ABI. Stage 4.3 designs an explicit, auditable vector-slice
-projection for mixed programs; its implementation and aggregate acceptance are
-not yet recorded in this design-only change.
-
-Base: `dev-cov2` at `fb399d055`.
+Starry syscall ABI. Stage 4.3 added explicit, auditable vector-slice projection
+for mixed programs on 2026-08-02. Stage 5 added the shared multi-adapter
+framework and eventfd synchronous oracle. Stages 6.1, 6.2a, 6.2b, and 6.3a
+then added controlled eventfd and pipe blocking I/O, extracted their shared
+single-worker lifecycle and pthread harness, and covered eventfd blocking
+`poll(2)`. Stage 6.3b is the current independently designed extension for
+controlled pipe blocking `poll(2)`.
 
 ## Decision
 
@@ -137,7 +139,7 @@ The implementation is complete when all of the following hold:
 
 ## Non-goals
 
-The first implementation deliberately excludes:
+The first synchronous implementation deliberately excludes:
 
 - blocking operations, timing comparisons, scheduler interleavings, multiple
   concurrent writers, and signal-delivery timing;
@@ -168,6 +170,14 @@ The first implementation deliberately excludes:
   fd direction, or source call order during Stage 4.3 projection;
 - changing `pipe.ops` v4, trace v4, the C harness operation set, or the
   `pipe-poll-v4` coverage target for imported programs.
+
+Later independently versioned adapters now cover controlled single-worker pipe
+read/write blocking and eventfd blocking poll without changing those v4
+contracts. Stage 6.3b is limited to one pipe `pollfd`, an infinite timeout, and
+statically controlled `POLLIN`, `POLLOUT`, and final-writer `POLLHUP` wakeups.
+Multiple waiters, fairness, allowed-result sets, signals/`EINTR`, nonnegative
+timeouts, `ppoll`, `epoll`, write-end `POLLERR`, `EPIPE`, and general
+close/lifetime races remain excluded.
 
 ## Alternatives considered
 
@@ -1584,10 +1594,21 @@ independently.
   full-pipe atomic write, and phased slot release. Historical pipe v4 bytes,
   traces, artifacts, persistence, replay, and default CLI behavior remain
   compatible.
-- Stage 6.2b will independently extract the common actor/concurrency machinery
-  from the two stable blocking adapters without changing their behavior.
-  Multiple waiters, fairness, allowed-result sets, signals, poll/epoll wakeup
-  interleavings, and general close competition remain later stages.
+- Stage 6.2b is complete: eventfd and pipe retain their exact accepted corpus,
+  trace, generator, fingerprint, replay, and campaign identities while sharing
+  `SingleWorkerLifecycle` and the controlled pthread harness.
+- Stage 6.3a is complete: the independently versioned eventfd blocking-poll
+  adapter proves one sleeping `poll(2)` waiter is woken for `POLLIN` and
+  `POLLOUT`; historical eventfd adapters remain replayable by exact ID.
+- Stage 6.3b is current: an independently versioned pipe blocking-poll adapter
+  will cover empty-read-end `POLLIN`, full-write-end `POLLOUT`, and
+  final-writer-close `POLLHUP` with one controlled worker. It does not expand
+  into `POLLERR`, `EPIPE`, close races, multiple fds/workers, timeouts,
+  signals, `ppoll`, or `epoll`.
+- Later Stage 6 work may add multiple waiters and fairness, allowed-result
+  sets, signal/`EINTR`, timeout/epoll behavior, and close/lifetime races.
+- Stage 7 returns to evidence- and priority-driven continuous extension after
+  the bounded Stage 6 concurrency slices are accepted.
 - A later stage may also evaluate cross-architecture differential coverage or
   automatic CI regression detection. It must receive separate design evidence,
   must not silently expand the Stage 4.1 allowlist, and must keep the default
