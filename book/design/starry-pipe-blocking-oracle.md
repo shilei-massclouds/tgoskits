@@ -2,11 +2,12 @@
 
 ## Status
 
-Proposed on 2026-08-04. This is the independently reviewable high-risk design
-for Stage 6.2a of the Starry Linux differential-testing roadmap. It introduces
-a bounded pthread concurrency model and a new persistent canonical format.
-Design acceptance, implementation, and runtime acceptance remain separate
-commits.
+Proposed and design-reviewed on 2026-08-04. Implementation and runtime
+acceptance completed on 2026-08-05. This is the independently reviewable
+high-risk design for Stage 6.2a of the Starry Linux differential-testing
+roadmap. It introduces a bounded pthread concurrency model and a new persistent
+canonical format. Design acceptance, implementation, and runtime acceptance
+remain separate commits.
 
 The historical synchronous adapter remains `pipe-v4`. The CLI calls that
 scenario model `simple-single` because every positive-length I/O is statically
@@ -346,6 +347,48 @@ and a 32-QEMU foreground budget. It must persist at least one exactly
 attributed corpus entry and either reduce one entry or prove it already
 minimal. Recovery then runs with zero new batches and a 64-QEMU bound until no
 attribution or minimization task remains.
+
+## Acceptance evidence
+
+Acceptance completed on 2026-08-05 without a StarryOS production change. The
+fixed v5 read and write corpora contain 28 and 16 operations. Each produced
+three consecutive byte-identical host traces, and host compare passed. The
+blocking campaign compared every foreground batch successfully in StarryOS
+x86_64 QEMU. The retained v4 host trace remained byte-identical at 162
+operations with SHA-256
+`76b332079e375fccd16d5f2ff7d2a9b202fd087ed02fe6699ca58fadeb34a497`,
+and its explicit QEMU comparison passed all 162 operations. The retained
+simple eventfd comparison also passed all 107 operations. No semantic
+mismatch, early completion, schedule timeout, harness error, panic, outer
+timeout, or missing coverage was observed.
+
+The serial Python results were 11 common-framework tests, 36 combined eventfd
+tests, and 201 pipe tests with one environment-dependent skip. Python bytecode
+compilation, workspace rustfmt, all 23 targeted `starry-kernel` clippy checks,
+the 39-check raw pipe syscall case, and `git diff --check` passed. Host-only
+pthread atomics were added to the oracle harness; no production wait queue or
+atomic synchronization changed, so additional crate clippy and
+`cargo xtask sync-lint` were not applicable.
+
+The required campaign used `--model blocking --seed 42 --batches 3
+--batch-size 16 --max-qemu 32`. It completed all 48 generated candidates,
+used the complete 32-QEMU foreground budget, and left two resumable background
+tasks rather than exceeding that bound. Bounded recovery with `--batches 0
+--max-qemu 64` completed every attribution and minimization task. A second
+recovery check used zero QEMU launches and reported an active corpus of ten
+entries with `background_pending=0`.
+
+All three attribution jobs completed against their fixed Starry ELF and mapped
+1210 target regions to one representative apiece. Their representative
+digests begin `70b39dacfea8`, `c589926526ef`, and `53caede9b030`; the admitted
+minimized digests are respectively
+`9213098f27d869dbbb9f1a14d7ae47d0c3cfd2e84bc76f47fda04471e26b8724`,
+`8eac1642de145abb9cc5ee1eeb6eaa4edebbb57bb60121fa5f3ccfad88a5f203`,
+and
+`bfabf2bcf5aff1ab9c05116831cf76dd537914c67a74276f05d9b6d4a139f4be`.
+Eight deterministic reduction attempts per job shrank their canonical inputs
+from 562 to 453 bytes, 453 to 413 bytes, and 453 to 419 bytes. All six durable
+jobs finished in `completed` state.
 
 ## Non-goals and rollback
 

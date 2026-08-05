@@ -1576,7 +1576,19 @@ independently.
   162-operation host/QEMU comparison remains compatible. See
   `book/design/starry-eventfd-linux-oracle.md` for the design and acceptance
   evidence.
-- A later stage may evaluate blocking/concurrent scenarios, cross-architecture
-  differential coverage, or automatic CI regression detection. It must receive
-  separate design evidence, must not silently expand the Stage 4.1 allowlist,
-  and must keep the default test path clean.
+- Stage 6.1 is complete: eventfd has a controlled single-worker blocking model,
+  and bounded recovery completed every attribution and minimization task with
+  no pending background work.
+- Stage 6.2a is complete: pipe has an independently versioned controlled
+  blocking model for read wakeup, aliasing, zero-write non-wakeup, EOF,
+  full-pipe atomic write, and phased slot release. Historical pipe v4 bytes,
+  traces, artifacts, persistence, replay, and default CLI behavior remain
+  compatible.
+- Stage 6.2b will independently extract the common actor/concurrency machinery
+  from the two stable blocking adapters without changing their behavior.
+  Multiple waiters, fairness, allowed-result sets, signals, poll/epoll wakeup
+  interleavings, and general close competition remain later stages.
+- A later stage may also evaluate cross-architecture differential coverage or
+  automatic CI regression detection. It must receive separate design evidence,
+  must not silently expand the Stage 4.1 allowlist, and must keep the default
+  test path clean.

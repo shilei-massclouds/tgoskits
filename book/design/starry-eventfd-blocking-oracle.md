@@ -407,18 +407,34 @@ and third productive batches were durably saved as two pending attribution
 jobs when the QEMU budget was exhausted; preserving those resumable jobs rather
 than exceeding the requested budget is the normal campaign policy.
 
-## Rollback and Stage 6.2
+Bounded recovery later ran with `--model blocking --batches 0 --batch-size 16
+--max-qemu 64` and completed both remaining attribution and minimization tasks.
+Batch 2 attributed all 880 target regions to representative
+`322471f800b158e3eaf52d0fa381c92c24645b39622a73636e122794c4d20c13` and
+admitted
+`3c30ee2bcf3d8921122497a05545e77806f25668bf58b4c047563652a659b01f`
+after reducing 788 to 505 bytes in eight attempts. Batch 3 likewise attributed
+880 regions to
+`65d21cb79d047473813f36080333ab72603891d1fca3f21d2e020d0ae0ad72dc`
+and admitted
+`d23993afdea6da8e095ee96dd7429161f131ee0aefba253f13e24886fb279ea3`
+after reducing 966 to 519 bytes in eight attempts. The recovery used 56 QEMU
+launches and ended with ten active corpus entries, no running or pending task,
+and `background_pending=0`.
+
+## Rollback and Stage 6.2 follow-up
 
 Rollback removes the blocking model and stops creating new blocking state. The
 simple model's commands, artifacts, and persistence remain untouched. Existing
 blocking directories are archived or replayed with the matching implementation;
 they are never reinterpreted as `eventfd-v1`.
 
-Stage 6.2 will consider multiple waiters, fairness, pipe blocking and
-`PIPE_BUF` atomicity, allowed-result sets, close/lifetime races, signal/EINTR,
-and poll/epoll wakeup interleavings. Only after the pipe adapter establishes a
-second controlled blocking implementation may actor/barrier/join machinery be
-extracted into `scripts/linux_oracle/`.
+Stage 6.2a subsequently established pipe blocking and `PIPE_BUF` atomicity as
+the second controlled blocking implementation. Stage 6.2b is the separate
+behavior-preserving extraction of actor/barrier/join machinery into
+`scripts/linux_oracle/`. Multiple waiters, fairness, allowed-result sets,
+close/lifetime races, signal/EINTR, and poll/epoll wakeup interleavings remain
+later work.
 
 ## Explicit non-goals
 
