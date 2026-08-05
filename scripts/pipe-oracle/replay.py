@@ -4,6 +4,7 @@ import json
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -13,6 +14,10 @@ from artifact import validate_failure
 from corpus_errors import CorpusValidationError
 from common import build_metadata, save_metadata
 from guest_result import GuestExecutionResult, normalize_guest_execution
+from linux_oracle.failure import load_failure
+from linux_oracle.persistence import PersistentStateError
+from linux_oracle.qemu import run_guest_compare as run_common_guest_compare
+from models import spec_for_common_failure
 from runner import run_guest_compare
 
 
@@ -27,6 +32,7 @@ def main():
                         help="Path to the failure directory")
     parser.add_argument("--refresh-host", action="store_true",
                         help="Re-record the host trace without overwriting original evidence")
+    parser.add_argument("--workspace", type=Path, default=WORKSPACE_ROOT)
     args = parser.parse_args()
 
     failure_dir = args.failure_path.resolve()
@@ -35,12 +41,24 @@ def main():
         sys.exit(1)
 
     try:
+        raw_metadata = json.loads((failure_dir / "metadata.json").read_text())
+        if isinstance(raw_metadata, dict) and "adapter_id" in raw_metadata:
+            _replay_common(
+                failure_dir,
+                args.workspace.resolve(),
+                args.refresh_host,
+            )
+            return
         meta = validate_failure(failure_dir)
     except (
         AssertionError,
         FileNotFoundError,
         json.JSONDecodeError,
         CorpusValidationError,
+        OSError,
+        PersistentStateError,
+        RuntimeError,
+        ValueError,
     ) as e:
         print(f"Validation error: {e}", file=sys.stderr)
         sys.exit(1)
@@ -54,6 +72,48 @@ def main():
         _refresh_host(failure_dir, meta)
     else:
         _replay_guest(failure_dir, meta)
+
+
+def _replay_common(
+    failure_dir: Path,
+    workspace: Path,
+    refresh_host: bool,
+) -> None:
+    spec = spec_for_common_failure(failure_dir)
+    artifact = load_failure(spec, failure_dir)
+    artifact_dir = artifact.path
+    temporary = None
+    try:
+        if refresh_host:
+            temporary = tempfile.TemporaryDirectory()
+            artifact_dir = Path(temporary.name)
+            shutil.copy2(
+                artifact.host_elf_path,
+                artifact_dir / spec.artifacts.host_executable_filename,
+            )
+            shutil.copy2(
+                artifact.scenario_path,
+                artifact_dir / spec.artifacts.scenario_filename,
+            )
+            recorded = spec.host_record(
+                artifact_dir / spec.artifacts.host_executable_filename,
+                artifact_dir / spec.artifacts.scenario_filename,
+                artifact_dir / spec.artifacts.trace_filename,
+            )
+            if not recorded.passed:
+                raise RuntimeError(recorded.log)
+        result = run_common_guest_compare(
+            spec,
+            workspace,
+            artifact_dir,
+            pinned_starry_elf=artifact.starry_elf_path,
+        )
+        print(result.log)
+        if not result.passed:
+            raise RuntimeError(f"{spec.adapter_id} replay failed")
+    finally:
+        if temporary is not None:
+            temporary.cleanup()
 
 
 def _replay_guest(failure_dir: Path, meta: Dict):

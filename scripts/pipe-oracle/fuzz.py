@@ -6,6 +6,7 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional, Sequence
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SCRIPTS_ROOT = SCRIPT_DIR.parent
@@ -43,6 +44,7 @@ from linux_oracle.campaign import CampaignRequest
 from linux_oracle.driver import run_campaign
 from linux_oracle.persistence import PersistentStateError
 from minimization_store import MinimizationStore
+from models import DEFAULT_MODEL, MODEL_NAMES, spec_for_model
 
 
 DEFAULT_SEED = 42
@@ -90,7 +92,7 @@ def _run_campaign(*args, **kwargs):
     return _LEGACY_RUN_CAMPAIGN(*args, **kwargs)
 
 
-def main() -> int:
+def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--batches", type=int, default=DEFAULT_BATCHES)
@@ -99,7 +101,9 @@ def main() -> int:
     parser.add_argument("--max-qemu", type=int, default=64)
     parser.add_argument("--max-minimize", type=int, default=8)
     parser.add_argument("--no-minimize", action="store_true")
-    args = parser.parse_args()
+    parser.add_argument("--model", choices=MODEL_NAMES, default=DEFAULT_MODEL)
+    args = parser.parse_args(argv)
+    spec = spec_for_model(args.model)
     try:
         request = CampaignRequest(
             args.seed,
@@ -110,19 +114,21 @@ def main() -> int:
             not args.no_minimize,
         )
         workspace = args.workspace.resolve()
+        if args.model != DEFAULT_MODEL:
+            return run_campaign(spec, request, workspace)
         legacy_store = CorpusStore(workspace)
         with legacy_store.campaign_lock():
             if _recover_legacy(
                 workspace,
                 legacy_store,
-                shlex.join(sys.argv),
+                shlex.join(sys.argv if argv is None else [str(item) for item in argv]),
                 args.max_qemu,
                 request.minimize_enabled,
             ):
                 return 1
-            return run_campaign(SPEC, request, workspace)
+            return run_campaign(spec, request, workspace)
     except (CorpusStorageError, OSError, PersistentStateError, RuntimeError, ValueError) as error:
-        print(f"{SPEC.adapter_id} campaign failed: {error}", file=sys.stderr)
+        print(f"{spec.adapter_id} campaign failed: {error}", file=sys.stderr)
         return 1
 
 

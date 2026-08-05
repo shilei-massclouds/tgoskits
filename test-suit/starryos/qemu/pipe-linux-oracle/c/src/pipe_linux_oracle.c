@@ -5,8 +5,10 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,17 +16,21 @@
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/utsname.h>
+#include <time.h>
 #include <unistd.h>
 
 #define LEGACY_TRACE_VERSION 1U
 #define FD_TRACE_VERSION 2U
 #define VECTOR_TRACE_VERSION 3U
 #define TRACE_VERSION 4U
+#define BLOCKING_TRACE_VERSION 5U
 #define LEGACY_CORPUS_VERSION 1L
 #define FD_CORPUS_VERSION 2L
 #define VECTOR_CORPUS_VERSION 3L
 #define CORPUS_VERSION 4L
+#define BLOCKING_CORPUS_VERSION 5L
 #define MAX_SLOTS 16
+#define MAX_PIPE_OBJECTS 16
 #define DUP_TARGET_FD_BASE 64
 #define MAX_IO_BYTES 8192
 #define MAX_IOV_SEGMENTS 4
@@ -35,6 +41,11 @@
 #define UNKNOWN_FLAG 0x40000000L
 #define READV_SENTINEL 0xa5U
 #define POLL_REVENTS_SENTINEL ((short)0x5a5a)
+#define WORKER_ACTOR 1L
+#define PIPE_BUFFER_BYTES 4096L
+#define PENDING_GUARD_NANOSECONDS UINT64_C(50000000)
+#define COMPLETION_TIMEOUT_NANOSECONDS UINT64_C(5000000000)
+#define WAIT_POLL_NANOSECONDS 1000000L
 
 static const unsigned char trace_magic[8] = {'P', 'I', 'P', 'E', 'O', 'R', 'C', '1'};
 
@@ -59,6 +70,10 @@ enum operation_kind {
     OP_READV,
     OP_WRITEV,
     OP_POLL_MANY,
+    OP_START_READ,
+    OP_START_WRITE,
+    OP_ASSERT_PENDING,
+    OP_JOIN,
 };
 
 enum operation_difference {
@@ -98,12 +113,55 @@ enum run_mode {
     MODE_COMPARE,
 };
 
+enum endpoint_kind {
+    ENDPOINT_NONE,
+    ENDPOINT_READER,
+    ENDPOINT_WRITER,
+};
+
+enum worker_phase {
+    WORKER_IDLE,
+    WORKER_ENTERED,
+    WORKER_COMPLETED,
+};
+
+enum worker_kind {
+    WORKER_READ,
+    WORKER_WRITE,
+};
+
+struct pipe_object {
+    int readers;
+    int writers;
+};
+
+struct worker_state {
+    pthread_t thread;
+    atomic_int phase;
+    enum worker_kind kind;
+    struct operation_result result;
+    int active;
+    int pending_confirmed;
+    int completable;
+    int slot;
+    int fd;
+    int pipe_object;
+    long length;
+    long byte_value;
+    long write_release_remaining;
+};
+
 struct run_context {
     enum run_mode mode;
     FILE *trace;
     struct trace_header header;
     int slots[MAX_SLOTS];
+    int slot_pipe_objects[MAX_SLOTS];
+    enum endpoint_kind slot_endpoints[MAX_SLOTS];
+    struct pipe_object pipe_objects[MAX_PIPE_OBJECTS];
+    int pipe_object_count;
     long corpus_version;
+    struct worker_state worker;
     uint32_t scenario_index;
     uint32_t operation_index;
 };
@@ -122,6 +180,23 @@ static int fail_line(unsigned int line_number, const char *line, const char *mes
     return 1;
 }
 
+static int fail_schedule_timeout(unsigned int line_number, const char *line)
+{
+    fprintf(stderr,
+            "STARRY_PIPE_LINUX_ORACLE_SCHEDULE_TIMEOUT: line=%u operation=\"%s\"\n",
+            line_number, line);
+    return 1;
+}
+
+static int fail_harness(unsigned int line_number, const char *line,
+                        const char *message)
+{
+    fprintf(stderr,
+            "STARRY_PIPE_LINUX_ORACLE_HARNESS_ERROR: line=%u operation=\"%s\" %s\n",
+            line_number, line, message);
+    return 1;
+}
+
 static void close_slots(struct run_context *context)
 {
     int index;
@@ -130,16 +205,29 @@ static void close_slots(struct run_context *context)
         if (context->slots[index] >= 0) {
             (void)syscall(SYS_close, context->slots[index]);
             context->slots[index] = -1;
+            context->slot_pipe_objects[index] = -1;
+            context->slot_endpoints[index] = ENDPOINT_NONE;
         }
     }
+    memset(context->pipe_objects, 0, sizeof(context->pipe_objects));
+    context->pipe_object_count = 0;
+    memset(&context->worker, 0, sizeof(context->worker));
+    atomic_init(&context->worker.phase, WORKER_IDLE);
 }
 
 static void initialize_slots(struct run_context *context)
 {
     int index;
 
-    for (index = 0; index < MAX_SLOTS; index++)
+    for (index = 0; index < MAX_SLOTS; index++) {
         context->slots[index] = -1;
+        context->slot_pipe_objects[index] = -1;
+        context->slot_endpoints[index] = ENDPOINT_NONE;
+    }
+    memset(context->pipe_objects, 0, sizeof(context->pipe_objects));
+    context->pipe_object_count = 0;
+    memset(&context->worker, 0, sizeof(context->worker));
+    atomic_init(&context->worker.phase, WORKER_IDLE);
 }
 
 static char *trim(char *text)
@@ -237,11 +325,169 @@ static void finish_syscall_result(struct operation_result *result, long syscall_
     result->error = syscall_result < 0 ? errno : 0;
 }
 
+static int monotonic_nanoseconds(uint64_t *value)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0 ||
+        now.tv_nsec < 0)
+        return -1;
+    *value = (uint64_t)now.tv_sec * UINT64_C(1000000000) +
+             (uint64_t)now.tv_nsec;
+    return 0;
+}
+
+static int sleep_wait_interval(void)
+{
+    struct timespec delay = {.tv_sec = 0, .tv_nsec = WAIT_POLL_NANOSECONDS};
+
+    while (nanosleep(&delay, &delay) != 0) {
+        if (errno != EINTR)
+            return -1;
+    }
+    return 0;
+}
+
+static int wait_for_worker_phase(struct worker_state *worker, int target,
+                                 uint64_t timeout_nanoseconds)
+{
+    uint64_t started;
+
+    if (monotonic_nanoseconds(&started) != 0)
+        return -1;
+    for (;;) {
+        uint64_t now;
+
+        if (atomic_load_explicit(&worker->phase, memory_order_acquire) >= target)
+            return 0;
+        if (monotonic_nanoseconds(&now) != 0)
+            return -1;
+        if (now - started >= timeout_nanoseconds)
+            return 1;
+        if (sleep_wait_interval() != 0)
+            return -1;
+    }
+}
+
+static int observe_pending_guard(struct worker_state *worker)
+{
+    uint64_t started;
+    int status = wait_for_worker_phase(worker, WORKER_ENTERED,
+                                       COMPLETION_TIMEOUT_NANOSECONDS);
+
+    if (status != 0)
+        return status == 1 ? 2 : -1;
+    if (monotonic_nanoseconds(&started) != 0)
+        return -1;
+    for (;;) {
+        uint64_t now;
+
+        if (atomic_load_explicit(&worker->phase, memory_order_acquire) ==
+            WORKER_COMPLETED)
+            return 1;
+        if (monotonic_nanoseconds(&now) != 0)
+            return -1;
+        if (now - started >= PENDING_GUARD_NANOSECONDS)
+            return 0;
+        if (sleep_wait_interval() != 0)
+            return -1;
+    }
+}
+
+static void *run_worker(void *argument)
+{
+    struct worker_state *worker = argument;
+    unsigned char buffer[MAX_IO_BYTES];
+    long syscall_result;
+
+    if (worker->kind == WORKER_READ) {
+        memset(buffer, 0, sizeof(buffer));
+        atomic_store_explicit(&worker->phase, WORKER_ENTERED,
+                              memory_order_release);
+        errno = 0;
+        syscall_result = syscall(SYS_read, worker->fd, buffer,
+                                 (size_t)worker->length);
+        finish_syscall_result(&worker->result, syscall_result);
+        if (syscall_result > 0) {
+            worker->result.data_len = (uint32_t)syscall_result;
+            memcpy(worker->result.data, buffer, (size_t)syscall_result);
+        }
+    } else {
+        memset(buffer, (unsigned char)worker->byte_value,
+               (size_t)worker->length);
+        atomic_store_explicit(&worker->phase, WORKER_ENTERED,
+                              memory_order_release);
+        errno = 0;
+        syscall_result = syscall(SYS_write, worker->fd, buffer,
+                                 (size_t)worker->length);
+        finish_syscall_result(&worker->result, syscall_result);
+    }
+    atomic_store_explicit(&worker->phase, WORKER_COMPLETED,
+                          memory_order_release);
+    return NULL;
+}
+
 static int destination_fd(const struct run_context *context, int slot)
 {
     if (context->slots[slot] >= 0)
         return context->slots[slot];
     return DUP_TARGET_FD_BASE + slot;
+}
+
+static void release_slot_metadata(struct run_context *context, int slot)
+{
+    int object_index = context->slot_pipe_objects[slot];
+
+    if (object_index >= 0) {
+        struct pipe_object *object = &context->pipe_objects[object_index];
+
+        if (context->slot_endpoints[slot] == ENDPOINT_READER)
+            object->readers--;
+        else if (context->slot_endpoints[slot] == ENDPOINT_WRITER)
+            object->writers--;
+    }
+    context->slot_pipe_objects[slot] = -1;
+    context->slot_endpoints[slot] = ENDPOINT_NONE;
+}
+
+static void duplicate_slot_metadata(struct run_context *context, int source,
+                                    int destination)
+{
+    int object_index = context->slot_pipe_objects[source];
+
+    context->slot_pipe_objects[destination] = object_index;
+    context->slot_endpoints[destination] = context->slot_endpoints[source];
+    if (object_index >= 0) {
+        struct pipe_object *object = &context->pipe_objects[object_index];
+
+        if (context->slot_endpoints[source] == ENDPOINT_READER)
+            object->readers++;
+        else if (context->slot_endpoints[source] == ENDPOINT_WRITER)
+            object->writers++;
+    }
+}
+
+static int pipe_queued_bytes(int fd, long *queued)
+{
+    int value = -1;
+
+    errno = 0;
+    if (syscall(SYS_ioctl, fd, FIONREAD, &value) != 0 || value < 0)
+        return -1;
+    *queued = value;
+    return 0;
+}
+
+static int pipe_capacity(int fd, long *capacity)
+{
+    long value;
+
+    errno = 0;
+    value = syscall(SYS_fcntl, fd, F_GETPIPE_SZ, 0);
+    if (value <= 0)
+        return -1;
+    *capacity = value;
+    return 0;
 }
 
 static int positive_io_is_nonblocking(const struct run_context *context, int slot,
@@ -254,6 +500,61 @@ static int positive_io_is_nonblocking(const struct run_context *context, int slo
     errno = 0;
     flags = syscall(SYS_fcntl, context->slots[slot], F_GETFL, 0);
     return flags < 0 || (flags & O_NONBLOCK) != 0;
+}
+
+static int blocking_read_is_ready(const struct run_context *context, int slot,
+                                  long length)
+{
+    int object_index = context->slot_pipe_objects[slot];
+    long queued;
+
+    if (context->corpus_version != BLOCKING_CORPUS_VERSION || length <= 0 ||
+        object_index < 0 || context->slot_endpoints[slot] != ENDPOINT_READER ||
+        pipe_queued_bytes(context->slots[slot], &queued) != 0)
+        return 0;
+    return queued > 0 || context->pipe_objects[object_index].writers == 0;
+}
+
+static int blocking_write_is_ready(const struct run_context *context, int slot,
+                                   long length)
+{
+    int object_index = context->slot_pipe_objects[slot];
+    long queued;
+    long capacity;
+
+    if (context->corpus_version != BLOCKING_CORPUS_VERSION || length <= 0 ||
+        length > PIPE_BUFFER_BYTES || object_index < 0 ||
+        context->slot_endpoints[slot] != ENDPOINT_WRITER ||
+        context->pipe_objects[object_index].readers == 0 ||
+        pipe_queued_bytes(context->slots[slot], &queued) != 0 ||
+        pipe_capacity(context->slots[slot], &capacity) != 0)
+        return 0;
+    /* v5 setup writes deliberately start from an empty pipe.  Keeping that
+     * invariant here avoids admitting fragmented raw corpora that the model
+     * cannot prove have an immediately available pipe-buffer record. */
+    return queued == 0 && length <= capacity;
+}
+
+static int valid_controller_read(const struct run_context *context, int slot,
+                                 long length)
+{
+    return context->worker.active && context->worker.pending_confirmed &&
+           !context->worker.completable &&
+           context->worker.kind == WORKER_WRITE && length > 0 &&
+           context->slots[slot] >= 0 &&
+           context->slot_pipe_objects[slot] == context->worker.pipe_object &&
+           context->slot_endpoints[slot] == ENDPOINT_READER;
+}
+
+static int valid_controller_write(const struct run_context *context, int slot,
+                                  long length)
+{
+    return context->worker.active && context->worker.pending_confirmed &&
+           !context->worker.completable &&
+           context->worker.kind == WORKER_READ && length >= 0 &&
+           length <= PIPE_BUFFER_BYTES && context->slots[slot] >= 0 &&
+           context->slot_pipe_objects[slot] == context->worker.pipe_object &&
+           context->slot_endpoints[slot] == ENDPOINT_WRITER;
 }
 
 static int positive_vector_io_is_nonblocking(const struct run_context *context,
@@ -317,6 +618,20 @@ static int execute_pipe2(struct run_context *context, char *save,
         }
         context->slots[read_slot] = pipe_fds[0];
         context->slots[write_slot] = pipe_fds[1];
+        if (context->pipe_object_count >= MAX_PIPE_OBJECTS) {
+            (void)syscall(SYS_close, pipe_fds[0]);
+            (void)syscall(SYS_close, pipe_fds[1]);
+            context->slots[read_slot] = -1;
+            context->slots[write_slot] = -1;
+            return -1;
+        }
+        context->slot_pipe_objects[read_slot] = context->pipe_object_count;
+        context->slot_pipe_objects[write_slot] = context->pipe_object_count;
+        context->slot_endpoints[read_slot] = ENDPOINT_READER;
+        context->slot_endpoints[write_slot] = ENDPOINT_WRITER;
+        context->pipe_objects[context->pipe_object_count].readers = 1;
+        context->pipe_objects[context->pipe_object_count].writers = 1;
+        context->pipe_object_count++;
     }
     result->kind = OP_PIPE2;
     return 0;
@@ -335,7 +650,10 @@ static int execute_read(struct run_context *context, char *save,
     if (parse_slot(slot_text, &slot) != 0 ||
         parse_long_value(length_text, 0, MAX_IO_BYTES, &length) != 0 ||
         strtok_r(NULL, " \t", &save) != NULL ||
-        !positive_io_is_nonblocking(context, slot, length))
+        !(context->worker.active
+              ? valid_controller_read(context, slot, length)
+              : (positive_io_is_nonblocking(context, slot, length) ||
+                 blocking_read_is_ready(context, slot, length))))
         return -1;
 
     memset(buffer, 0, sizeof(buffer));
@@ -345,6 +663,11 @@ static int execute_read(struct run_context *context, char *save,
     if (syscall_result > 0) {
         result->data_len = (uint32_t)syscall_result;
         memcpy(result->data, buffer, (size_t)syscall_result);
+        if (context->worker.active) {
+            context->worker.write_release_remaining -= syscall_result;
+            if (context->worker.write_release_remaining <= 0)
+                context->worker.completable = 1;
+        }
     }
     result->kind = OP_READ;
     return 0;
@@ -384,13 +707,18 @@ static int execute_write(struct run_context *context, char *save,
         parse_long_value(length_text, 0, MAX_IO_BYTES, &length) != 0 ||
         parse_long_value(byte_text, 0, UCHAR_MAX, &byte_value) != 0 ||
         strtok_r(NULL, " \t", &save) != NULL ||
-        !positive_io_is_nonblocking(context, slot, length))
+        !(context->worker.active
+              ? valid_controller_write(context, slot, length)
+              : (positive_io_is_nonblocking(context, slot, length) ||
+                 blocking_write_is_ready(context, slot, length))))
         return -1;
 
     memset(buffer, (unsigned char)byte_value, (size_t)length);
     errno = 0;
     syscall_result = syscall(SYS_write, context->slots[slot], buffer, (size_t)length);
     finish_syscall_result(result, syscall_result);
+    if (context->worker.active && syscall_result > 0)
+        context->worker.completable = 1;
     result->kind = OP_WRITE;
     return 0;
 }
@@ -490,8 +818,10 @@ static int execute_dup(struct run_context *context, char *save,
     errno = 0;
     syscall_result = syscall(SYS_dup, context->slots[source]);
     finish_syscall_result(result, syscall_result < 0 ? syscall_result : 0);
-    if (syscall_result >= 0)
+    if (syscall_result >= 0) {
         context->slots[destination] = (int)syscall_result;
+        duplicate_slot_metadata(context, source, destination);
+    }
     result->kind = OP_DUP;
     return 0;
 }
@@ -522,8 +852,13 @@ static int execute_dup_to(struct run_context *context, char *save,
                                    (int)flags)
                          : syscall(SYS_dup2, context->slots[source], target_fd);
     finish_syscall_result(result, syscall_result < 0 ? syscall_result : 0);
-    if (syscall_result >= 0)
+    if (syscall_result >= 0) {
+        if (source != destination) {
+            release_slot_metadata(context, destination);
+            duplicate_slot_metadata(context, source, destination);
+        }
         context->slots[destination] = (int)syscall_result;
+    }
     result->kind = use_dup3 ? OP_DUP3 : OP_DUP2;
     return 0;
 }
@@ -533,16 +868,30 @@ static int execute_close(struct run_context *context, char *save,
 {
     char *slot_text = strtok_r(NULL, " \t", &save);
     int slot;
+    long queued = 0;
     long syscall_result;
 
     if (parse_slot(slot_text, &slot) != 0 || strtok_r(NULL, " \t", &save) != NULL)
         return -1;
+    if (context->worker.active) {
+        if (!context->worker.pending_confirmed || context->worker.completable ||
+            context->worker.kind != WORKER_READ ||
+            context->slot_pipe_objects[slot] != context->worker.pipe_object ||
+            context->slot_endpoints[slot] != ENDPOINT_WRITER ||
+            context->pipe_objects[context->worker.pipe_object].writers != 1 ||
+            pipe_queued_bytes(context->slots[slot], &queued) != 0 || queued != 0)
+            return -1;
+    }
 
     errno = 0;
     syscall_result = syscall(SYS_close, context->slots[slot]);
     finish_syscall_result(result, syscall_result);
-    if (syscall_result == 0)
+    if (syscall_result == 0) {
+        release_slot_metadata(context, slot);
         context->slots[slot] = -1;
+        if (context->worker.active)
+            context->worker.completable = 1;
+    }
     result->kind = OP_CLOSE;
     return 0;
 }
@@ -695,11 +1044,166 @@ static int execute_fionread(struct run_context *context, char *save,
     return 0;
 }
 
+static int execute_start_worker(struct run_context *context, char *save,
+                                struct operation_result *result, int is_write)
+{
+    char *actor_text = strtok_r(NULL, " \t", &save);
+    char *slot_text = strtok_r(NULL, " \t", &save);
+    char *length_text = strtok_r(NULL, " \t", &save);
+    char *byte_text = is_write ? strtok_r(NULL, " \t", &save) : NULL;
+    int object_index;
+    int slot;
+    long actor;
+    long byte_value = 0;
+    long capacity = 0;
+    long flags;
+    long length;
+    long queued;
+
+    if (context->corpus_version != BLOCKING_CORPUS_VERSION ||
+        parse_long_value(actor_text, WORKER_ACTOR, WORKER_ACTOR, &actor) != 0 ||
+        parse_slot(slot_text, &slot) != 0 ||
+        parse_long_value(length_text, 1,
+                         is_write ? PIPE_BUFFER_BYTES : MAX_IO_BYTES,
+                         &length) != 0 ||
+        (is_write &&
+         parse_long_value(byte_text, 0, UCHAR_MAX, &byte_value) != 0) ||
+        strtok_r(NULL, " \t", &save) != NULL || context->worker.active ||
+        context->slots[slot] < 0 || context->slot_pipe_objects[slot] < 0)
+        return -1;
+    object_index = context->slot_pipe_objects[slot];
+    errno = 0;
+    flags = syscall(SYS_fcntl, context->slots[slot], F_GETFL, 0);
+    if (flags < 0 || (flags & O_NONBLOCK) != 0 ||
+        pipe_queued_bytes(context->slots[slot], &queued) != 0)
+        return -1;
+    if ((!is_write &&
+         (context->slot_endpoints[slot] != ENDPOINT_READER || queued != 0 ||
+          context->pipe_objects[object_index].writers == 0)) ||
+        (is_write &&
+         (context->slot_endpoints[slot] != ENDPOINT_WRITER ||
+          context->pipe_objects[object_index].readers == 0 ||
+          pipe_capacity(context->slots[slot], &capacity) != 0 ||
+          capacity != PIPE_BUFFER_BYTES || queued != capacity)))
+        return -1;
+
+    memset(&context->worker, 0, sizeof(context->worker));
+    atomic_init(&context->worker.phase, WORKER_IDLE);
+    context->worker.kind = is_write ? WORKER_WRITE : WORKER_READ;
+    context->worker.active = 1;
+    context->worker.slot = slot;
+    context->worker.fd = context->slots[slot];
+    context->worker.pipe_object = object_index;
+    context->worker.length = length;
+    context->worker.byte_value = byte_value;
+    context->worker.write_release_remaining = queued;
+    if (pthread_create(&context->worker.thread, NULL, run_worker,
+                       &context->worker) != 0) {
+        context->worker.active = 0;
+        return -2;
+    }
+    result->kind = is_write ? OP_START_WRITE : OP_START_READ;
+    result->value = length;
+    if (is_write) {
+        result->data_len = 1;
+        result->data[0] = (unsigned char)byte_value;
+    }
+    return 0;
+}
+
+static int execute_assert_pending(struct run_context *context, char *save,
+                                  struct operation_result *result)
+{
+    char *actor_text = strtok_r(NULL, " \t", &save);
+    long actor;
+    int pending_status;
+
+    if (context->corpus_version != BLOCKING_CORPUS_VERSION ||
+        parse_long_value(actor_text, WORKER_ACTOR, WORKER_ACTOR, &actor) != 0 ||
+        strtok_r(NULL, " \t", &save) != NULL || !context->worker.active ||
+        context->worker.completable)
+        return -1;
+    pending_status = observe_pending_guard(&context->worker);
+    if (pending_status < 0)
+        return -2;
+    if (pending_status == 2)
+        return -4;
+    result->kind = OP_ASSERT_PENDING;
+    result->result = pending_status == 1 ? 1 : 0;
+    if (pending_status == 1)
+        return context->mode == MODE_RECORD ? -3 : 0;
+    context->worker.pending_confirmed = 1;
+    return 0;
+}
+
+static int execute_join(struct run_context *context, char *save,
+                        struct operation_result *result)
+{
+    char *actor_text = strtok_r(NULL, " \t", &save);
+    long actor;
+    int wait_status;
+
+    if (context->corpus_version != BLOCKING_CORPUS_VERSION ||
+        parse_long_value(actor_text, WORKER_ACTOR, WORKER_ACTOR, &actor) != 0 ||
+        strtok_r(NULL, " \t", &save) != NULL || !context->worker.active ||
+        !context->worker.pending_confirmed || !context->worker.completable)
+        return -1;
+    wait_status = wait_for_worker_phase(&context->worker, WORKER_COMPLETED,
+                                        COMPLETION_TIMEOUT_NANOSECONDS);
+    if (wait_status < 0)
+        return -2;
+    if (wait_status > 0)
+        return -4;
+    if (pthread_join(context->worker.thread, NULL) != 0)
+        return -2;
+
+    result->kind = OP_JOIN;
+    result->result = context->worker.result.result;
+    result->error = context->worker.result.error;
+    result->value = context->worker.result.value;
+    result->data_len = context->worker.result.data_len;
+    memcpy(result->data, context->worker.result.data, sizeof(result->data));
+    context->worker.active = 0;
+    return 0;
+}
+
 static int execute_operation(struct run_context *context, char *line,
                              struct operation_result *result)
 {
     char *save = NULL;
     char *operation = strtok_r(line, " \t", &save);
+
+    if (context->corpus_version == BLOCKING_CORPUS_VERSION &&
+        strcmp(operation, "pipe2") != 0 && strcmp(operation, "read") != 0 &&
+        strcmp(operation, "write") != 0 && strcmp(operation, "dup") != 0 &&
+        strcmp(operation, "close") != 0 &&
+        strcmp(operation, "set-size") != 0 &&
+        strcmp(operation, "get-size") != 0 &&
+        strcmp(operation, "fionread") != 0 &&
+        strcmp(operation, "get-status-flags") != 0 &&
+        strcmp(operation, "set-status-flags") != 0 &&
+        strcmp(operation, "get-fd-flags") != 0 &&
+        strcmp(operation, "set-fd-flags") != 0 &&
+        strcmp(operation, "start-read") != 0 &&
+        strcmp(operation, "start-write") != 0 &&
+        strcmp(operation, "assert-pending") != 0 &&
+        strcmp(operation, "join") != 0)
+        return -1;
+
+    if (context->worker.active && strcmp(operation, "read") != 0 &&
+        strcmp(operation, "write") != 0 && strcmp(operation, "close") != 0 &&
+        strcmp(operation, "assert-pending") != 0 &&
+        strcmp(operation, "join") != 0)
+        return -1;
+
+    if (strcmp(operation, "start-read") == 0)
+        return execute_start_worker(context, save, result, 0);
+    if (strcmp(operation, "start-write") == 0)
+        return execute_start_worker(context, save, result, 1);
+    if (strcmp(operation, "assert-pending") == 0)
+        return execute_assert_pending(context, save, result);
+    if (strcmp(operation, "join") == 0)
+        return execute_join(context, save, result);
 
     if (strcmp(operation, "pipe2") == 0)
         return execute_pipe2(context, save, result);
@@ -805,11 +1309,21 @@ static int process_operation(struct run_context *context, char *parse_line,
                              const char *display_line, unsigned int line_number)
 {
     struct operation_result result;
+    int execution_status;
 
     memset(&result, 0, sizeof(result));
     result.scenario_index = context->scenario_index;
     result.operation_index = context->operation_index;
-    if (execute_operation(context, parse_line, &result) != 0)
+    execution_status = execute_operation(context, parse_line, &result);
+    if (execution_status == -2)
+        return fail_harness(line_number, display_line,
+                            "thread or monotonic-clock operation failed");
+    if (execution_status == -3)
+        return fail_line(line_number, display_line,
+                         "worker completed before pending guard");
+    if (execution_status == -4)
+        return fail_schedule_timeout(line_number, display_line);
+    if (execution_status != 0)
         return fail_line(line_number, display_line, "invalid operation");
 
     if (context->mode == MODE_RECORD) {
@@ -859,7 +1373,7 @@ static int process_corpus(struct run_context *context, const char *corpus_path)
 
             if (saw_version || saw_scenario ||
                 parse_long_value(trim(line + 8), LEGACY_CORPUS_VERSION,
-                                 CORPUS_VERSION,
+                                 BLOCKING_CORPUS_VERSION,
                                  &version) != 0) {
                 status = fail_line(line_number, display_line, "invalid corpus version");
                 break;
@@ -873,7 +1387,8 @@ static int process_corpus(struct run_context *context, const char *corpus_path)
             char *name = trim(line + 9);
 
             if (!saw_version || *name == '\0' || strchr(name, ' ') != NULL ||
-                strchr(name, '\t') != NULL) {
+                strchr(name, '\t') != NULL ||
+                (saw_scenario && context->worker.active)) {
                 status = fail_line(line_number, display_line, "invalid scenario");
                 break;
             }
@@ -897,6 +1412,8 @@ static int process_corpus(struct run_context *context, const char *corpus_path)
         status = fail("cannot read operation corpus");
     if ((!saw_version || !saw_scenario || context->operation_index == 0U) && status == 0)
         status = fail("operation corpus is incomplete");
+    if (context->worker.active && status == 0)
+        status = fail("scenario ends with an unfinished worker");
     close_slots(context);
     if (fclose(corpus) != 0 && status == 0)
         status = fail("cannot close operation corpus");
@@ -975,6 +1492,9 @@ static int record_trace(const char *corpus_path, const char *trace_path,
 
     status = process_corpus(&context, corpus_path);
     context.header.record_count = context.operation_index;
+    context.header.version = context.corpus_version == BLOCKING_CORPUS_VERSION
+                                 ? BLOCKING_TRACE_VERSION
+                                 : TRACE_VERSION;
     if (status == 0 &&
         (fseek(context.trace, 0L, SEEK_SET) != 0 ||
          fwrite(&context.header, sizeof(context.header), 1, context.trace) != 1 ||
@@ -1009,7 +1529,8 @@ static int compare_trace(const char *corpus_path, const char *trace_path,
         (context.header.version != LEGACY_TRACE_VERSION &&
          context.header.version != FD_TRACE_VERSION &&
          context.header.version != VECTOR_TRACE_VERSION &&
-         context.header.version != TRACE_VERSION) ||
+         context.header.version != TRACE_VERSION &&
+         context.header.version != BLOCKING_TRACE_VERSION) ||
         context.header.corpus_digest != corpus_digest) {
         fclose(context.trace);
         return fail("invalid expected trace header or corpus digest");
@@ -1029,6 +1550,9 @@ static int compare_trace(const char *corpus_path, const char *trace_path,
     if (status == 0 && context.corpus_version == CORPUS_VERSION &&
         context.header.version != TRACE_VERSION)
         status = fail("version-4 corpus requires a version-4 trace");
+    if (status == 0 && context.corpus_version == BLOCKING_CORPUS_VERSION &&
+        context.header.version != BLOCKING_TRACE_VERSION)
+        status = fail("version-5 corpus requires a version-5 trace");
     if (status == 0 && context.operation_index != context.header.record_count)
         status = fail("expected trace operation count does not match corpus");
     if (status == 0 && fread(&trailing_byte, 1, 1, context.trace) != 0U)

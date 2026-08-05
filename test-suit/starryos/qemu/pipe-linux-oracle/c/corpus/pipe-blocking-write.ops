@@ -1,0 +1,19 @@
+version 5
+scenario generated-0001
+pipe2 10 11 0
+set-size 11 4096
+write 11 4096 85
+start-write 1 11 16 170
+assert-pending 1
+read 10 4096
+join 1
+scenario generated-0002
+pipe2 12 13 0
+set-size 13 4096
+write 13 4096 170
+start-write 1 13 1 85
+assert-pending 1
+read 12 1
+assert-pending 1
+read 12 4095
+join 1

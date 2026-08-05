@@ -25,6 +25,13 @@ _OPERATION_KINDS = {
     "set-fd-flags": 15,
     "dup2": 16,
     "dup3": 17,
+    "readv": 18,
+    "writev": 19,
+    "poll-many": 20,
+    "start-read": 21,
+    "start-write": 22,
+    "assert-pending": 23,
+    "join": 24,
 }
 _DIFFERENCE_FIELDS = ("result", "errno", "value", "data_len", "data")
 _RESULT_CLASSES = {"error", "zero", "positive"}

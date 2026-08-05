@@ -1,0 +1,33 @@
+version 5
+scenario generated-0001
+pipe2 0 1 0
+start-read 1 0 4
+assert-pending 1
+write 1 4 65
+join 1
+scenario generated-0002
+pipe2 2 3 2048
+dup 2 4
+dup 3 5
+set-status-flags 4 0
+set-status-flags 5 0
+get-status-flags 2
+get-status-flags 3
+start-read 1 4 3
+assert-pending 1
+write 5 3 66
+join 1
+scenario generated-0003
+pipe2 6 7 0
+start-read 1 6 1
+assert-pending 1
+write 7 0 67
+assert-pending 1
+write 7 1 68
+join 1
+scenario generated-0004
+pipe2 8 9 0
+start-read 1 8 8
+assert-pending 1
+close 9
+join 1
