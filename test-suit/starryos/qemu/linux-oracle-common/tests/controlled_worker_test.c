@@ -211,6 +211,7 @@ static int test_two_worker_group(void)
     struct pending_worker arguments[CONTROLLED_WORKER_COUNT];
     struct controlled_worker *actor1;
     struct controlled_worker *actor2;
+    int completed_actor;
     int index;
 
     reset_failures();
@@ -234,8 +235,14 @@ static int test_two_worker_group(void)
     CHECK(controlled_worker_tid(actor2) > 0);
 
     atomic_store_explicit(&arguments[1].wake, 1, memory_order_release);
-    CHECK(controlled_worker_wait_for_completion(actor2) == CONTROLLED_WORKER_OK);
+    CHECK(controlled_workers_wait_for_next(&controllers, 0, &completed_actor) ==
+          CONTROLLED_WORKER_OK);
+    CHECK(completed_actor == 2);
     atomic_store_explicit(&arguments[0].wake, 1, memory_order_release);
+    CHECK(controlled_workers_wait_for_next(&controllers, 1U << 1,
+                                           &completed_actor) ==
+          CONTROLLED_WORKER_OK);
+    CHECK(completed_actor == 1);
     CHECK(controlled_workers_wait_for_all(&controllers) == CONTROLLED_WORKER_OK);
     CHECK(controlled_worker_completion_ordinal(actor2) == 1U);
     CHECK(controlled_worker_completion_ordinal(actor1) == 2U);

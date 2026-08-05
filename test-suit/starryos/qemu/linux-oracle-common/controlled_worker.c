@@ -230,6 +230,46 @@ controlled_workers_wait_for_all(struct controlled_workers *workers)
 }
 
 enum controlled_worker_status
+controlled_workers_wait_for_next(struct controlled_workers *workers,
+                                 unsigned int completed_actor_mask,
+                                 int *completed_actor)
+{
+    enum controlled_worker_status status;
+    uint64_t started;
+
+    if (completed_actor == NULL)
+        return CONTROLLED_WORKER_PTHREAD_ERROR;
+    status = monotonic_nanoseconds(&started);
+    if (status != CONTROLLED_WORKER_OK)
+        return status;
+    for (;;) {
+        uint64_t now;
+        int index;
+
+        for (index = 0; index < CONTROLLED_WORKER_COUNT; index++) {
+            unsigned int actor_mask = 1U << index;
+
+            if ((completed_actor_mask & actor_mask) == 0 &&
+                workers->slots[index].started &&
+                atomic_load_explicit(&workers->slots[index].phase,
+                                     memory_order_acquire) ==
+                    CONTROLLED_WORKER_COMPLETED) {
+                *completed_actor = index + 1;
+                return CONTROLLED_WORKER_OK;
+            }
+        }
+        status = monotonic_nanoseconds(&now);
+        if (status != CONTROLLED_WORKER_OK)
+            return status;
+        if (now - started >= COMPLETION_TIMEOUT_NANOSECONDS)
+            return CONTROLLED_WORKER_COMPLETION_TIMEOUT;
+        status = sleep_wait_interval();
+        if (status != CONTROLLED_WORKER_OK)
+            return status;
+    }
+}
+
+enum controlled_worker_status
 controlled_workers_join_all(struct controlled_workers *workers)
 {
     enum controlled_worker_status result = CONTROLLED_WORKER_OK;

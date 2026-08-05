@@ -4,20 +4,27 @@ from pathlib import Path
 
 import adapter
 import blocking_adapter
+import concurrent_adapter
 import poll_adapter
 from linux_oracle.persistence import PersistentStateError, read_json
 
 
 DEFAULT_MODEL = "simple-single"
-MODEL_NAMES = (DEFAULT_MODEL, "blocking")
+MODEL_NAMES = (DEFAULT_MODEL, "blocking", "concurrent")
 DEFAULT_SPEC = adapter.SPEC
 _BY_MODEL = {
     DEFAULT_MODEL: adapter.SPEC,
     "blocking": poll_adapter.SPEC,
+    "concurrent": concurrent_adapter.SPEC,
 }
 _BY_ADAPTER_ID = {
     spec.adapter_id: spec
-    for spec in (adapter.SPEC, blocking_adapter.SPEC, poll_adapter.SPEC)
+    for spec in (
+        adapter.SPEC,
+        blocking_adapter.SPEC,
+        poll_adapter.SPEC,
+        concurrent_adapter.SPEC,
+    )
 }
 
 

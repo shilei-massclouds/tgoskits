@@ -14,10 +14,12 @@
 #include <unistd.h>
 
 #include "controlled_worker.h"
+#include "eventfd_concurrent_oracle.h"
 
 #define SIMPLE_CORPUS_VERSION 1L
 #define BLOCKING_CORPUS_VERSION 2L
 #define POLL_CORPUS_VERSION 3L
+#define CONCURRENT_CORPUS_VERSION 4L
 #define MAX_SLOTS 16
 #define MAX_OBJECTS 32
 #define MAX_IO_BYTES 16
@@ -1099,7 +1101,7 @@ static int read_corpus_version(const char *path, long *version)
             continue;
         if (strncmp(line, "version ", 8) == 0 &&
             parse_long_value(trim(line + 8), SIMPLE_CORPUS_VERSION,
-                             POLL_CORPUS_VERSION, version) == 0)
+                             CONCURRENT_CORPUS_VERSION, version) == 0)
             status = 0;
         break;
     }
@@ -1242,6 +1244,9 @@ int main(int argc, char **argv)
         return fail("cannot digest operation corpus");
     if (read_corpus_version(argv[2], &corpus_version) != 0)
         return fail("invalid corpus version");
+    if (corpus_version == CONCURRENT_CORPUS_VERSION)
+        return eventfd_concurrent_run(mode == MODE_RECORD, argv[2], argv[3],
+                                      corpus_digest);
     if (mode == MODE_RECORD)
         return record_trace(argv[2], argv[3], corpus_digest, corpus_version);
     return compare_trace(argv[2], argv[3], corpus_digest, corpus_version);

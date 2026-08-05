@@ -26,6 +26,8 @@ _KINDS = {
     "assert-pending": 16,
     "join": 17,
     "start-poll": 18,
+    "assert-all-pending": 19,
+    "join-set": 20,
 }
 _FIELD_ORDER = ("result", "errno", "value", "data_len", "data")
 

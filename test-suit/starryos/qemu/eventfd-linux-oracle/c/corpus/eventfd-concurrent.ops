@@ -1,0 +1,53 @@
+version 4
+scenario generated-0001
+eventfd2 0 0 1
+dup 0 1
+start-read 1 0 8
+start-read 2 1 8
+assert-all-pending
+write 0 8 0 2
+join-set 1 2
+scenario generated-0002
+eventfd 0 0
+start-poll 1 0 1 -1
+start-poll 2 0 1 -1
+assert-all-pending
+write 0 8 0 1
+join-set 1 2
+scenario generated-0003
+eventfd 0 0
+dup 0 1
+start-read 1 0 8
+start-read 2 1 8
+assert-all-pending
+write 0 8 0 1
+write 0 8 0 1
+join-set 1 2
+scenario generated-0004
+eventfd2 0 0 2048
+dup 0 1
+get-status-flags 1
+set-status-flags 0 0
+start-read 1 0 8
+start-read 2 1 8
+assert-all-pending
+write 0 8 0 1
+write 0 8 0 1
+join-set 1 2
+scenario generated-0005
+eventfd 0 4294967295
+write 0 8 0 18446744069414584319
+start-write 1 0 18446744073709551614
+start-write 2 0 18446744073709551614
+assert-all-pending
+read 0 8 0
+read 0 8 0
+join-set 1 2
+scenario generated-0006
+eventfd 0 4294967295
+write 0 8 0 18446744069414584319
+start-poll 1 0 4 -1
+start-poll 2 0 4 -1
+assert-all-pending
+read 0 8 0
+join-set 1 2

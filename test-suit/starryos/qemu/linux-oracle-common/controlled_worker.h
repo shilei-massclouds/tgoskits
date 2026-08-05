@@ -67,6 +67,10 @@ controlled_workers_observe_all_pending(struct controlled_workers *workers);
 enum controlled_worker_status
 controlled_workers_wait_for_all(struct controlled_workers *workers);
 enum controlled_worker_status
+controlled_workers_wait_for_next(struct controlled_workers *workers,
+                                 unsigned int completed_actor_mask,
+                                 int *completed_actor);
+enum controlled_worker_status
 controlled_workers_join_all(struct controlled_workers *workers);
 enum controlled_worker_status
 controlled_workers_cleanup(struct controlled_workers *workers,

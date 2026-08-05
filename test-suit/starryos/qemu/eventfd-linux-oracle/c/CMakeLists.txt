@@ -52,7 +52,9 @@ else()
     add_executable(
         eventfd-linux-oracle
         src/eventfd_linux_oracle.c
+        src/eventfd_concurrent_oracle.c
         "${LINUX_ORACLE_COMMON_DIR}/controlled_worker.c"
+        "${LINUX_ORACLE_COMMON_DIR}/concurrent_trace.c"
     )
     target_include_directories(
         eventfd-linux-oracle PRIVATE "${LINUX_ORACLE_COMMON_DIR}"
