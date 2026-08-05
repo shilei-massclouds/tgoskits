@@ -1,15 +1,22 @@
 """Controlled two-actor pipe scenario IR and canonical v5 codec."""
 
 import hashlib
+import sys
 from dataclasses import dataclass, field, replace
-from typing import Dict, Iterable, Optional, Tuple, Union
+from pathlib import Path
+from typing import Callable, Dict, Iterable, Optional, Tuple, Union
+
+_SCRIPTS_ROOT = Path(__file__).resolve().parents[1]
+if str(_SCRIPTS_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_ROOT))
 
 import scenario as simple
+from linux_oracle import actor as controlled_actor
 
 
 CORPUS_VERSION = 5
-CONTROL_ACTOR = 0
-WORKER_ACTOR = 1
+CONTROL_ACTOR = controlled_actor.CONTROLLER_ACTOR
+WORKER_ACTOR = controlled_actor.WORKER_ACTOR
 PIPE_BUF = 4096
 PIPE_BUFFER_BYTES = 4096
 DEFAULT_PIPE_CAPACITY = 65536
@@ -160,12 +167,7 @@ class PipeState:
         return result
 
 
-@dataclass(frozen=True)
-class WorkerCall:
-    operation: Union[StartRead, StartWrite]
-    pipe_id: int
-    pending_confirmed: bool = False
-    completable: bool = False
+WorkerCall = controlled_actor.WorkerCall
 
 
 class ResourceState:
@@ -177,7 +179,13 @@ class ResourceState:
         self.pipes: Dict[int, PipeState] = {}
         self.next_description_id = 0
         self.next_pipe_id = 0
-        self.worker: Optional[WorkerCall] = None
+        self._worker_lifecycle = controlled_actor.SingleWorkerLifecycle[
+            Union[StartRead, StartWrite], int
+        ]()
+
+    @property
+    def worker(self) -> Optional[WorkerCall]:
+        return self._worker_lifecycle.worker
 
     def apply(self, operation: Operation, line_number: int = 0) -> None:
         if isinstance(operation, (StartRead, StartWrite)):
@@ -192,12 +200,9 @@ class ResourceState:
             self._apply_controller_trigger(operation, line_number)
 
     def finish_scenario(self, line_number: int = 0) -> None:
-        if self.worker is not None:
-            _raise(
-                line_number,
-                CodecErrorCategory.RESOURCE_CONFLICT,
-                "scenario ends with an unfinished worker",
-            )
+        self._apply_worker_transition(
+            line_number, self._worker_lifecycle.finish_scenario
+        )
 
     def descriptor(self, slot: int) -> Optional[FdResource]:
         return self.slots[slot]
@@ -373,77 +378,59 @@ class ResourceState:
     def _start_worker(
         self, operation: Union[StartRead, StartWrite], line_number: int
     ) -> None:
-        if self.worker is not None:
-            _raise(
-                line_number,
-                CodecErrorCategory.RESOURCE_CONFLICT,
-                "only one worker call may be active",
-            )
-        endpoint = "reader" if isinstance(operation, StartRead) else "writer"
-        resource = self._require_endpoint(operation.slot, endpoint, line_number)
-        description = self.descriptions[resource.description_id]
-        pipe = self.pipes[resource.pipe_id]
-        if description.nonblocking:
-            _raise(
-                line_number,
-                CodecErrorCategory.BLOCKING_IO,
-                "worker endpoint must not have O_NONBLOCK",
-            )
-        if isinstance(operation, StartRead):
-            if operation.length <= 0 or pipe.queued_bytes != 0 or pipe.writers == 0:
+        def identify_pipe() -> int:
+            endpoint = "reader" if isinstance(operation, StartRead) else "writer"
+            resource = self._require_endpoint(operation.slot, endpoint, line_number)
+            description = self.descriptions[resource.description_id]
+            pipe = self.pipes[resource.pipe_id]
+            if description.nonblocking:
                 _raise(
                     line_number,
                     CodecErrorCategory.BLOCKING_IO,
-                    "worker read would not block",
+                    "worker endpoint must not have O_NONBLOCK",
                 )
-        elif (
-            operation.length <= 0
-            or operation.length > PIPE_BUF
-            or pipe.readers == 0
-            or pipe.can_write_record(operation.length)
-            or pipe.available_buffer_slots != 0
-        ):
-            _raise(
-                line_number,
-                CodecErrorCategory.BLOCKING_IO,
-                "worker atomic write is not proven to block before committing",
-            )
-        self.worker = WorkerCall(operation, resource.pipe_id)
+            if isinstance(operation, StartRead):
+                if (
+                    operation.length <= 0
+                    or pipe.queued_bytes != 0
+                    or pipe.writers == 0
+                ):
+                    _raise(
+                        line_number,
+                        CodecErrorCategory.BLOCKING_IO,
+                        "worker read would not block",
+                    )
+            elif (
+                operation.length <= 0
+                or operation.length > PIPE_BUF
+                or pipe.readers == 0
+                or pipe.can_write_record(operation.length)
+                or pipe.available_buffer_slots != 0
+            ):
+                _raise(
+                    line_number,
+                    CodecErrorCategory.BLOCKING_IO,
+                    "worker atomic write is not proven to block before committing",
+                )
+            return resource.pipe_id
+
+        self._apply_worker_transition(
+            line_number,
+            lambda: self._worker_lifecycle.start(operation, identify_pipe),
+        )
 
     def _assert_pending(self, line_number: int) -> None:
-        if self.worker is None:
-            _raise(
-                line_number,
-                CodecErrorCategory.RESOURCE_CONFLICT,
-                "assert-pending requires an active worker",
-            )
-        if self.worker.completable:
-            _raise(
-                line_number,
-                CodecErrorCategory.BLOCKING_IO,
-                "worker may complete before assert-pending",
-            )
-        self.worker = replace(self.worker, pending_confirmed=True)
+        self._apply_worker_transition(
+            line_number, self._worker_lifecycle.assert_pending
+        )
 
     def _apply_controller_trigger(
         self, operation: simple.Operation, line_number: int
     ) -> None:
-        worker = self.worker
-        if worker is None:
-            raise AssertionError("active worker is required")
-        if worker.completable:
-            _raise(
-                line_number,
-                CodecErrorCategory.RESOURCE_CONFLICT,
-                "join must immediately follow a completing trigger",
-            )
-        if not worker.pending_confirmed:
-            _raise(
-                line_number,
-                CodecErrorCategory.RESOURCE_CONFLICT,
-                "worker pending state was not confirmed",
-            )
-        pipe = self.pipes[worker.pipe_id]
+        worker = self._apply_worker_transition(
+            line_number, self._worker_lifecycle.before_trigger
+        )
+        pipe = self.pipes[worker.resource]
         if isinstance(worker.operation, StartRead):
             self._trigger_read_worker(operation, worker, pipe, line_number)
         else:
@@ -458,7 +445,7 @@ class ResourceState:
     ) -> None:
         if isinstance(operation, Write):
             resource = self._require_same_pipe_endpoint(
-                operation.slot, worker.pipe_id, "writer", line_number
+                operation.slot, worker.resource, "writer", line_number
             )
             del resource
             if operation.length > PIPE_BUF or not pipe.can_write_record(operation.length):
@@ -468,11 +455,11 @@ class ResourceState:
                     "read wake write is not immediately completable",
                 )
             pipe.write_record(operation.length, operation.byte)
-            self.worker = replace(worker, completable=pipe.queued_bytes > 0)
+            self._worker_lifecycle.update_completable(pipe.queued_bytes > 0)
             return
         if isinstance(operation, Close):
             resource = self._require_same_pipe_endpoint(
-                operation.slot, worker.pipe_id, "writer", line_number
+                operation.slot, worker.resource, "writer", line_number
             )
             if pipe.writers != 1 or pipe.queued_bytes != 0:
                 _raise(
@@ -482,7 +469,7 @@ class ResourceState:
                 )
             del resource
             self._close_slot(operation.slot, line_number)
-            self.worker = replace(worker, completable=True)
+            self._worker_lifecycle.update_completable(True)
             return
         _raise(
             line_number,
@@ -504,7 +491,7 @@ class ResourceState:
                 "pending write allows only a positive same-pipe read",
             )
         self._require_same_pipe_endpoint(
-            operation.slot, worker.pipe_id, "reader", line_number
+            operation.slot, worker.resource, "reader", line_number
         )
         if pipe.queued_bytes == 0:
             _raise(
@@ -513,34 +500,38 @@ class ResourceState:
                 "write wake read has no queued data",
             )
         pipe.read_bytes(operation.length)
-        self.worker = replace(
-            worker,
-            completable=pipe.can_write_record(worker.operation.length),
+        self._worker_lifecycle.update_completable(
+            pipe.can_write_record(worker.operation.length)
         )
 
     def _join_worker(self, line_number: int) -> None:
-        worker = self.worker
-        if worker is None:
-            _raise(
-                line_number,
-                CodecErrorCategory.RESOURCE_CONFLICT,
-                "join requires an active worker",
+        def complete(worker: WorkerCall) -> None:
+            pipe = self.pipes[worker.resource]
+            if isinstance(worker.operation, StartRead):
+                if pipe.queued_bytes:
+                    pipe.read_bytes(worker.operation.length)
+                elif pipe.writers != 0:
+                    raise AssertionError("joined empty read requires EOF")
+            else:
+                pipe.write_record(worker.operation.length, worker.operation.byte)
+
+        self._apply_worker_transition(
+            line_number, lambda: self._worker_lifecycle.join(complete)
+        )
+
+    @staticmethod
+    def _apply_worker_transition(
+        line_number: int, transition: Callable[[], object]
+    ):
+        try:
+            return transition()
+        except controlled_actor.WorkerLifecycleError as error:
+            category = (
+                CodecErrorCategory.RESOURCE_CONFLICT
+                if error.kind is controlled_actor.WorkerLifecycleErrorKind.LIFECYCLE
+                else CodecErrorCategory.BLOCKING_IO
             )
-        if not worker.pending_confirmed or not worker.completable:
-            _raise(
-                line_number,
-                CodecErrorCategory.BLOCKING_IO,
-                "worker is not proven completable before join",
-            )
-        pipe = self.pipes[worker.pipe_id]
-        if isinstance(worker.operation, StartRead):
-            if pipe.queued_bytes:
-                pipe.read_bytes(worker.operation.length)
-            elif pipe.writers != 0:
-                raise AssertionError("joined empty read requires EOF")
-        else:
-            pipe.write_record(worker.operation.length, worker.operation.byte)
-        self.worker = None
+            _raise(line_number, category, error.detail)
 
     def _require_live(self, slot: int, line_number: int) -> FdResource:
         resource = self.slots[slot]

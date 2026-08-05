@@ -39,8 +39,6 @@ def _scenario_count(document: object) -> int:
 
 
 def _record_host(elf: Path, scenario_path: Path, trace_path: Path):
-    # host_runtime imports the compatibility HostRecordResult, so defer this
-    # edge until after batch_execution has finished initializing.
     from host_runtime import record_host
 
     return record_host(elf, scenario_path, trace_path)

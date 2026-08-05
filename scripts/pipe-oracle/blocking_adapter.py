@@ -1,8 +1,6 @@
 """Adapter specification for controlled pipe blocking scenarios."""
 
-import shutil
 import sys
-import tempfile
 from pathlib import Path
 
 _SCRIPTS_ROOT = Path(__file__).resolve().parents[1]
@@ -14,10 +12,11 @@ import blocking_generator
 import blocking_mutation
 import blocking_reducer
 import blocking_scenario
-from batch_execution import HostRecordResult
 from guest_result import classify_guest_execution, normalize_guest_execution
 from host_runtime import find_or_build_host_oracle
 from host_runtime import record_host as record_host_once
+from linux_oracle.batch import HostRecordResult
+from linux_oracle.host_record import record_stable_host
 from linux_oracle.spec import (
     AdapterSpec,
     ArtifactLayout,
@@ -34,30 +33,13 @@ def record_host_stable(
     elf: Path, scenario_path: Path, trace_path: Path
 ) -> HostRecordResult:
     """Accept a candidate only after three byte-identical host recordings."""
-    trace_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(
-        prefix=".pipe-blocking-host-", dir=trace_path.parent
-    ) as temporary_directory:
-        temporary = Path(temporary_directory)
-        recorded_traces = []
-        logs = []
-        for index in range(3):
-            candidate_trace = temporary / f"linux-{index}.trace"
-            result = record_host_once(elf, scenario_path, candidate_trace)
-            logs.append(result.log)
-            if not result.passed:
-                return HostRecordResult(
-                    False, result.parser_rejection, "\n".join(logs)
-                )
-            recorded_traces.append(candidate_trace.read_bytes())
-        if len(set(recorded_traces)) != 1:
-            return HostRecordResult(
-                False,
-                False,
-                "blocking host trace is not byte-stable across three recordings",
-            )
-        shutil.copy2(temporary / "linux-0.trace", trace_path)
-    return HostRecordResult(True, False, "\n".join(logs))
+    return record_stable_host(
+        record_host_once,
+        elf,
+        scenario_path,
+        trace_path,
+        temporary_prefix=".pipe-blocking-host-",
+    )
 
 
 def _serialize(document: object) -> bytes:

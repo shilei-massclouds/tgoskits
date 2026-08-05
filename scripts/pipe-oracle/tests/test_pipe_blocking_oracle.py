@@ -111,6 +111,54 @@ class PipeBlockingCodecTests(unittest.TestCase):
             ):
                 blocking_scenario.parse_document(encoded)
 
+    def test_shared_lifecycle_errors_keep_pipe_categories_lines_and_text(self):
+        cases = {
+            "repeat": (
+                "version 5\nscenario x\npipe2 0 1 0\n"
+                "start-read 1 0 1\nstart-read 1 0 1\n",
+                "line 3: resource-conflict: only one worker call may be active",
+            ),
+            "pending-without-worker": (
+                "version 5\nscenario x\npipe2 0 1 0\nassert-pending 1\n",
+                "line 2: resource-conflict: assert-pending requires an active worker",
+            ),
+            "trigger-before-pending": (
+                "version 5\nscenario x\npipe2 0 1 0\n"
+                "start-read 1 0 1\nwrite 1 1 1\n",
+                "line 3: resource-conflict: worker pending state was not confirmed",
+            ),
+            "trigger-after-completable": (
+                "version 5\nscenario x\npipe2 0 1 0\nstart-read 1 0 1\n"
+                "assert-pending 1\nwrite 1 1 1\nwrite 1 1 1\n",
+                "line 5: resource-conflict: join must immediately follow a completing trigger",
+            ),
+            "pending-after-completable": (
+                "version 5\nscenario x\npipe2 0 1 0\nstart-read 1 0 1\n"
+                "assert-pending 1\nwrite 1 1 1\nassert-pending 1\n",
+                "line 5: blocking-io: worker may complete before assert-pending",
+            ),
+            "join-without-worker": (
+                "version 5\nscenario x\npipe2 0 1 0\njoin 1\n",
+                "line 2: resource-conflict: join requires an active worker",
+            ),
+            "join-before-completable": (
+                "version 5\nscenario x\npipe2 0 1 0\nstart-read 1 0 1\n"
+                "assert-pending 1\njoin 1\n",
+                "line 4: blocking-io: worker is not proven completable before join",
+            ),
+            "unfinished": (
+                "version 5\nscenario x\npipe2 0 1 0\n"
+                "start-read 1 0 1\nassert-pending 1\n",
+                "line 4: resource-conflict: scenario ends with an unfinished worker",
+            ),
+        }
+        for label, (encoded, expected) in cases.items():
+            with self.subTest(label=label), self.assertRaises(
+                blocking_scenario.ScenarioCodecError
+            ) as raised:
+                blocking_scenario.parse_document(encoded)
+            self.assertEqual(str(raised.exception), expected)
+
     def test_alias_zero_write_and_shared_nonblocking_complete_read(self):
         document = blocking_scenario.parse_document(
             "version 5\nscenario x\n"

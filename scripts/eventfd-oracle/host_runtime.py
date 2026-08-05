@@ -2,16 +2,10 @@
 
 import os
 import subprocess
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-
-@dataclass(frozen=True)
-class HostRecordResult:
-    passed: bool
-    parser_rejection: bool
-    log: str
+from linux_oracle.batch import HostRecordResult
 
 
 def find_or_build_host_oracle(workspace: Path) -> Optional[Path]:

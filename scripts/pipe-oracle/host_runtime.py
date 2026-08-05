@@ -5,7 +5,7 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
-from batch_execution import HostRecordResult
+from linux_oracle.batch import HostRecordResult
 
 
 def find_or_build_host_oracle(workspace: Path) -> Optional[Path]:

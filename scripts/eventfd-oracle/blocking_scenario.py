@@ -2,15 +2,22 @@
 
 import hashlib
 import re
-from dataclasses import dataclass, replace
-from typing import Iterable, Optional, Tuple, Union
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Iterable, Optional, Tuple, Union
+
+_SCRIPTS_ROOT = Path(__file__).resolve().parents[1]
+if str(_SCRIPTS_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_ROOT))
 
 import scenario as simple
+from linux_oracle import actor as controlled_actor
 
 
 CORPUS_VERSION = 2
-CONTROL_ACTOR = 0
-WORKER_ACTOR = 1
+CONTROL_ACTOR = controlled_actor.CONTROLLER_ACTOR
+WORKER_ACTOR = controlled_actor.WORKER_ACTOR
 
 MAX_LOGICAL_SLOTS = simple.MAX_LOGICAL_SLOTS
 MAX_OPS_PER_SCENARIO = simple.MAX_OPS_PER_SCENARIO
@@ -67,12 +74,7 @@ BlockingOperation = Union[StartRead, StartWrite, AssertPending, Join]
 Operation = Union[simple.Operation, BlockingOperation]
 
 
-@dataclass(frozen=True)
-class WorkerCall:
-    operation: Union[StartRead, StartWrite]
-    event_id: int
-    pending_confirmed: bool = False
-    completable: bool = False
+WorkerCall = controlled_actor.WorkerCall
 
 
 class ResourceState:
@@ -80,7 +82,13 @@ class ResourceState:
 
     def __init__(self) -> None:
         self.simple = simple.ResourceState()
-        self.worker: Optional[WorkerCall] = None
+        self._worker_lifecycle = controlled_actor.SingleWorkerLifecycle[
+            Union[StartRead, StartWrite], int
+        ]()
+
+    @property
+    def worker(self) -> Optional[WorkerCall]:
+        return self._worker_lifecycle.worker
 
     def apply(self, operation: Operation) -> None:
         if isinstance(operation, (StartRead, StartWrite)):
@@ -95,10 +103,7 @@ class ResourceState:
             self._apply_controller_trigger(operation)
 
     def finish_scenario(self) -> None:
-        if self.worker is not None:
-            raise ScenarioCodecError(
-                "actor-lifecycle", "scenario ends with an unfinished worker"
-            )
+        self._apply_worker_transition(self._worker_lifecycle.finish_scenario)
 
     def descriptor(self, slot: int):
         return self.simple.descriptor(slot)
@@ -110,55 +115,43 @@ class ResourceState:
         return self.simple.event(slot)
 
     def _start_worker(self, operation: Union[StartRead, StartWrite]) -> None:
-        if self.worker is not None:
-            raise ScenarioCodecError(
-                "actor-lifecycle", "only one worker call may be active"
-            )
-        description = self.simple.description(operation.slot)
-        event = self.simple.event(operation.slot)
-        if description is None or event is None:
-            raise ScenarioCodecError(
-                "blocking-proof", f"worker slot {operation.slot} is not live"
-            )
-        if description.nonblocking:
-            raise ScenarioCodecError(
-                "blocking-proof", "worker eventfd must not have O_NONBLOCK"
-            )
-        if isinstance(operation, StartRead):
-            if event.count != 0:
+        def identify_event() -> int:
+            description = self.simple.description(operation.slot)
+            event = self.simple.event(operation.slot)
+            if description is None or event is None:
                 raise ScenarioCodecError(
-                    "blocking-proof", "worker read would not block"
+                    "blocking-proof", f"worker slot {operation.slot} is not live"
                 )
-        elif operation.value == MAX_U64 or operation.value <= MAX_COUNTER - event.count:
-            raise ScenarioCodecError(
-                "blocking-proof", "worker write would not block"
-            )
-        self.worker = WorkerCall(operation, description.event_id)
+            if description.nonblocking:
+                raise ScenarioCodecError(
+                    "blocking-proof", "worker eventfd must not have O_NONBLOCK"
+                )
+            if isinstance(operation, StartRead):
+                if event.count != 0:
+                    raise ScenarioCodecError(
+                        "blocking-proof", "worker read would not block"
+                    )
+            elif (
+                operation.value == MAX_U64
+                or operation.value <= MAX_COUNTER - event.count
+            ):
+                raise ScenarioCodecError(
+                    "blocking-proof", "worker write would not block"
+                )
+            return description.event_id
+
+        self._apply_worker_transition(
+            lambda: self._worker_lifecycle.start(operation, identify_event)
+        )
 
     def _assert_pending(self, operation: AssertPending) -> None:
         del operation
-        if self.worker is None:
-            raise ScenarioCodecError(
-                "actor-lifecycle", "assert-pending requires an active worker"
-            )
-        if self.worker.completable:
-            raise ScenarioCodecError(
-                "blocking-proof", "worker may complete before assert-pending"
-            )
-        self.worker = replace(self.worker, pending_confirmed=True)
+        self._apply_worker_transition(self._worker_lifecycle.assert_pending)
 
     def _apply_controller_trigger(self, operation: simple.Operation) -> None:
-        worker = self.worker
-        if worker is None:
-            raise AssertionError("active worker is required")
-        if worker.completable:
-            raise ScenarioCodecError(
-                "actor-lifecycle", "join must immediately follow a completing trigger"
-            )
-        if not worker.pending_confirmed:
-            raise ScenarioCodecError(
-                "actor-lifecycle", "worker pending state was not confirmed"
-            )
+        worker = self._apply_worker_transition(
+            self._worker_lifecycle.before_trigger
+        )
         if not isinstance(operation, (Read, Write)):
             raise ScenarioCodecError(
                 "actor-lifecycle", "only same-event read/write may run while worker is active"
@@ -172,7 +165,7 @@ class ResourceState:
                 "blocking-proof", "controller trigger write value is invalid"
             )
         description = self.simple.description(operation.slot)
-        if description is None or description.event_id != worker.event_id:
+        if description is None or description.event_id != worker.resource:
             raise ScenarioCodecError(
                 "actor-lifecycle", "controller trigger targets a different eventfd"
             )
@@ -185,32 +178,40 @@ class ResourceState:
             completable = event.count > 0
         else:
             completable = worker.operation.value <= MAX_COUNTER - event.count
-        self.worker = replace(worker, completable=completable)
+        self._worker_lifecycle.update_completable(completable)
 
     def _join_worker(self, operation: Join) -> None:
         del operation
-        worker = self.worker
-        if worker is None:
-            raise ScenarioCodecError(
-                "actor-lifecycle", "join requires an active worker"
+
+        def complete(worker: WorkerCall) -> None:
+            if isinstance(worker.operation, StartRead):
+                joined_operation: simple.Operation = Read(
+                    worker.operation.slot, 8, PointerMode.VALID
+                )
+            else:
+                joined_operation = Write(
+                    worker.operation.slot,
+                    8,
+                    PointerMode.VALID,
+                    worker.operation.value,
+                )
+            self.simple.apply(joined_operation)
+
+        self._apply_worker_transition(
+            lambda: self._worker_lifecycle.join(complete)
+        )
+
+    @staticmethod
+    def _apply_worker_transition(transition: Callable[[], object]):
+        try:
+            return transition()
+        except controlled_actor.WorkerLifecycleError as error:
+            category = (
+                "actor-lifecycle"
+                if error.kind is controlled_actor.WorkerLifecycleErrorKind.LIFECYCLE
+                else "blocking-proof"
             )
-        if not worker.pending_confirmed or not worker.completable:
-            raise ScenarioCodecError(
-                "blocking-proof", "worker is not proven completable before join"
-            )
-        if isinstance(worker.operation, StartRead):
-            joined_operation: simple.Operation = Read(
-                worker.operation.slot, 8, PointerMode.VALID
-            )
-        else:
-            joined_operation = Write(
-                worker.operation.slot,
-                8,
-                PointerMode.VALID,
-                worker.operation.value,
-            )
-        self.simple.apply(joined_operation)
-        self.worker = None
+            raise ScenarioCodecError(category, error.detail) from None
 
 
 def parse_document(encoded: Union[bytes, str]) -> ScenarioDocument:

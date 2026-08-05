@@ -92,6 +92,54 @@ class EventFdBlockingCodecTests(unittest.TestCase):
             ):
                 blocking_scenario.parse_document(encoded)
 
+    def test_shared_lifecycle_errors_keep_eventfd_categories_and_text(self):
+        cases = {
+            "repeat": (
+                "version 2\nscenario x\neventfd 0 0\n"
+                "start-read 1 0\nstart-read 1 0\n",
+                "actor-lifecycle: only one worker call may be active",
+            ),
+            "pending-without-worker": (
+                "version 2\nscenario x\neventfd 0 0\nassert-pending 1\n",
+                "actor-lifecycle: assert-pending requires an active worker",
+            ),
+            "trigger-before-pending": (
+                "version 2\nscenario x\neventfd 0 0\n"
+                "start-read 1 0\nwrite 0 8 0 1\n",
+                "actor-lifecycle: worker pending state was not confirmed",
+            ),
+            "trigger-after-completable": (
+                "version 2\nscenario x\neventfd 0 0\nstart-read 1 0\n"
+                "assert-pending 1\nwrite 0 8 0 1\nwrite 0 8 0 1\n",
+                "actor-lifecycle: join must immediately follow a completing trigger",
+            ),
+            "pending-after-completable": (
+                "version 2\nscenario x\neventfd 0 0\nstart-read 1 0\n"
+                "assert-pending 1\nwrite 0 8 0 1\nassert-pending 1\n",
+                "blocking-proof: worker may complete before assert-pending",
+            ),
+            "join-without-worker": (
+                "version 2\nscenario x\neventfd 0 0\njoin 1\n",
+                "actor-lifecycle: join requires an active worker",
+            ),
+            "join-before-completable": (
+                "version 2\nscenario x\neventfd 0 0\nstart-read 1 0\n"
+                "assert-pending 1\njoin 1\n",
+                "blocking-proof: worker is not proven completable before join",
+            ),
+            "unfinished": (
+                "version 2\nscenario x\neventfd 0 0\n"
+                "start-read 1 0\nassert-pending 1\n",
+                "actor-lifecycle: scenario ends with an unfinished worker",
+            ),
+        }
+        for label, (encoded, expected) in cases.items():
+            with self.subTest(label=label), self.assertRaises(
+                blocking_scenario.ScenarioCodecError
+            ) as raised:
+                blocking_scenario.parse_document(encoded)
+            self.assertEqual(str(raised.exception), expected)
+
     def test_alias_zero_write_and_shared_nonblocking_complete_read(self):
         document = blocking_scenario.parse_document(
             "version 2\nscenario x\n"
