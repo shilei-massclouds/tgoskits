@@ -76,12 +76,12 @@ join-set 1 2
 scenario generated-0005
 eventfd 0 4294967295
 write 0 8 0 18446744069414584319
-start-write 1 0 18446744073709551614
-start-write 2 0 18446744073709551614
+start-write 1 0 1
+start-write 2 0 1
 assert-all-pending
 read 0 8 0
-read 0 8 0
 join-set 1 2
+read 0 8 0
 scenario generated-0006
 eventfd 0 4294967295
 write 0 8 0 18446744069414584319

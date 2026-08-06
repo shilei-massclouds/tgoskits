@@ -5,10 +5,12 @@ from enum import Enum
 
 import concurrent_generator
 from concurrent_scenario import (
+    ScenarioCodecError,
     ScenarioDocument,
     canonical_digest,
     serialize_document,
     validate_entry_limits,
+    validate_schedulable_document,
 )
 
 
@@ -51,9 +53,14 @@ def mutate_document(rng, parent, donor, *, requested_kind=None):
         validate_entry_limits(document)
         encoded = serialize_document(document).encode("utf-8")
         digest = canonical_digest(document)
+    try:
+        validate_schedulable_document(document)
+        schedulable = True
+    except ScenarioCodecError:
+        schedulable = False
     classification = (
         CandidateClassification.EXECUTABLE
-        if digest != canonical_digest(parent)
+        if schedulable and digest != canonical_digest(parent)
         else CandidateClassification.REJECTED
     )
     return MutationCandidate(classification, document, encoded, digest, kind)

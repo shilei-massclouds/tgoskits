@@ -202,6 +202,65 @@ class EventFdConcurrentCodecTests(unittest.TestCase):
 
         self.assertEqual(state.epolls[2].registrations, {})
 
+    def test_controller_read_cannot_depend_on_unjoined_writer_progress(self):
+        scenario = concurrent_scenario.Scenario(
+            (
+                concurrent_scenario.EventFd(0, (1 << 32) - 1),
+                concurrent_scenario.Write(
+                    0,
+                    8,
+                    concurrent_scenario.PointerMode.VALID,
+                    concurrent_generator._FULL_COUNTER_INCREMENT,
+                ),
+                concurrent_scenario.StartWrite(
+                    1, 0, concurrent_scenario.MAX_COUNTER
+                ),
+                concurrent_scenario.StartWrite(
+                    2, 0, concurrent_scenario.MAX_COUNTER
+                ),
+                concurrent_scenario.AssertAllPending(),
+                concurrent_scenario.Read(
+                    0, 8, concurrent_scenario.PointerMode.VALID
+                ),
+                concurrent_scenario.Read(
+                    0, 8, concurrent_scenario.PointerMode.VALID
+                ),
+                concurrent_scenario.JoinSet((1, 2)),
+            )
+        )
+
+        self.assertIsInstance(
+            concurrent_scenario.analyze_scenario(scenario),
+            concurrent_scenario.ResourceState,
+        )
+        with self.assertRaises(
+            concurrent_scenario.ScenarioCodecError
+        ) as raised:
+            concurrent_scenario.validate_schedulable_scenario(scenario)
+
+        self.assertEqual(raised.exception.category, "blocking-operation")
+        self.assertIn("unjoined worker progress", raised.exception.detail)
+
+        safe = concurrent_scenario.ScenarioDocument(
+            (
+                concurrent_generator.generate_scenario(
+                    concurrent_generator.CampaignRng(42), story=0
+                ),
+            ),
+            version=4,
+        )
+        unsafe = concurrent_scenario.ScenarioDocument((scenario,), version=4)
+        candidate = concurrent_mutation.mutate_document(
+            concurrent_generator.CampaignRng(42),
+            safe,
+            unsafe,
+            requested_kind="append-donor",
+        )
+        self.assertEqual(
+            candidate.classification,
+            concurrent_mutation.CandidateClassification.REJECTED,
+        )
+
     def test_v4_rejects_invalid_actor_mask_timeout_and_cross_version(self):
         invalid = (
             "version 4\nscenario x\neventfd 0 0\nstart-read 3 0 8\n"
@@ -218,6 +277,7 @@ class EventFdConcurrentCodecTests(unittest.TestCase):
         document = concurrent_scenario.parse_document(encoded)
 
         concurrent_scenario.validate_entry_limits(document)
+        concurrent_scenario.validate_schedulable_document(document)
         self.assertEqual(concurrent_scenario.serialize_document(document).encode(), encoded)
         self.assertLessEqual(len(document.scenarios), 8)
         self.assertTrue(

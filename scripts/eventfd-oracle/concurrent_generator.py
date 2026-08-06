@@ -46,11 +46,12 @@ from concurrent_scenario import (
     canonical_digest,
     serialize_document,
     validate_entry_limits,
+    validate_schedulable_document,
 )
 from poll_generator import CampaignRng
 
 
-GENERATOR_VERSION = "eventfd-concurrent-generator-v1"
+GENERATOR_VERSION = "eventfd-concurrent-generator-v2"
 STORY_COUNT = 15
 _FULL_COUNTER_INCREMENT = MAX_COUNTER - ((1 << 32) - 1)
 
@@ -92,12 +93,12 @@ def generate_scenario(rng: CampaignRng, story: Optional[int] = None) -> Scenario
             (
                 EventFd(first, (1 << 32) - 1),
                 Write(first, 8, PointerMode.VALID, _FULL_COUNTER_INCREMENT),
-                StartWrite(actors[0], first, MAX_COUNTER),
-                StartWrite(actors[1], first, MAX_COUNTER),
+                StartWrite(actors[0], first, 1),
+                StartWrite(actors[1], first, 1),
                 AssertAllPending(),
                 Read(first, 8, PointerMode.VALID),
-                Read(first, 8, PointerMode.VALID),
                 JoinSet((1, 2)),
+                Read(first, 8, PointerMode.VALID),
             )
         )
     if story_index == 5:
@@ -126,6 +127,7 @@ def generate_document(rng: CampaignRng) -> ScenarioDocument:
         (generate_scenario(rng) for _ in range(rng.range(1, 3))), version=4
     )
     validate_entry_limits(document)
+    validate_schedulable_document(document)
     return document
 
 

@@ -1,5 +1,6 @@
 """Controlled two-worker eventfd scenario IR and canonical v4 codec."""
 
+import copy
 import hashlib
 import re
 import sys
@@ -230,8 +231,13 @@ class EpollState:
 class ResourceState:
     """Validate blocking proofs while allowing Linux to choose each winner."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, enforce_controller_progress: bool = False) -> None:
         self.simple = simple.ResourceState()
+        # A controller syscall must be safe even if a woken worker has not run
+        # yet. Worker I/O updates `simple`; this shadow receives only completed
+        # controller operations until an explicit join establishes a barrier.
+        self.controller_simple = simple.ResourceState()
+        self.enforce_controller_progress = enforce_controller_progress
         self.workers = controlled_actor.ControlledWorkers[
             ConcurrentOperation, tuple[str, int]
         ]()
@@ -287,12 +293,14 @@ class ResourceState:
         elif isinstance(operation, Join):
             self._complete_timeout(operation.actor)
             self._transition(lambda: self.workers.join(operation.actor, lambda _call: None))
+            self._synchronize_controller_state_if_idle()
         elif isinstance(operation, JoinSet):
             for actor in operation.actors:
                 self._complete_timeout(actor)
             self._transition(
                 lambda: self.workers.join_set(operation.actors, lambda _calls: None)
             )
+            self._synchronize_controller_state_if_idle()
         elif self.workers.active_actors:
             self._apply_trigger(operation)
         else:
@@ -591,6 +599,20 @@ class ResourceState:
             if isinstance(operation, (Read, Write, Close))
             else None
         )
+        if self.enforce_controller_progress:
+            try:
+                self.controller_simple.apply(operation)
+            except ScenarioCodecError as error:
+                if (
+                    self.workers.active_actors
+                    and error.category == "blocking-operation"
+                ):
+                    raise ScenarioCodecError(
+                        error.category,
+                        "controller operation depends on unjoined worker progress: "
+                        f"{error.detail}",
+                    ) from None
+                raise
         self.simple.apply(operation)
         if description is not None:
             if (
@@ -603,6 +625,10 @@ class ResourceState:
             ):
                 self._drop_epoll_description(descriptor.description_id)
             self._refresh_epolls(description.event_id)
+
+    def _synchronize_controller_state_if_idle(self) -> None:
+        if self.enforce_controller_progress and not self.workers.active_actors:
+            self.controller_simple = copy.deepcopy(self.simple)
 
     def _epoll_create(self, operation: EpollCreate) -> None:
         if operation.slot in self.epolls or self.simple.descriptor(operation.slot):
@@ -826,6 +852,23 @@ def analyze_scenario(source_scenario: Scenario) -> ResourceState:
         state.apply(operation)
     state.finish_scenario()
     return state
+
+
+def validate_schedulable_scenario(source_scenario: Scenario) -> ResourceState:
+    """Reject controller calls whose progress depends on an unjoined worker."""
+    state = ResourceState(enforce_controller_progress=True)
+    for operation in source_scenario.operations:
+        _validate_operation_fields(operation)
+        state.apply(operation)
+    state.finish_scenario()
+    return state
+
+
+def validate_schedulable_document(document: ScenarioDocument) -> None:
+    """Apply generator-only scheduling proofs without changing the v4 codec."""
+    validate_entry_limits(document)
+    for source_scenario in document.scenarios:
+        validate_schedulable_scenario(source_scenario)
 
 
 def deterministic_scenario_indexes(document: ScenarioDocument) -> Tuple[int, ...]:
