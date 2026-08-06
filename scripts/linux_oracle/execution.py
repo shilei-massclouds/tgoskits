@@ -82,13 +82,41 @@ def execute_inputs(
         if guest is None:
             return ExecutionObservation(False, "missing-guest-result", (), "")
         starry_elf = coverage_object(spec, workspace)
-        category = _category_value(guest.category)
+        category = effective_guest_category(
+            spec,
+            execution.prepared.document,
+            guest,
+        )
+        if not starry_elf.is_file():
+            return ExecutionObservation(False, "coverage-missing", (), "")
+        elf_digest = sha256_file(starry_elf)
+        if pinned_starry_elf is not None and elf_digest != sha256_file(
+            pinned_starry_elf
+        ):
+            return ExecutionObservation(False, "starry-elf-changed", (), elf_digest)
+        if category == "unexplained-outcome":
+            _save_execution_evidence(
+                spec,
+                store.questions_root,
+                execution,
+                starry_elf,
+                category,
+                batch_index,
+                label="question",
+            )
+            return ExecutionObservation(
+                True,
+                category,
+                (),
+                elf_digest,
+                "concurrent outcome is not yet present in Linux evidence",
+            )
         if not guest.passed:
             _save_execution_failure(
                 spec, store, execution, starry_elf, category, batch_index
             )
             return ExecutionObservation(False, category, (), "")
-        if not guest.profraw_paths or not starry_elf.is_file():
+        if not guest.profraw_paths:
             _save_execution_failure(
                 spec,
                 store,
@@ -98,11 +126,6 @@ def execute_inputs(
                 batch_index,
             )
             return ExecutionObservation(False, "coverage-missing", (), "")
-        elf_digest = sha256_file(starry_elf)
-        if pinned_starry_elf is not None and elf_digest != sha256_file(
-            pinned_starry_elf
-        ):
-            return ExecutionObservation(False, "starry-elf-changed", (), elf_digest)
         with tempfile.TemporaryDirectory() as temporary_directory:
             profdata = Path(temporary_directory) / "campaign.profdata"
             merge_profraws(guest.profraw_paths, profdata)
@@ -158,6 +181,27 @@ def _save_execution_failure(
     category: str,
     batch_index: int,
 ) -> None:
+    _save_execution_evidence(
+        spec,
+        store.failures_root,
+        execution,
+        starry_elf,
+        category,
+        batch_index,
+        label="failure",
+    )
+
+
+def _save_execution_evidence(
+    spec: AdapterSpec,
+    evidence_root: Path,
+    execution: object,
+    starry_elf: Path,
+    category: str,
+    batch_index: int,
+    *,
+    label: str,
+) -> None:
     guest = execution.guest_result
     if guest is None or not starry_elf.is_file() or not execution.trace_path.is_file():
         return
@@ -171,8 +215,8 @@ def _save_execution_failure(
     else:
         mismatch = vars(difference)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    destination = store.failures_root / (
-        f"failure-{category}-{stamp}-batch-{batch_index + 1:04d}"
+    destination = evidence_root / (
+        f"{label}-{category}-{stamp}-batch-{batch_index + 1:04d}"
     )
     save_failure(
         spec,
@@ -186,7 +230,30 @@ def _save_execution_failure(
         result_category=category,
         mismatch=mismatch,
     )
-    print(f"failure saved: {destination}", file=sys.stderr, flush=True)
+    print(f"{label} saved: {destination}", file=sys.stderr, flush=True)
+
+
+def effective_guest_category(
+    spec: AdapterSpec,
+    document: object,
+    guest: object,
+) -> str:
+    """Separate confirmed mismatches from empirical concurrent questions."""
+    category = _category_value(guest.category)
+    if category != "unexplained-outcome":
+        return category
+    if spec.outcomes is None:
+        return "semantic-mismatch"
+    difference = getattr(guest, "difference", None)
+    scenario_index = getattr(difference, "scenario_index", None)
+    if not isinstance(scenario_index, int) or scenario_index < 0:
+        return "oracle-failure"
+    deterministic = set(spec.outcomes.deterministic_indexes(document))
+    return (
+        "semantic-mismatch"
+        if scenario_index in deterministic
+        else "unexplained-outcome"
+    )
 
 
 def _category_value(category: object) -> str:
@@ -198,6 +265,7 @@ def _category_value(category: object) -> str:
 
 __all__ = [
     "ExecutionObservation",
+    "effective_guest_category",
     "execute_inputs",
     "fixed_elf_from_digest",
     "fixed_starry_elf",

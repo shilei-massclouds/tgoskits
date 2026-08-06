@@ -97,7 +97,11 @@ def run_campaign(
         )
         new_regions = observed_new_regions - pending_regions
         admitted: Sequence[str] = ()
-        result = "passed-no-new-coverage"
+        result = (
+            "unexplained-outcome-saved"
+            if observation.category == "unexplained-outcome"
+            else "passed-no-new-coverage"
+        )
         task: Optional[Task] = None
         if new_regions:
             fixed_elf = fixed_starry_elf(spec, store, coverage_object(spec, workspace))

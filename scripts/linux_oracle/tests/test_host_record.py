@@ -201,7 +201,7 @@ class ConvergedHostRecordTests(unittest.TestCase):
             )
             self.assertEqual(len(decoded.scenarios[0].alternatives), 2)
 
-    def test_unstable_set_is_typed_host_failure_and_not_persisted(self):
+    def test_all_observed_outcomes_are_persisted(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             scenario = root / "scenario.ops"
@@ -226,10 +226,14 @@ class ConvergedHostRecordTests(unittest.TestCase):
                 temporary_prefix=".test-concurrent-",
             )
 
-            self.assertFalse(result.passed)
-            self.assertFalse(result.parser_rejection)
-            self.assertIn("host-unstable", result.log)
-            self.assertFalse(trace.exists())
+            self.assertTrue(result.passed)
+            decoded = AllowedTrace.from_bytes(
+                trace.read_bytes(),
+                expected_magic=b"PIPEORC1",
+                expected_version=7,
+                expected_corpus_digest=fnv1a64(scenario.read_bytes()),
+            )
+            self.assertEqual(len(decoded.scenarios[0].alternatives), 5)
 
 
 if __name__ == "__main__":

@@ -6,10 +6,6 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Sequence, Tuple
 
 
-MAX_ALTERNATIVES = 4
-MIN_ALTERNATIVE_OBSERVATIONS = 3
-CONVERGENCE_RUNS = 8
-
 _TRACE_HEADER = struct.Struct("<8sIIQ32s")
 _SCENARIO_HEADER = struct.Struct("<III32s")
 _ALTERNATIVE_HEADER = struct.Struct("<I")
@@ -147,7 +143,7 @@ class AllowedScenario:
             self.scenario_index < 0
             or self.operation_count <= 0
             or not payloads
-            or len(payloads) > MAX_ALTERNATIVES
+            or len(payloads) > (1 << 32) - 1
             or payloads != tuple(sorted(set(payloads)))
         ):
             raise AllowedOutcomeError("allowed scenario is not canonical")
@@ -242,7 +238,7 @@ class AllowedTrace:
                 _SCENARIO_HEADER.unpack_from(encoded, offset)
             )
             offset += _SCENARIO_HEADER.size
-            if scenario_index != expected_index or not 1 <= count <= MAX_ALTERNATIVES:
+            if scenario_index != expected_index or count == 0:
                 raise AllowedOutcomeError("allowed scenario identity is invalid")
             alternatives = []
             for _alternative_index in range(count):
@@ -266,7 +262,7 @@ class AllowedTrace:
 
 
 class AllowedOutcomeRecorder:
-    """Collect repeated host runs and enforce the bounded convergence policy."""
+    """Collect a fixed budget of host runs into one bounded allowed set."""
 
     def __init__(
         self,
@@ -274,14 +270,13 @@ class AllowedOutcomeRecorder:
         expected_runs: int = 32,
         deterministic: Iterable[int] = (),
     ) -> None:
-        if expected_runs < CONVERGENCE_RUNS:
-            raise AllowedOutcomeError("expected host run count is too small")
+        if expected_runs <= 0:
+            raise AllowedOutcomeError("expected host run count must be positive")
         self.expected_runs = expected_runs
         self.deterministic = frozenset(deterministic)
         self._runs = 0
         self._operation_counts: Optional[Tuple[int, ...]] = None
         self._counts: Tuple[Dict[bytes, int], ...] = ()
-        self._first_seen: Tuple[Dict[bytes, int], ...] = ()
 
     def add_run(self, scenarios: Sequence[ScenarioRun]) -> None:
         if self._runs >= self.expected_runs:
@@ -294,15 +289,12 @@ class AllowedOutcomeRecorder:
         if self._operation_counts is None:
             self._operation_counts = operation_counts
             self._counts = tuple({} for _scenario in current)
-            self._first_seen = tuple({} for _scenario in current)
         elif operation_counts != self._operation_counts:
             raise AllowedOutcomeError("host run operation count changed")
         for index, scenario in enumerate(current):
             counts = self._counts[index]
-            first_seen = self._first_seen[index]
             if scenario.payload not in counts:
                 counts[scenario.payload] = 0
-                first_seen[scenario.payload] = self._runs
             counts[scenario.payload] += 1
         self._runs += 1
 
@@ -310,21 +302,8 @@ class AllowedOutcomeRecorder:
         if self._runs != self.expected_runs or self._operation_counts is None:
             raise AllowedOutcomeError("host recording did not run exactly as requested")
         scenarios = []
-        convergence_start = self.expected_runs - CONVERGENCE_RUNS
         for index, operation_count in enumerate(self._operation_counts):
             counts = self._counts[index]
-            if len(counts) > MAX_ALTERNATIVES:
-                raise AllowedOutcomeError(
-                    f"scenario {index} produced more than {MAX_ALTERNATIVES} alternatives"
-                )
-            if any(run >= convergence_start for run in self._first_seen[index].values()):
-                raise AllowedOutcomeError(
-                    f"scenario {index} added an alternative in the final 8 runs"
-                )
-            if any(count < MIN_ALTERNATIVE_OBSERVATIONS for count in counts.values()):
-                raise AllowedOutcomeError(
-                    f"scenario {index} has an alternative observed fewer than 3 times"
-                )
             if index in self.deterministic and len(counts) != 1:
                 raise AllowedOutcomeError(
                     f"deterministic scenario {index} produced multiple alternatives"

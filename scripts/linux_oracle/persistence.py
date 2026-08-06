@@ -41,6 +41,7 @@ class CampaignStore:
         self.runs_root = self.root / spec.campaign.run_directory
         self.coverage_root = self.root / spec.campaign.coverage_directory
         self.failures_root = self.root / spec.campaign.failure_directory
+        self.questions_root = self.root / spec.campaign.question_directory
 
     def load_entries(self) -> Tuple[CorpusEntry, ...]:
         if not self.corpus_root.exists():

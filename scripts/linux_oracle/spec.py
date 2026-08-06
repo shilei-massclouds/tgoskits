@@ -83,6 +83,8 @@ class CampaignLayout:
     attribution_task_directory: str = "attribution-jobs"
     minimization_task_directory: str = "minimization-jobs"
     elf_directory: str = "elfs"
+    outcome_directory: str = "outcomes"
+    question_directory: str = "questions"
 
     def __post_init__(self) -> None:
         if self.root.is_absolute() or not self.root.parts:
@@ -95,6 +97,8 @@ class CampaignLayout:
             self.attribution_task_directory,
             self.minimization_task_directory,
             self.elf_directory,
+            self.outcome_directory,
+            self.question_directory,
         ):
             _require_filename(value)
 
@@ -137,6 +141,19 @@ class CoverageTarget:
 
 
 @dataclass(frozen=True)
+class OutcomeSetHooks:
+    """Adapter semantics for persistent concurrent Linux outcomes."""
+
+    trace_magic: bytes
+    scenario_keys: Callable[[object], Tuple[str, ...]]
+    deterministic_indexes: Callable[[object], Tuple[int, ...]]
+
+    def __post_init__(self) -> None:
+        if len(self.trace_magic) != 8:
+            raise ValueError("outcome trace magic must contain eight bytes")
+
+
+@dataclass(frozen=True)
 class CodecSpec:
     parse: Callable[[bytes], object]
     serialize: Callable[[object], bytes]
@@ -161,6 +178,7 @@ class AdapterSpec:
     host_record: Callable[[Path, Path, Path], HostRecordResultLike]
     classify_guest: Callable[..., object]
     normalize_guest: Callable[[object], object]
+    outcomes: Optional[OutcomeSetHooks] = None
     campaign_hooks: Optional[CampaignHooks] = None
     generate: Optional[Callable[..., object]] = None
     mutate: Optional[Callable[..., object]] = None

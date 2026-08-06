@@ -1,4 +1,4 @@
-"""Stable and converged host recording for controlled adapters."""
+"""Fixed-budget host recording for controlled adapters."""
 
 import shutil
 import tempfile
@@ -34,7 +34,7 @@ def record_converged_host(
     indexed_record_once: Optional[IndexedHostRecorder] = None,
     progress: Optional[ProgressReporter] = None,
 ) -> HostRecordResult:
-    """Record 32 host runs and atomically persist one converged allowed set."""
+    """Record 32 host runs and atomically persist one bounded allowed set."""
     trace_path.parent.mkdir(parents=True, exist_ok=True)
     recorder = AllowedOutcomeRecorder(deterministic=deterministic)
     logs = []

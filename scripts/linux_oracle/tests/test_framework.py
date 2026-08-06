@@ -10,6 +10,7 @@ import unittest
 from contextlib import contextmanager, redirect_stderr
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 SCRIPTS_ROOT = Path(__file__).resolve().parents[2]
@@ -35,6 +36,7 @@ from linux_oracle.spec import (
     CampaignLayout,
     CodecSpec,
     CoverageTarget,
+    OutcomeSetHooks,
     QemuSpec,
     ReductionHooks,
 )
@@ -359,6 +361,74 @@ class FrameworkContractTests(unittest.TestCase):
             self.assertEqual(observation.category, "host-unstable")
             self.assertEqual(observation.detail, diagnostic)
             self.assertEqual(budget.used, 0)
+
+    def test_unexplained_concurrent_outcome_is_saved_as_a_question(self):
+        spec = replace(
+            FAKE_SPEC,
+            outcomes=OutcomeSetHooks(
+                b"FAUXOUT1",
+                lambda document: tuple("0" * 64 for _item in document),
+                lambda _document: (),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            host = workspace / "source-runner"
+            host.write_bytes(b"host")
+            kernel = workspace / spec.qemu.coverage_object_path
+            kernel.parent.mkdir(parents=True)
+            kernel.write_bytes(b"kernel")
+            encoded = fake_input("question").encoded
+            scenario = workspace / spec.artifacts.scenario_filename
+            scenario.write_bytes(encoded)
+            trace = workspace / spec.artifacts.trace_filename
+            trace.write_bytes(b"trace")
+            artifact_host = workspace / spec.artifacts.host_executable_filename
+            artifact_host.write_bytes(b"artifact host")
+            guest = SimpleNamespace(
+                passed=False,
+                category="unexplained-outcome",
+                log="unexplained",
+                profraw_paths=(),
+                difference=SimpleNamespace(
+                    scenario_index=0,
+                    actual_digest="1" * 64,
+                    actual_vector="00",
+                ),
+            )
+            execution = SimpleNamespace(
+                prepared=SimpleNamespace(document=parse_fake(encoded)),
+                host_record=HostRecordResult(True, False, "recorded"),
+                guest_result=guest,
+                scenario_path=scenario,
+                trace_path=trace,
+                host_oracle_path=artifact_host,
+            )
+
+            @contextmanager
+            def questioned_batch(*_args, **_kwargs):
+                yield execution
+
+            store = CampaignStore(spec, workspace)
+            with mock.patch.object(
+                common_execution,
+                "execute_batch",
+                side_effect=questioned_batch,
+            ):
+                observation = common_execution.execute_inputs(
+                    spec,
+                    workspace,
+                    store,
+                    host,
+                    (fake_input("question"),),
+                    CampaignBudget(1),
+                    batch_index=0,
+                )
+
+            self.assertTrue(observation.passed)
+            self.assertEqual(observation.category, "unexplained-outcome")
+            self.assertFalse(store.failures_root.exists())
+            self.assertEqual(len(tuple(store.questions_root.iterdir())), 1)
 
     def test_adapter_spec_is_immutable_and_has_no_intrinsic_scenario_roles(self):
         with self.assertRaises(Exception):

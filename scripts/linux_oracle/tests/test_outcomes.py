@@ -1,4 +1,4 @@
-"""Fail-first tests for converged complete-scenario outcome sets."""
+"""Fail-first tests for bounded complete-scenario outcome sets."""
 
 import hashlib
 import sys
@@ -36,32 +36,53 @@ class AllowedOutcomeRecorderTests(unittest.TestCase):
         )
         self.assertNotIn(b"actor1=ready;actor2=ready", trace.to_bytes(b"EVFDORC4"))
 
-    def test_final_eight_runs_must_not_add_an_alternative(self):
+    def test_final_run_alternative_is_admitted(self):
         recorder = AllowedOutcomeRecorder(expected_runs=32)
         for index in range(32):
-            payload = b"late" if index == 28 else b"stable"
+            payload = b"late" if index == 31 else b"stable"
             recorder.add_run((ScenarioRun(0, 1, payload),))
 
-        with self.assertRaisesRegex(AllowedOutcomeError, "final 8 runs"):
-            recorder.finish(version=4, corpus_digest=7)
+        trace = recorder.finish(version=4, corpus_digest=7)
 
-    def test_every_alternative_requires_three_observations(self):
+        self.assertEqual(
+            tuple(
+                alternative.payload
+                for alternative in trace.scenarios[0].alternatives
+            ),
+            (b"late", b"stable"),
+        )
+
+    def test_single_observation_is_admitted(self):
         recorder = AllowedOutcomeRecorder(expected_runs=32)
         for index in range(32):
             recorder.add_run(
                 (ScenarioRun(0, 1, b"rare" if index == 0 else b"common"),)
             )
 
-        with self.assertRaisesRegex(AllowedOutcomeError, "fewer than 3"):
-            recorder.finish(version=4, corpus_digest=7)
+        trace = recorder.finish(version=4, corpus_digest=7)
 
-    def test_more_than_four_alternatives_is_host_unstable(self):
+        self.assertEqual(
+            tuple(
+                alternative.payload
+                for alternative in trace.scenarios[0].alternatives
+            ),
+            (b"common", b"rare"),
+        )
+
+    def test_more_than_four_observed_alternatives_are_preserved(self):
         recorder = AllowedOutcomeRecorder(expected_runs=32)
         for index in range(32):
             recorder.add_run((ScenarioRun(0, 1, bytes((index % 5,))),))
 
-        with self.assertRaisesRegex(AllowedOutcomeError, "more than 4"):
-            recorder.finish(version=4, corpus_digest=7)
+        trace = recorder.finish(version=4, corpus_digest=7)
+
+        self.assertEqual(
+            tuple(
+                alternative.payload
+                for alternative in trace.scenarios[0].alternatives
+            ),
+            tuple(bytes((index,)) for index in range(5)),
+        )
 
     def test_deterministic_scenario_rejects_a_second_alternative(self):
         recorder = AllowedOutcomeRecorder(expected_runs=32, deterministic=(1,))

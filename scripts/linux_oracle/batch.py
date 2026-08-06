@@ -1,6 +1,7 @@
 """Deterministic host-record and guest-compare batch execution."""
 
 import hashlib
+import os
 import shutil
 import tempfile
 from contextlib import contextmanager
@@ -9,6 +10,8 @@ from pathlib import Path
 from typing import Callable, Iterator, Optional, Tuple
 
 from .spec import AdapterSpec
+from .outcome_store import OutcomeStore, OutcomeStoreError
+from .outcomes import AllowedOutcomeError, AllowedTrace, fnv1a64
 
 
 @dataclass(frozen=True)
@@ -110,6 +113,21 @@ def execute_batch(
                 False,
                 host_record.log + "\nHost record reported success without a trace.\n",
             )
+        if host_record.passed and spec.outcomes is not None:
+            try:
+                merge_persistent_outcomes(
+                    spec,
+                    workspace,
+                    prepared.document,
+                    prepared.encoded,
+                    trace_path,
+                )
+            except (AllowedOutcomeError, OutcomeStoreError, OSError) as error:
+                host_record = HostRecordResult(
+                    False,
+                    False,
+                    f"outcome-store-failure: {error}",
+                )
         guest_result = None
         if host_record.passed:
             shutil.copy2(host_oracle, artifact_oracle)
@@ -136,3 +154,35 @@ def execute_batch(
             host_record,
             guest_result,
         )
+
+
+def merge_persistent_outcomes(
+    spec: AdapterSpec,
+    workspace: Path,
+    document: object,
+    encoded: bytes,
+    trace_path: Path,
+) -> AllowedTrace:
+    """Merge one concurrent host trace into persistent scenario evidence."""
+    if spec.outcomes is None:
+        raise OutcomeStoreError("adapter does not define persistent outcomes")
+    allowed = AllowedTrace.from_bytes(
+        trace_path.read_bytes(),
+        expected_magic=spec.outcomes.trace_magic,
+        expected_version=spec.corpus_version,
+        expected_corpus_digest=fnv1a64(encoded),
+    )
+    merged = OutcomeStore(
+        workspace / spec.campaign.root / spec.campaign.outcome_directory
+    ).merge(
+        spec.outcomes.scenario_keys(document),
+        allowed,
+        kernel_release=os.uname().release,
+    )
+    for index in spec.outcomes.deterministic_indexes(document):
+        if len(merged.scenarios[index].alternatives) != 1:
+            raise OutcomeStoreError(
+                f"deterministic scenario {index} has persistent alternatives"
+            )
+    trace_path.write_bytes(merged.to_bytes(spec.outcomes.trace_magic))
+    return merged

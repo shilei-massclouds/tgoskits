@@ -417,8 +417,7 @@ int concurrent_allowed_compare(struct concurrent_allowed_reader *reader,
         load_le32(scenario) != scenario_index ||
         load_le32(scenario + 4) != operation_count || operation_count == 0 ||
         operation_count > CONCURRENT_MAX_OPERATIONS ||
-        alternative_count == 0 ||
-        alternative_count > CONCURRENT_MAX_ALTERNATIVES)
+        alternative_count == 0)
         return -1;
     memset(mismatch, 0, sizeof(*mismatch));
     memcpy(mismatch->allowed_set_digest, scenario + 12, 32);
