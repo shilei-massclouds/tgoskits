@@ -709,7 +709,7 @@ pipe buffer slot。默认 `simple-single` 和历史 replay routing 未改变。
 
 ### 10.4 Stage 6.4：并发、signal、timeout、epoll 与生命周期闭环
 
-**状态：进行中。**
+**状态：进行中（实现完成，aggregate acceptance 进行中；2026-08-06）。**
 
 Stage 6 的最终纵向能力使用两个独立的新 adapter，绝不升级或迁移历史格式：
 
@@ -733,6 +733,26 @@ Linux-specific 诊断，不作为兼容 gate；panic、UAF、harness failure 或
 线程仍是缺陷。公共协议见
 `book/design/starry-linux-oracle-concurrent-outcomes.md`，资源与 syscall 设计见
 `book/design/starry-eventfd-pipe-concurrent-oracle.md`。
+
+截至 2026-08-06，公共双 worker/allowed-set 框架以及 eventfd/pipe 的 multi-waiter、
+signal、timeout、epoll 和 close/OFD 生命周期实现均已完成。两个 checked artifact
+分别在 StarryOS QEMU 上匹配 212 operations / 8 scenarios 和 259 operations / 8
+scenarios；各自三份独立的 32-run Linux aggregate trace 逐字节一致。历史 adapter、
+默认 model 和精确 replay routing 未迁移。
+
+新增 oracle 已通过 fail-first regression 发现并修复六类 StarryOS 生产语义差异：
+epoll LT alias 在多 waiter 间重复返回、fd-multiplexing wait 被 `SA_RESTART` 错误
+重启、`poll`/`ppoll` 在 `EINTR` 时漏写 `revents`、epoll ET 在无新通知时重复返回、
+由 HUP 错误合成 EPOLLIN，以及 pipe 部分写在 signal interrupt 时丢失已写字节。
+同 fd cross-thread `poll` close 的 100-run Linux/Starry 诊断均可有界清理；两侧结果
+分布不同但按既定边界不作为语义 gate。
+
+最终 campaign 验收尚未完成。`eventfd-concurrent-v1` 的 seed 42 第一批 foreground
+Linux record 和 Starry QEMU 已通过并产生新 coverage；16 个 attribution 单项已
+完成，当前正在诊断五个代表项合并后的 Linux allowed-set record failure。完成该
+可恢复任务后，仍须执行 eventfd/pipe 的 4 × 16 campaign、recovery-only 清空后台
+任务，以及最终 fmt、clippy、sync/lockdep/stress QEMU 验收。在这些 gate 全部通过
+前，Stage 6 不标记 complete，Stage 7 也不据此提前开始。
 
 ## 11. 阶段 7：持续扩展与优先级管理
 
