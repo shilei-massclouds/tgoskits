@@ -872,12 +872,16 @@ def validate_schedulable_document(document: ScenarioDocument) -> None:
 
 
 def deterministic_scenario_indexes(document: ScenarioDocument) -> Tuple[int, ...]:
-    """Return scenarios that never have more than one active worker."""
+    """Return single-worker scenarios without asynchronous signal delivery."""
     validate_document(document)
     return tuple(
         index
         for index, source_scenario in enumerate(document.scenarios)
         if analyze_scenario(source_scenario).peak_active_workers <= 1
+        and not any(
+            isinstance(operation, SendSignal)
+            for operation in source_scenario.operations
+        )
     )
 
 

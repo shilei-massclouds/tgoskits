@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from linux_oracle.failure import load_failure
+from linux_oracle.batch import merge_persistent_outcomes
 from linux_oracle.persistence import PersistentStateError
 from linux_oracle.qemu import run_guest_compare
 from models import spec_for_failure
@@ -44,6 +45,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if not recorded.passed:
                 print(recorded.log, file=sys.stderr)
                 return 1
+            encoded = (
+                artifact_dir / spec.artifacts.scenario_filename
+            ).read_bytes()
+            if spec.outcomes is not None:
+                merge_persistent_outcomes(
+                    spec,
+                    args.workspace.resolve(),
+                    spec.codec.parse(encoded),
+                    encoded,
+                    artifact_dir / spec.artifacts.trace_filename,
+                )
         result = run_guest_compare(
             spec,
             args.workspace.resolve(),

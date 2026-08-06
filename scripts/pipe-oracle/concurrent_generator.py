@@ -48,7 +48,7 @@ from concurrent_scenario import (
 from generator import CampaignRng
 
 
-GENERATOR_VERSION = "pipe-concurrent-generator-v1"
+GENERATOR_VERSION = "pipe-concurrent-generator-v2"
 STORY_COUNT = 17
 
 

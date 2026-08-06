@@ -27,6 +27,7 @@ from linux_oracle.spec import (
     CampaignLayout,
     CodecSpec,
     CoverageTarget,
+    OutcomeSetHooks,
     QemuSpec,
     ReductionHooks,
 )
@@ -81,6 +82,19 @@ def _serialize(document: object) -> bytes:
 
 def _scenario_count(document: object) -> int:
     return len(document.scenarios)
+
+
+def _scenario_keys(document: object) -> tuple[str, ...]:
+    return tuple(
+        hashlib.sha256(
+            concurrent_scenario.serialize_document(
+                concurrent_scenario.ScenarioDocument(
+                    (scenario,), version=document.version
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+        for scenario in document.scenarios
+    )
 
 
 def _seed_inputs(workspace: Path):
@@ -146,6 +160,11 @@ SPEC = AdapterSpec(
     host_record=record_host_converged,
     classify_guest=classify_guest_execution,
     normalize_guest=normalize_guest_execution,
+    outcomes=OutcomeSetHooks(
+        TRACE_MAGIC,
+        _scenario_keys,
+        concurrent_scenario.deterministic_scenario_indexes,
+    ),
     campaign_hooks=CampaignHooks(
         find_or_build_host=find_or_build_host_oracle,
         seed_inputs=_seed_inputs,

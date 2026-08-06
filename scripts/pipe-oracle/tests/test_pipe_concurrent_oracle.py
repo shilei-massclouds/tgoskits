@@ -244,7 +244,7 @@ class PipeConcurrentCodecTests(unittest.TestCase):
             hashlib.sha256(encoded).hexdigest(),
         )
         self.assertEqual(
-            concurrent_scenario.deterministic_scenario_indexes(document), (6, 7)
+            concurrent_scenario.deterministic_scenario_indexes(document), ()
         )
 
     def test_recorder_derives_deterministic_indexes_after_combine(self):
@@ -268,7 +268,7 @@ class PipeConcurrentCodecTests(unittest.TestCase):
                     result,
                 )
 
-        self.assertEqual(record.call_args.kwargs["deterministic"], (0,))
+        self.assertEqual(record.call_args.kwargs["deterministic"], ())
 
 
 class PipeConcurrentRoutingTests(unittest.TestCase):
@@ -276,6 +276,10 @@ class PipeConcurrentRoutingTests(unittest.TestCase):
         self.assertIs(models.spec_for_model("concurrent"), concurrent_adapter.SPEC)
         self.assertEqual(concurrent_adapter.SPEC.adapter_id, "pipe-concurrent-v1")
         self.assertEqual(concurrent_adapter.SPEC.corpus_version, 7)
+        self.assertEqual(
+            concurrent_adapter.SPEC.generator_version,
+            "pipe-concurrent-generator-v2",
+        )
         self.assertEqual(
             concurrent_adapter.SPEC.campaign.root,
             Path("coverage/pipe-concurrent-v1-oracle-fuzz"),
@@ -333,7 +337,10 @@ class PipeConcurrentRoutingTests(unittest.TestCase):
             + vector
         )
         result = guest_result.classify_guest_execution(log, 1)
-        self.assertIs(result.category, guest_result.GuestResultCategory.SEMANTIC_MISMATCH)
+        self.assertIs(
+            result.category,
+            guest_result.GuestResultCategory.UNEXPLAINED_OUTCOME,
+        )
         self.assertEqual(result.difference.byte_offset, 24)
 
     def test_generator_mutation_and_timeout_categories_cover_new_stories(self):

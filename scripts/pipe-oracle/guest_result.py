@@ -11,6 +11,7 @@ from typing import Any, Iterable, Optional, Tuple, Union
 class GuestResultCategory(str, Enum):
     PASSED = "passed"
     SEMANTIC_MISMATCH = "semantic-mismatch"
+    UNEXPLAINED_OUTCOME = "unexplained-outcome"
     ORACLE_FAILURE = "oracle-failure"
     KERNEL_PANIC = "kernel-panic"
     LOCKDEP_FAILURE = "lockdep-failure"
@@ -168,7 +169,7 @@ def classify_guest_execution(
     concurrent_difference = parse_concurrent_difference(log)
     if concurrent_difference is not None:
         return GuestExecutionResult(
-            GuestResultCategory.SEMANTIC_MISMATCH,
+            GuestResultCategory.UNEXPLAINED_OUTCOME,
             log,
             paths,
             returncode,

@@ -24,7 +24,15 @@ import fuzz  # noqa: E402
 import fingerprint  # noqa: E402
 import guest_result  # noqa: E402
 import models  # noqa: E402
-from linux_oracle.outcomes import AllowedTrace, decode_raw_run_trace, fnv1a64  # noqa: E402
+from linux_oracle.batch import BatchInput, execute_batch  # noqa: E402
+from linux_oracle.outcomes import (  # noqa: E402
+    AllowedAlternative,
+    AllowedScenario,
+    AllowedTrace,
+    decode_raw_run_trace,
+    fnv1a64,
+)
+from linux_oracle.execution import effective_guest_category  # noqa: E402
 
 
 class EventFdConcurrentCodecTests(unittest.TestCase):
@@ -293,7 +301,19 @@ class EventFdConcurrentCodecTests(unittest.TestCase):
             hashlib.sha256(encoded).hexdigest(),
         )
         self.assertEqual(
-            concurrent_scenario.deterministic_scenario_indexes(document), (7,)
+            concurrent_scenario.deterministic_scenario_indexes(document), ()
+        )
+
+    def test_single_worker_signal_story_is_not_deterministic(self):
+        document = concurrent_scenario.ScenarioDocument(
+            (concurrent_generator.generate_scenario(
+                concurrent_generator.CampaignRng(42), story=6
+            ),),
+            version=4,
+        )
+
+        self.assertEqual(
+            concurrent_scenario.deterministic_scenario_indexes(document), ()
         )
 
     def test_recorder_derives_deterministic_indexes_after_combine(self):
@@ -317,7 +337,7 @@ class EventFdConcurrentCodecTests(unittest.TestCase):
                     result,
                 )
 
-        self.assertEqual(record.call_args.kwargs["deterministic"], (0,))
+        self.assertEqual(record.call_args.kwargs["deterministic"], ())
 
 
 class EventFdConcurrentRoutingTests(unittest.TestCase):
@@ -327,7 +347,7 @@ class EventFdConcurrentRoutingTests(unittest.TestCase):
         self.assertEqual(concurrent_adapter.SPEC.corpus_version, 4)
         self.assertEqual(
             concurrent_adapter.SPEC.generator_version,
-            "eventfd-concurrent-generator-v3",
+            "eventfd-concurrent-generator-v4",
         )
         self.assertEqual(
             concurrent_adapter.SPEC.campaign.root,
@@ -460,11 +480,99 @@ class EventFdConcurrentRoutingTests(unittest.TestCase):
         result = guest_result.classify_guest_execution(log, 1)
 
         self.assertIs(
-            result.category, guest_result.GuestResultCategory.SEMANTIC_MISMATCH
+            result.category,
+            guest_result.GuestResultCategory.UNEXPLAINED_OUTCOME,
         )
         self.assertEqual(result.difference.scenario_index, 2)
         self.assertEqual(result.difference.byte_offset, 16)
         self.assertEqual(result.difference.actual_vector, vector)
+
+    def test_deterministic_mismatch_is_confirmed_but_competition_is_questioned(self):
+        document = concurrent_scenario.parse_document(CORPUS_PATH.read_bytes())
+        guest = mock.Mock(
+            category=guest_result.GuestResultCategory.UNEXPLAINED_OUTCOME,
+            difference=mock.Mock(scenario_index=0),
+        )
+
+        self.assertEqual(
+            effective_guest_category(concurrent_adapter.SPEC, document, guest),
+            "unexplained-outcome",
+        )
+        deterministic = concurrent_scenario.parse_document(
+            b"version 4\n"
+            b"scenario timeout\n"
+            b"eventfd 0 0\n"
+            b"start-poll 1 0 1 200\n"
+            b"assert-pending 1\n"
+            b"join 1\n"
+        )
+        guest.difference.scenario_index = 0
+        self.assertEqual(
+            effective_guest_category(concurrent_adapter.SPEC, deterministic, guest),
+            "semantic-mismatch",
+        )
+
+    def test_execute_batch_reuses_persistent_linux_outcomes(self):
+        checked = concurrent_scenario.parse_document(CORPUS_PATH.read_bytes())
+        document = concurrent_scenario.ScenarioDocument(
+            (checked.scenarios[0],), version=4
+        )
+        encoded = concurrent_scenario.serialize_document(document).encode("utf-8")
+        item = BatchInput(hashlib.sha256(encoded).hexdigest(), encoded)
+        payloads = iter((b"first", b"second"))
+
+        def record(_elf, scenario_path, trace_path):
+            payload = next(payloads)
+            trace_path.write_bytes(
+                AllowedTrace(
+                    4,
+                    fnv1a64(scenario_path.read_bytes()),
+                    (
+                        AllowedScenario(
+                            0,
+                            len(document.scenarios[0].operations),
+                            (AllowedAlternative(payload),),
+                        ),
+                    ),
+                ).to_bytes(concurrent_adapter.TRACE_MAGIC)
+            )
+            return concurrent_adapter.HostRecordResult(True, False, "recorded")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            host = workspace / "eventfd-linux-oracle"
+            host.write_bytes(b"host")
+            with execute_batch(
+                concurrent_adapter.SPEC,
+                workspace,
+                (item,),
+                host,
+                record_host=record,
+                run_guest=lambda *_args: ("", (), True),
+            ):
+                pass
+            with execute_batch(
+                concurrent_adapter.SPEC,
+                workspace,
+                (item,),
+                host,
+                record_host=record,
+                run_guest=lambda *_args: ("", (), True),
+            ) as execution:
+                merged = AllowedTrace.from_bytes(
+                    execution.trace_path.read_bytes(),
+                    expected_magic=concurrent_adapter.TRACE_MAGIC,
+                    expected_version=4,
+                    expected_corpus_digest=fnv1a64(encoded),
+                )
+
+        self.assertEqual(
+            tuple(
+                alternative.payload
+                for alternative in merged.scenarios[0].alternatives
+            ),
+            (b"first", b"second"),
+        )
 
     def test_syscall_schedule_and_qemu_timeouts_are_distinct(self):
         syscall_timeout = guest_result.classify_guest_execution(
