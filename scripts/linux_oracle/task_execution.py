@@ -177,7 +177,10 @@ def run_minimization_task(
         item = BatchInput(hashlib.sha256(candidate).hexdigest(), candidate)
         observation = _execute_one(runtime, (item,), fixed_elf)
         if not observation.passed:
-            if observation.category == "host-unstable":
+            if observation.category in {
+                "host-schedule-timeout",
+                "host-unstable",
+            }:
                 raise RejectCandidate(
                     CandidateRejection(
                         observation.category,

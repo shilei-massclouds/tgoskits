@@ -218,6 +218,57 @@ class FrameworkContractTests(unittest.TestCase):
             self.assertEqual(recovered.metadata["state"], "running")
             self.assertIsNone(recovered.metadata["result"])
 
+    def test_host_schedule_timeout_initial_reduction_input_remains_fatal(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            store = CampaignStore(FAKE_SPEC, workspace)
+            original = fake_input("timed-out-original").encoded
+            task_store = TaskStore(FAKE_SPEC, store.root, "minimization")
+            task = task_store.claim(
+                task_store.create("reject-timeout-original", (original,))
+            )
+            diagnostic = (
+                "STARRY_EVENTFD_LINUX_ORACLE_SCHEDULE_TIMEOUT: "
+                'line=9 operation="write 1 8 0 1"'
+            )
+
+            def observe(*_args, **_kwargs):
+                return driver.ExecutionObservation(
+                    False,
+                    "host-schedule-timeout",
+                    (),
+                    "",
+                    diagnostic,
+                )
+
+            runtime = TaskRuntime(
+                FAKE_SPEC,
+                FAKE_SPEC.campaign_hooks,
+                workspace,
+                store,
+                workspace / "host-oracle",
+                CampaignBudget(16),
+                0,
+                observe,
+            )
+            with self.assertRaisesRegex(
+                driver.CampaignReplayError,
+                "minimization replay failed: host-schedule-timeout",
+            ):
+                run_minimization_task(
+                    runtime,
+                    task_store,
+                    task,
+                    original,
+                    {"region:1:1"},
+                    workspace / "starryos",
+                    8,
+                )
+
+            recovered = task_store.load(task.path)
+            self.assertEqual(recovered.metadata["state"], "running")
+            self.assertIsNone(recovered.metadata["result"])
+
     def test_host_unstable_reduction_candidate_is_rejected_with_audit(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             workspace = Path(temporary_directory)
@@ -280,6 +331,76 @@ class FrameworkContractTests(unittest.TestCase):
                         "category": "host-unstable",
                         "detail": diagnostic,
                         "digest": hashlib.sha256(unstable_candidate).hexdigest(),
+                    }
+                ],
+            )
+
+    def test_host_schedule_timeout_reduction_candidate_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            store = CampaignStore(FAKE_SPEC, workspace)
+            original = fake_input("keep", "drop").encoded
+            timed_out_candidate = fake_input("keep").encoded
+            reduction = replace(
+                FAKE_SPEC.campaign_hooks.reduction,
+                candidates=lambda encoded: (
+                    (timed_out_candidate,) if encoded == original else ()
+                ),
+            )
+            hooks = replace(FAKE_SPEC.campaign_hooks, reduction=reduction)
+            task_store = TaskStore(FAKE_SPEC, store.root, "minimization")
+            task = task_store.claim(
+                task_store.create("reject-timeout-candidate", (original,))
+            )
+            diagnostic = (
+                "STARRY_EVENTFD_LINUX_ORACLE_SCHEDULE_TIMEOUT: "
+                'line=9 operation="write 1 8 0 1"'
+            )
+
+            def observe(*args, **_kwargs):
+                candidate = args[4][0].encoded
+                if candidate == timed_out_candidate:
+                    return driver.ExecutionObservation(
+                        False,
+                        "host-schedule-timeout",
+                        (),
+                        "",
+                        diagnostic,
+                    )
+                return driver.ExecutionObservation(
+                    True, "passed", ("region:1:1",), "e" * 64
+                )
+
+            runtime = TaskRuntime(
+                FAKE_SPEC,
+                hooks,
+                workspace,
+                store,
+                workspace / "host-oracle",
+                CampaignBudget(16),
+                0,
+                observe,
+            )
+            result = run_minimization_task(
+                runtime,
+                task_store,
+                task,
+                original,
+                {"region:1:1"},
+                workspace / "starryos",
+                8,
+            )
+
+            self.assertEqual(result, original)
+            completed = task_store.load(task.path)
+            self.assertEqual(completed.metadata["state"], "completed")
+            self.assertEqual(
+                completed.metadata["result"]["candidate_rejections"],
+                [
+                    {
+                        "category": "host-schedule-timeout",
+                        "detail": diagnostic,
+                        "digest": hashlib.sha256(timed_out_candidate).hexdigest(),
                     }
                 ],
             )
@@ -359,6 +480,45 @@ class FrameworkContractTests(unittest.TestCase):
 
             self.assertFalse(observation.passed)
             self.assertEqual(observation.category, "host-unstable")
+            self.assertEqual(observation.detail, diagnostic)
+            self.assertEqual(budget.used, 0)
+
+    def test_host_schedule_timeout_preserves_typed_category_and_diagnostic(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            host = workspace / "source-runner"
+            host.write_bytes(b"ELF")
+            store = CampaignStore(FAKE_SPEC, workspace)
+            budget = CampaignBudget(1)
+            diagnostic = (
+                "STARRY_PIPE_LINUX_ORACLE_SCHEDULE_TIMEOUT: "
+                'line=9 operation="write 1 8 0 1"'
+            )
+
+            @contextmanager
+            def fail_on_host(*_args, **_kwargs):
+                yield mock.Mock(
+                    host_record=HostRecordResult(False, False, diagnostic),
+                    guest_result=None,
+                )
+
+            with mock.patch.object(
+                common_execution,
+                "execute_batch",
+                side_effect=fail_on_host,
+            ):
+                observation = common_execution.execute_inputs(
+                    FAKE_SPEC,
+                    workspace,
+                    store,
+                    host,
+                    (fake_input("host-schedule-timeout"),),
+                    budget,
+                    batch_index=0,
+                )
+
+            self.assertFalse(observation.passed)
+            self.assertEqual(observation.category, "host-schedule-timeout")
             self.assertEqual(observation.detail, diagnostic)
             self.assertEqual(budget.used, 0)
 

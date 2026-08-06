@@ -69,6 +69,8 @@ def execute_inputs(
                 category = "host-parser-rejection"
             elif execution.host_record.log.startswith("host-unstable:"):
                 category = "host-unstable"
+            elif "SCHEDULE_TIMEOUT:" in execution.host_record.log:
+                category = "host-schedule-timeout"
             else:
                 category = "host-record-failure"
             return ExecutionObservation(
