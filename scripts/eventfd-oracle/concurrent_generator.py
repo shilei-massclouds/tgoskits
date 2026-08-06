@@ -7,6 +7,7 @@ from concurrent_scenario import (
     AssertAllPending,
     AssertPending,
     AssertSignalHandled,
+    Close,
     Dup,
     EFD_SEMAPHORE,
     EPOLLEXCLUSIVE,
@@ -50,7 +51,7 @@ from poll_generator import CampaignRng
 
 
 GENERATOR_VERSION = "eventfd-concurrent-generator-v1"
-STORY_COUNT = 14
+STORY_COUNT = 15
 _FULL_COUNTER_INCREMENT = MAX_COUNTER - ((1 << 32) - 1)
 
 
@@ -115,7 +116,9 @@ def generate_scenario(rng: CampaignRng, story: Optional[int] = None) -> Scenario
         return _epoll_oneshot_story(rng, actors)
     if story_index == 12:
         return _epoll_exclusive_story(rng, actors)
-    return _epoll_signal_timeout_story(rng, actors[0])
+    if story_index == 13:
+        return _epoll_signal_timeout_story(rng, actors[0])
+    return _epoll_lifetime_story(rng, actors[0])
 
 
 def generate_document(rng: CampaignRng) -> ScenarioDocument:
@@ -301,6 +304,29 @@ def _epoll_lt_story(rng: CampaignRng, actors: tuple[int, int]) -> Scenario:
             AssertAllPending(),
             Write(event, 8, PointerMode.VALID, 1),
             JoinSet((1, 2)),
+        )
+    )
+
+
+def _epoll_lifetime_story(rng: CampaignRng, actor: int) -> Scenario:
+    event, alias, epoll = _distinct_slots(rng, 3)
+    return Scenario(
+        (
+            EventFd(event, 0),
+            Dup(event, alias),
+            EpollCreate(epoll, 0),
+            EpollCtl(epoll, EpollCtlAction.ADD, event, EPOLLIN, 153),
+            Close(event),
+            StartEpollWait(actor, epoll, 1, -1),
+            AssertPending(actor),
+            Write(alias, 8, PointerMode.VALID, 1),
+            Join(actor),
+            Read(alias, 8, PointerMode.VALID),
+            Close(alias),
+            EventFd(event, 1),
+            StartEpollWait(actor, epoll, 1, 200),
+            AssertPending(actor),
+            Join(actor),
         )
     )
 

@@ -179,6 +179,29 @@ class EventFdConcurrentCodecTests(unittest.TestCase):
         self.assertIn("start-read 2 1 8", canonical)
         self.assertIn("join-set 1 2", canonical)
 
+    def test_epoll_interest_tracks_eventfd_ofd_lifetime(self):
+        state = concurrent_scenario.ResourceState()
+        operations = (
+            concurrent_scenario.EventFd(0, 0),
+            concurrent_scenario.Dup(0, 1),
+            concurrent_scenario.EpollCreate(2, 0),
+            concurrent_scenario.EpollCtl(
+                2,
+                concurrent_scenario.EpollCtlAction.ADD,
+                0,
+                concurrent_scenario.EPOLLIN,
+                17,
+            ),
+            concurrent_scenario.Close(0),
+        )
+        for operation in operations:
+            state.apply(operation)
+        self.assertEqual(len(state.epolls[2].registrations), 1)
+
+        state.apply(concurrent_scenario.Close(1))
+
+        self.assertEqual(state.epolls[2].registrations, {})
+
     def test_v4_rejects_invalid_actor_mask_timeout_and_cross_version(self):
         invalid = (
             "version 4\nscenario x\neventfd 0 0\nstart-read 3 0 8\n"
@@ -295,6 +318,12 @@ class EventFdConcurrentRoutingTests(unittest.TestCase):
                 for operation in generated[13].operations
             )
         )
+        self.assertTrue(
+            any(
+                isinstance(operation, concurrent_scenario.Close)
+                for operation in generated[14].operations
+            )
+        )
 
         parent = concurrent_scenario.ScenarioDocument((generated[0],), version=4)
         donor = concurrent_scenario.ScenarioDocument((generated[6],), version=4)
@@ -405,7 +434,7 @@ class EventFdConcurrentHarnessTests(unittest.TestCase):
                 expected_corpus_digest=corpus_digest,
             )
             self.assertEqual(len(scenarios), 8)
-            self.assertEqual(sum(item.operation_count for item in scenarios), 197)
+            self.assertEqual(sum(item.operation_count for item in scenarios), 212)
 
             aggregate = root / "linux.trace"
             result = concurrent_adapter.record_host_converged(
@@ -458,6 +487,31 @@ class EventFdConcurrentHarnessTests(unittest.TestCase):
             )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("operations=23 scenarios=3", result.stdout)
+
+    def test_alias_close_and_fd_reuse_lifetime_executes_on_host(self):
+        encoded = (
+            "version 4\nscenario eventfd-ofd-lifetime\n"
+            "eventfd 0 0\ndup 0 1\nepoll-create 2 0\n"
+            "epoll-ctl 2 add 0 1 17\nclose 0\n"
+            "start-epoll-wait 1 2 1 -1\nassert-pending 1\n"
+            "write 1 8 0 1\njoin 1\nread 1 8 0\nclose 1\n"
+            "eventfd 0 1\n"
+            "start-epoll-wait 1 2 1 200\nassert-pending 1\njoin 1\n"
+        )
+        document = concurrent_scenario.parse_document(encoded)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            corpus = root / "lifetime.ops"
+            trace = root / "lifetime.trace"
+            corpus.write_text(concurrent_scenario.serialize_document(document))
+            result = subprocess.run(
+                [str(self.oracle), "--record", str(corpus), str(trace)],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("operations=15 scenarios=1", result.stdout)
 
     def test_cleanup_joins_restarted_and_masked_workers(self):
         corpora = (

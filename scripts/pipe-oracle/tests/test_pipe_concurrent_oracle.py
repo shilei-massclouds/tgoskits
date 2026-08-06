@@ -144,6 +144,83 @@ class PipeConcurrentCodecTests(unittest.TestCase):
         self.assertIn("start-read 2 0 1", canonical)
         self.assertIn("join-set 1 2", canonical)
 
+    def test_blocked_io_holds_ofd_after_descriptor_close(self):
+        encoded = (
+            "version 7\n"
+            "scenario blocked-read-close\n"
+            "pipe2 0 1 0\n"
+            "start-read 1 0 1\n"
+            "assert-pending 1\n"
+            "close 0\n"
+            "assert-pending 1\n"
+            "write 1 1 65\n"
+            "join 1\n"
+            "scenario blocked-write-close\n"
+            "pipe2 0 1 0\n"
+            "set-size 1 4096\n"
+            "write 1 4096 17\n"
+            "start-write 1 1 4096\n"
+            "assert-pending 1\n"
+            "close 1\n"
+            "assert-pending 1\n"
+            "read 0 4096\n"
+            "join 1\n"
+        )
+
+        document = concurrent_scenario.parse_document(encoded)
+
+        self.assertEqual(
+            concurrent_scenario.parse_document(
+                concurrent_scenario.serialize_document(document)
+            ),
+            document,
+        )
+
+    def test_epoll_interest_tracks_ofd_lifetime_not_fd_number(self):
+        encoded = (
+            "version 7\n"
+            "scenario epoll-ofd-lifetime\n"
+            "pipe2 0 1 0\n"
+            "dup 0 2\n"
+            "epoll-create 3 0\n"
+            "epoll-ctl 3 add 0 1 17\n"
+            "close 0\n"
+            "start-epoll-wait 1 3 1 -1\n"
+            "assert-pending 1\n"
+            "write 1 1 65\n"
+            "join 1\n"
+            "read 2 1\n"
+            "close 2\n"
+            "close 1\n"
+            "pipe2 0 1 0\n"
+            "write 1 1 66\n"
+            "start-epoll-wait 1 3 1 200\n"
+            "assert-pending 1\n"
+            "join 1\n"
+        )
+
+        document = concurrent_scenario.parse_document(encoded)
+
+        self.assertEqual(len(document.scenarios), 1)
+
+    def test_last_reader_close_completes_pollerr_and_epipe_workers(self):
+        encoded = (
+            "version 7\n"
+            "scenario pollerr-epipe\n"
+            "pipe2 0 1 0\n"
+            "set-size 1 4096\n"
+            "write 1 4096 17\n"
+            "start-write 1 1 4096\n"
+            "start-poll 2 1 4 -1\n"
+            "assert-all-pending\n"
+            "close 0\n"
+            "join-set 1 2\n"
+        )
+
+        document = concurrent_scenario.parse_document(encoded)
+
+        self.assertEqual(len(document.scenarios), 1)
+
     def test_v7_rejects_invalid_actor_and_cross_version(self):
         with self.assertRaises(concurrent_scenario.ScenarioCodecError):
             concurrent_scenario.parse_document(
@@ -263,6 +340,18 @@ class PipeConcurrentRoutingTests(unittest.TestCase):
             any(
                 isinstance(operation, concurrent_scenario.StartEpollPwait2)
                 for operation in generated[14].operations
+            )
+        )
+        self.assertTrue(
+            any(
+                isinstance(operation, concurrent_scenario.EpollCreate)
+                for operation in generated[15].operations
+            )
+        )
+        self.assertTrue(
+            any(
+                isinstance(operation, concurrent_scenario.Close)
+                for operation in generated[16].operations
             )
         )
 
@@ -388,6 +477,43 @@ class PipeConcurrentHarnessTests(unittest.TestCase):
             )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("operations=23 scenarios=3", result.stdout)
+
+    def test_close_and_ofd_lifetime_stories_execute_on_host(self):
+        encoded = (
+            "version 7\n"
+            "scenario blocked-read-close\n"
+            "pipe2 0 1 0\nstart-read 1 0 1\nassert-pending 1\n"
+            "close 0\nassert-pending 1\nwrite 1 1 65\njoin 1\n"
+            "scenario blocked-write-close\n"
+            "pipe2 0 1 0\nset-size 1 4096\nwrite 1 4096 17\n"
+            "start-write 1 1 4096\nassert-pending 1\nclose 1\n"
+            "assert-pending 1\nread 0 4096\njoin 1\n"
+            "scenario pollerr-epipe\n"
+            "pipe2 0 1 0\nset-size 1 4096\nwrite 1 4096 34\n"
+            "start-write 1 1 4096\nstart-poll 2 1 4 -1\n"
+            "assert-all-pending\nclose 0\njoin-set 1 2\n"
+            "scenario epoll-ofd-lifetime\n"
+            "pipe2 0 1 0\ndup 0 2\nepoll-create 3 0\n"
+            "epoll-ctl 3 add 0 1 17\nclose 0\n"
+            "start-epoll-wait 1 3 1 -1\nassert-pending 1\n"
+            "write 1 1 66\njoin 1\nread 2 1\nclose 2\nclose 1\n"
+            "pipe2 0 1 0\nwrite 1 1 67\n"
+            "start-epoll-wait 1 3 1 200\nassert-pending 1\njoin 1\n"
+        )
+        document = concurrent_scenario.parse_document(encoded)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            corpus = root / "lifetime.ops"
+            trace = root / "lifetime.trace"
+            corpus.write_text(concurrent_scenario.serialize_document(document))
+            result = subprocess.run(
+                [str(self.oracle), "--record", str(corpus), str(trace)],
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("operations=41 scenarios=4", result.stdout)
 
     def test_cleanup_joins_restart_mask_and_large_write_workers(self):
         corpora = (

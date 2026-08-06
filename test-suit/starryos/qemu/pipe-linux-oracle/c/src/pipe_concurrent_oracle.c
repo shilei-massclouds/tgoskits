@@ -102,6 +102,9 @@ enum worker_kind {
 struct epoll_registration {
     int active;
     int target_slot;
+    int pipe_id;
+    int description_id;
+    int endpoint;
     uint32_t events;
     uint64_t data;
 };
@@ -122,6 +125,10 @@ struct concurrent_worker_state {
     int slot;
     int fd;
     int peer_fd;
+    int pipe_id;
+    int description_id;
+    int endpoint;
+    int descriptor_closed;
     size_t length;
     unsigned char byte_value;
     struct pollfd poll_fd;
@@ -150,8 +157,12 @@ struct concurrent_context {
     int slot_peer_fds[MAX_SLOTS];
     int slot_epolls[MAX_SLOTS];
     int slot_endpoints[MAX_SLOTS];
+    int slot_pipe_ids[MAX_SLOTS];
+    int slot_description_ids[MAX_SLOTS];
     struct epoll_object epolls[MAX_EPOLL_OBJECTS];
     int epoll_count;
+    int next_pipe_id;
+    int next_description_id;
     uint32_t scenario_index;
     uint32_t operation_index;
     uint32_t total_operations;
@@ -442,9 +453,13 @@ static void initialize_scenario(struct concurrent_context *context)
         context->slot_peer_fds[index] = -1;
         context->slot_epolls[index] = -1;
         context->slot_endpoints[index] = ENDPOINT_NONE;
+        context->slot_pipe_ids[index] = -1;
+        context->slot_description_ids[index] = -1;
     }
     memset(context->epolls, 0, sizeof(context->epolls));
     context->epoll_count = 0;
+    context->next_pipe_id = 0;
+    context->next_description_id = 0;
     context->operation_index = 0;
     context->accounted_actor_mask = 0;
     memset(context->results, 0, sizeof(context->results));
@@ -477,6 +492,8 @@ static int cleanup_scenario(struct concurrent_context *context)
             context->slot_peer_fds[index] = -1;
             context->slot_epolls[index] = -1;
             context->slot_endpoints[index] = ENDPOINT_NONE;
+            context->slot_pipe_ids[index] = -1;
+            context->slot_description_ids[index] = -1;
         }
     }
     if (configure_count_signal_handler(SIGUSR1, 0, NULL) != 0)
@@ -732,6 +749,138 @@ static void *run_worker(void *argument)
     return NULL;
 }
 
+static int worker_is_incomplete(const struct concurrent_worker_state *worker)
+{
+    return worker->active &&
+           atomic_load_explicit(&worker->controller->phase,
+                                memory_order_acquire) !=
+               CONTROLLED_WORKER_COMPLETED;
+}
+
+static int description_has_reference(const struct concurrent_context *context,
+                                     int description_id)
+{
+    int index;
+
+    for (index = 0; index < MAX_SLOTS; index++) {
+        if (context->slots[index] >= 0 &&
+            context->slot_description_ids[index] == description_id)
+            return 1;
+    }
+    for (index = 0; index < CONTROLLED_WORKER_COUNT; index++) {
+        const struct concurrent_worker_state *worker = &context->workers[index];
+
+        if (worker_is_incomplete(worker) &&
+            worker->description_id == description_id)
+            return 1;
+    }
+    return 0;
+}
+
+static void drop_released_epoll_description(struct concurrent_context *context,
+                                            int description_id)
+{
+    int epoll_index;
+
+    if (description_id < 0 ||
+        description_has_reference(context, description_id))
+        return;
+    for (epoll_index = 0; epoll_index < context->epoll_count; epoll_index++) {
+        struct epoll_object *epoll = &context->epolls[epoll_index];
+        int registration_index;
+
+        for (registration_index = 0;
+             registration_index < MAX_EPOLL_REGISTRATIONS;
+             registration_index++) {
+            struct epoll_registration *registration =
+                &epoll->registrations[registration_index];
+
+            if (registration->active &&
+                registration->description_id == description_id)
+                memset(registration, 0, sizeof(*registration));
+        }
+    }
+}
+
+static int pipe_endpoint_alive(const struct concurrent_context *context,
+                               int pipe_id, int endpoint)
+{
+    int index;
+
+    for (index = 0; index < MAX_SLOTS; index++) {
+        if (context->slots[index] >= 0 &&
+            context->slot_pipe_ids[index] == pipe_id &&
+            context->slot_endpoints[index] == endpoint)
+            return 1;
+    }
+    for (index = 0; index < CONTROLLED_WORKER_COUNT; index++) {
+        const struct concurrent_worker_state *worker = &context->workers[index];
+
+        if (worker_is_incomplete(worker) && worker->pipe_id == pipe_id &&
+            worker->endpoint == endpoint)
+            return 1;
+    }
+    return 0;
+}
+
+static int epoll_worker_watches_closed_endpoint(
+    const struct concurrent_context *context,
+    const struct concurrent_worker_state *worker, int pipe_id,
+    int closed_endpoint)
+{
+    const struct epoll_object *epoll;
+    int wanted_endpoint = closed_endpoint == ENDPOINT_READER ?
+                              ENDPOINT_WRITER :
+                              ENDPOINT_READER;
+    int index;
+
+    if (worker->kind != WORKER_EPOLL_WAIT &&
+        worker->kind != WORKER_EPOLL_PWAIT &&
+        worker->kind != WORKER_EPOLL_PWAIT2)
+        return 0;
+    epoll = &context->epolls[worker->epoll_object];
+    for (index = 0; index < MAX_EPOLL_REGISTRATIONS; index++) {
+        const struct epoll_registration *registration =
+            &epoll->registrations[index];
+
+        if (registration->active && registration->pipe_id == pipe_id &&
+            registration->endpoint == wanted_endpoint)
+            return 1;
+    }
+    return 0;
+}
+
+static int endpoint_close_affects_worker(
+    const struct concurrent_context *context, int pipe_id, int closed_endpoint)
+{
+    int actor;
+
+    for (actor = 0; actor < CONTROLLED_WORKER_COUNT; actor++) {
+        const struct concurrent_worker_state *worker = &context->workers[actor];
+
+        if (!worker_is_incomplete(worker))
+            continue;
+        if (worker->pipe_id == pipe_id) {
+            if (closed_endpoint == ENDPOINT_READER &&
+                (worker->kind == WORKER_WRITE ||
+                 ((worker->kind == WORKER_POLL ||
+                   worker->kind == WORKER_PPOLL) &&
+                  (worker->poll_fd.events & POLLOUT) != 0)))
+                return 1;
+            if (closed_endpoint == ENDPOINT_WRITER &&
+                (worker->kind == WORKER_READ ||
+                 ((worker->kind == WORKER_POLL ||
+                   worker->kind == WORKER_PPOLL) &&
+                  (worker->poll_fd.events & POLLIN) != 0)))
+                return 1;
+        }
+        if (epoll_worker_watches_closed_endpoint(
+                context, worker, pipe_id, closed_endpoint))
+            return 1;
+    }
+    return 0;
+}
+
 static void account_worker(struct concurrent_context *context, int actor)
 {
     struct concurrent_worker_state *worker = &context->workers[actor - 1];
@@ -742,6 +891,7 @@ static void account_worker(struct concurrent_context *context, int actor)
         return;
     worker->accounted = 1;
     context->accounted_actor_mask |= 1U << (actor - 1);
+    drop_released_epoll_description(context, worker->description_id);
 }
 
 static int worker_is_ready(struct concurrent_worker_state *worker)
@@ -754,6 +904,8 @@ static int worker_is_ready(struct concurrent_worker_state *worker)
     if (atomic_load_explicit(&worker->controller->phase,
                              memory_order_acquire) == CONTROLLED_WORKER_COMPLETED)
         return 1;
+    if (worker->descriptor_closed)
+        return 0;
     descriptor.fd = worker->fd;
     descriptor.events =
         worker->kind == WORKER_READ ? POLLIN :
@@ -860,19 +1012,6 @@ static int wait_for_partial_write_progress(struct concurrent_worker_state *worke
     return -4;
 }
 
-static int has_any_unaccounted_worker(struct concurrent_context *context)
-{
-    int actor;
-
-    for (actor = 1; actor <= CONTROLLED_WORKER_COUNT; actor++) {
-        struct concurrent_worker_state *worker = &context->workers[actor - 1];
-
-        if (worker->active && !worker->accounted)
-            return 1;
-    }
-    return 0;
-}
-
 static int wait_for_trigger_progress(struct concurrent_context *context,
                                      int progress_required)
 {
@@ -922,12 +1061,20 @@ static int execute_pipe2(struct concurrent_context *context, char *save,
     syscall_result = syscall(SYS_pipe2, descriptors, flags);
     finish_syscall_result(result, syscall_result);
     if (syscall_result == 0) {
+        int pipe_id = context->next_pipe_id++;
+
         context->slots[read_slot] = descriptors[0];
         context->slots[write_slot] = descriptors[1];
         context->slot_peer_fds[read_slot] = descriptors[1];
         context->slot_peer_fds[write_slot] = descriptors[0];
         context->slot_endpoints[read_slot] = ENDPOINT_READER;
         context->slot_endpoints[write_slot] = ENDPOINT_WRITER;
+        context->slot_pipe_ids[read_slot] = pipe_id;
+        context->slot_pipe_ids[write_slot] = pipe_id;
+        context->slot_description_ids[read_slot] =
+            context->next_description_id++;
+        context->slot_description_ids[write_slot] =
+            context->next_description_id++;
     }
     result->kind = OP_PIPE2;
     return 0;
@@ -1029,6 +1176,9 @@ static int execute_dup(struct concurrent_context *context, char *save,
         context->slots[destination] = (int)syscall_result;
         context->slot_peer_fds[destination] = context->slot_peer_fds[source];
         context->slot_endpoints[destination] = context->slot_endpoints[source];
+        context->slot_pipe_ids[destination] = context->slot_pipe_ids[source];
+        context->slot_description_ids[destination] =
+            context->slot_description_ids[source];
     }
     result->kind = OP_DUP;
     return 0;
@@ -1039,23 +1189,45 @@ static int execute_close(struct concurrent_context *context, char *save,
 {
     char *slot_text = strtok_r(NULL, " \t", &save);
     long syscall_result;
+    int description_id;
+    int closed_fd;
+    int endpoint;
+    int pipe_id;
+    int progress_required = 0;
     int slot;
+    int actor;
 
     if (parse_slot(slot_text, &slot) != 0 || context->slots[slot] < 0 ||
         strtok_r(NULL, " \t", &save) != NULL)
         return -1;
+    closed_fd = context->slots[slot];
+    pipe_id = context->slot_pipe_ids[slot];
+    description_id = context->slot_description_ids[slot];
+    endpoint = context->slot_endpoints[slot];
     errno = 0;
-    syscall_result = syscall(SYS_close, context->slots[slot]);
+    syscall_result = syscall(SYS_close, closed_fd);
     finish_syscall_result(result, syscall_result);
     if (syscall_result == 0) {
+        for (actor = 0; actor < CONTROLLED_WORKER_COUNT; actor++) {
+            struct concurrent_worker_state *worker = &context->workers[actor];
+
+            if (worker_is_incomplete(worker) && worker->fd == closed_fd)
+                worker->descriptor_closed = 1;
+        }
         context->slots[slot] = -1;
         context->slot_peer_fds[slot] = -1;
         context->slot_epolls[slot] = -1;
         context->slot_endpoints[slot] = ENDPOINT_NONE;
+        context->slot_pipe_ids[slot] = -1;
+        context->slot_description_ids[slot] = -1;
+        drop_released_epoll_description(context, description_id);
+        if (pipe_id >= 0 && endpoint != ENDPOINT_NONE &&
+            !pipe_endpoint_alive(context, pipe_id, endpoint) &&
+            endpoint_close_affects_worker(context, pipe_id, endpoint))
+            progress_required = 1;
     }
     result->kind = OP_CLOSE;
-    return wait_for_trigger_progress(context,
-                                     has_any_unaccounted_worker(context));
+    return wait_for_trigger_progress(context, progress_required);
 }
 
 static int execute_fcntl(struct concurrent_context *context, char *save,
@@ -1203,6 +1375,10 @@ static int execute_epoll_ctl(struct concurrent_context *context, char *save,
             memset(registration, 0, sizeof(*registration));
             registration->active = 1;
             registration->target_slot = target_slot;
+            registration->pipe_id = context->slot_pipe_ids[target_slot];
+            registration->description_id =
+                context->slot_description_ids[target_slot];
+            registration->endpoint = context->slot_endpoints[target_slot];
         }
         if (command == EPOLL_CTL_DEL) {
             memset(registration, 0, sizeof(*registration));
@@ -1298,6 +1474,9 @@ static int execute_start_worker(struct concurrent_context *context, char *save,
     worker->slot = slot;
     worker->fd = context->slots[slot];
     worker->peer_fd = context->slot_peer_fds[slot];
+    worker->pipe_id = context->slot_pipe_ids[slot];
+    worker->description_id = context->slot_description_ids[slot];
+    worker->endpoint = context->slot_endpoints[slot];
     worker->epoll_object = -1;
     worker->start_result_index = context->operation_index;
     worker->length = (size_t)argument;
@@ -1396,6 +1575,9 @@ static int execute_start_epoll_worker(
     worker->slot = slot;
     worker->fd = context->slots[slot];
     worker->peer_fd = -1;
+    worker->pipe_id = -1;
+    worker->description_id = -1;
+    worker->endpoint = ENDPOINT_NONE;
     worker->epoll_object = context->slot_epolls[slot];
     worker->start_result_index = context->operation_index;
     worker->maxevents = (int)maxevents;

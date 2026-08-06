@@ -23,8 +23,17 @@ exec sleep 300
 """
 asset_cache = "bypass"
 default_run = false
-success_regex = ['(?m)^STARRY_PIPE_LINUX_ORACLE_PASSED: operations=[0-9]+ host_linux=[^\r\n]+\r?$']
+success_regex = [
+    '(?m)^STARRY_PIPE_LINUX_ORACLE_PASSED: operations=[0-9]+ host_linux=[^\r\n]+\r?$',
+    '(?m)^STARRY_PIPE_LINUX_ORACLE_PASSED: operations=[0-9]+ scenarios=[0-9]+\r?$',
+]
 fail_regex = [
+    "(?m)^STARRY_PIPE_LINUX_ORACLE_FAILED:",
+    # Let the harness finish printing the complete concurrent fingerprint;
+    # the shell emits AXTEST_COVERAGE_DEFERRED_FAIL after its nonzero exit.
+    "(?m)^STARRY_PIPE_LINUX_ORACLE_SYSCALL_TIMEOUT:",
+    "(?m)^STARRY_PIPE_LINUX_ORACLE_SCHEDULE_TIMEOUT:",
+    "(?m)^STARRY_PIPE_LINUX_ORACLE_HARNESS_ERROR:",
     '(?i)\bpanic(?:ked)?\b',
     "(?m)^lockdep fatal violation\\s*$",
     "AXTEST_COVERAGE_DEFERRED_FAIL",

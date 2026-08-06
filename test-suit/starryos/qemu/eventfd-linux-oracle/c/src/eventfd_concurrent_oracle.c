@@ -958,6 +958,67 @@ static int execute_dup(struct concurrent_context *context, char *save,
     return 0;
 }
 
+static int object_has_descriptor(const struct concurrent_context *context,
+                                 int object)
+{
+    int slot;
+
+    for (slot = 0; slot < MAX_SLOTS; slot++) {
+        if (context->slots[slot] >= 0 && context->slot_objects[slot] == object)
+            return 1;
+    }
+    return 0;
+}
+
+static void drop_released_epoll_object(struct concurrent_context *context,
+                                       int object)
+{
+    int epoll_index;
+
+    if (object_has_descriptor(context, object))
+        return;
+    for (epoll_index = 0; epoll_index < context->epoll_count; epoll_index++) {
+        struct epoll_object *epoll = &context->epolls[epoll_index];
+        int registration_index;
+
+        for (registration_index = 0;
+             registration_index < MAX_EPOLL_REGISTRATIONS;
+             registration_index++) {
+            struct epoll_registration *registration =
+                &epoll->registrations[registration_index];
+
+            if (registration->active && registration->object == object)
+                memset(registration, 0, sizeof(*registration));
+        }
+    }
+}
+
+static int execute_close(struct concurrent_context *context, char *save,
+                         struct concurrent_operation_result *result)
+{
+    char *slot_text = strtok_r(NULL, " \t", &save);
+    long syscall_result;
+    int object;
+    int slot;
+
+    if (parse_slot(slot_text, &slot) != 0 || context->slots[slot] < 0 ||
+        context->slot_objects[slot] < 0 ||
+        strtok_r(NULL, " \t", &save) != NULL)
+        return -1;
+    object = context->slot_objects[slot];
+    errno = 0;
+    syscall_result = syscall(SYS_close, context->slots[slot]);
+    finish_syscall_result(result, syscall_result);
+    if (syscall_result == 0) {
+        context->slots[slot] = -1;
+        context->slot_objects[slot] = -1;
+        context->slot_epolls[slot] = -1;
+        drop_released_epoll_object(context, object);
+    }
+    result->kind = OP_CLOSE;
+    return 0;
+}
+
 static int execute_fcntl(struct concurrent_context *context, char *save,
                          struct concurrent_operation_result *result,
                          int command, uint32_t kind)
@@ -1568,6 +1629,8 @@ static int execute_operation(struct concurrent_context *context, char *line,
         return execute_write(context, save, result);
     if (strcmp(operation, "dup") == 0)
         return execute_dup(context, save, result);
+    if (strcmp(operation, "close") == 0)
+        return execute_close(context, save, result);
     if (strcmp(operation, "get-status-flags") == 0)
         return execute_fcntl(context, save, result, F_GETFL,
                              OP_GET_STATUS_FLAGS);

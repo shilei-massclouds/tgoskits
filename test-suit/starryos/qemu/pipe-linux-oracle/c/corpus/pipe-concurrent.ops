@@ -67,12 +67,15 @@ read 0 1
 epoll-create 2 0
 epoll-ctl 2 add 0 2147483649 119
 start-epoll-wait 1 2 1 -1
-start-epoll-wait 2 2 1 -1
-assert-all-pending
+assert-pending 1
 write 1 1 72
+join 1
+start-epoll-wait 1 2 1 -1
+assert-pending 1
 read 0 1
+assert-pending 1
 write 1 1 73
-join-set 1 2
+join 1
 scenario generated-0005
 pipe2 0 1 0
 set-size 1 4096
@@ -87,11 +90,13 @@ join-set 1 2
 epoll-create 2 0
 epoll-ctl 2 add 0 1073741825 136
 start-epoll-wait 1 2 1 -1
-start-epoll-wait 2 2 1 -1
-assert-all-pending
+assert-pending 1
 write 1 1 74
+join 1
+start-epoll-wait 1 2 1 -1
+assert-pending 1
 epoll-ctl 2 mod 0 1073741825 153
-join-set 1 2
+join 1
 scenario generated-0006
 pipe2 0 1 0
 start-poll 1 0 1 -1
@@ -106,6 +111,47 @@ start-epoll-wait 1 4 1 -1
 assert-pending 1
 close 3
 join 1
+pipe2 5 6 0
+dup 5 7
+epoll-create 8 0
+epoll-ctl 8 add 5 1 221
+close 5
+start-epoll-wait 1 8 1 -1
+assert-pending 1
+write 6 1 111
+join 1
+read 7 1
+close 7
+close 6
+pipe2 5 6 0
+write 6 1 112
+start-epoll-wait 1 8 1 200
+assert-pending 1
+join 1
+pipe2 9 10 0
+start-read 1 9 1
+assert-pending 1
+close 9
+assert-pending 1
+write 10 1 113
+join 1
+pipe2 11 12 0
+set-size 12 4096
+write 12 4096 114
+start-write 1 12 4096
+assert-pending 1
+close 12
+assert-pending 1
+read 11 4096
+join 1
+pipe2 13 14 0
+set-size 14 4096
+write 14 4096 115
+start-write 1 14 4096
+start-poll 2 14 4 -1
+assert-all-pending
+close 13
+join-set 1 2
 scenario generated-0007
 signal-config 10 0
 pipe2 0 1 0

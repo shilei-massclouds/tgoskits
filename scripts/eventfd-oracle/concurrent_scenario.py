@@ -213,6 +213,7 @@ Operation = Union[simple.Operation, ConcurrentOperation]
 class EpollRegistration:
     target_slot: int
     event_id: int
+    description_id: int
     events: int
     data: int
     enabled: bool
@@ -576,6 +577,11 @@ class ResourceState:
             or operation.destination_slot in self.epolls
         ):
             raise ScenarioCodecError("resource-state", "epoll dup is not supported")
+        descriptor = (
+            self.simple.descriptor(operation.slot)
+            if isinstance(operation, (Read, Write, Close))
+            else None
+        )
         description = (
             self.simple.description(operation.slot)
             if isinstance(operation, (Read, Write, Close))
@@ -583,6 +589,15 @@ class ResourceState:
         )
         self.simple.apply(operation)
         if description is not None:
+            if (
+                isinstance(operation, Close)
+                and descriptor is not None
+                and not any(
+                    candidate.description_id == descriptor.description_id
+                    for candidate in self.simple.descriptors.values()
+                )
+            ):
+                self._drop_epoll_description(descriptor.description_id)
             self._refresh_epolls(description.event_id)
 
     def _epoll_create(self, operation: EpollCreate) -> None:
@@ -606,6 +621,7 @@ class ResourceState:
             epoll.registrations[operation.target_slot] = EpollRegistration(
                 operation.target_slot,
                 description.event_id,
+                self.simple.descriptor(operation.target_slot).description_id,
                 operation.events,
                 operation.data,
                 True,
@@ -625,6 +641,14 @@ class ResourceState:
             if existing is None:
                 raise ScenarioCodecError("resource-state", "epoll DEL is not registered")
             del epoll.registrations[operation.target_slot]
+
+    def _drop_epoll_description(self, description_id: int) -> None:
+        for epoll in self.epolls.values():
+            epoll.registrations = {
+                slot: registration
+                for slot, registration in epoll.registrations.items()
+                if registration.description_id != description_id
+            }
 
     def _refresh_epolls(self, event_id: int) -> None:
         exclusive = []

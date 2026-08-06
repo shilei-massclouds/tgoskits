@@ -208,6 +208,7 @@ Operation = Union[simple.Operation, ConcurrentOperation]
 class EpollRegistration:
     target_slot: int
     pipe_id: int
+    description_id: int
     endpoint: str
     events: int
     data: int
@@ -239,6 +240,8 @@ class ResourceState(blocking.ResourceState):
         self.worker_write_progress = {
             actor: 0 for actor in controlled_actor.WORKER_ACTORS
         }
+        self.worker_resources: dict[int, blocking.FdResource] = {}
+        self.adopted_descriptions: set[int] = set()
         self.epolls: dict[int, EpollState] = {}
         self.exclusive_cursor: dict[tuple[int, str], int] = {}
 
@@ -404,6 +407,10 @@ class ResourceState(blocking.ResourceState):
                 operation.actor, operation, identify_resource
             ),
         )
+        if isinstance(operation, (StartRead, StartWrite)):
+            self.worker_resources[operation.actor] = self._require_live(
+                operation.slot, line_number
+            )
         self.worker_write_progress[operation.actor] = 0
 
     def _send_signal(self, operation: SendSignal, line_number: int) -> None:
@@ -483,6 +490,27 @@ class ResourceState(blocking.ResourceState):
             line_number,
             lambda: self.workers.mark_completed(actor, ordinal),
         )
+        self._release_worker_resource(actor)
+
+    def _release_worker_resource(self, actor: int) -> None:
+        resource = self.worker_resources.pop(actor, None)
+        if (
+            resource is None
+            or resource.description_id not in self.adopted_descriptions
+            or any(
+                held.description_id == resource.description_id
+                for held in self.worker_resources.values()
+            )
+        ):
+            return
+        pipe = self.pipes[resource.pipe_id]
+        if resource.endpoint == "reader":
+            pipe.readers -= 1
+        else:
+            pipe.writers -= 1
+        self.adopted_descriptions.remove(resource.description_id)
+        self._drop_epoll_description(resource.description_id)
+        self._refresh_epolls(resource.pipe_id)
 
     def _deliver_pending_signals(self, actor: int) -> None:
         pending = self.pending_signal_counts[actor]
@@ -555,7 +583,9 @@ class ResourceState(blocking.ResourceState):
                         self._mark_completed(actor, line_number)
                         made_progress = True
                     continue
-                resource = self._require_live(operation.slot, line_number)
+                resource = self.worker_resources.get(actor)
+                if resource is None:
+                    resource = self._require_live(operation.slot, line_number)
                 pipe = self.pipes[worker.resource[1]]
                 ready = False
                 if isinstance(operation, StartRead):
@@ -606,8 +636,30 @@ class ResourceState(blocking.ResourceState):
             if isinstance(operation, (Read, Write, Close, SetSize))
             else None
         )
+        last_description_reference = False
+        held_by_worker = False
+        if isinstance(operation, Close) and resource is not None:
+            last_description_reference = not any(
+                candidate is not None
+                and candidate.description_id == resource.description_id
+                and index != operation.slot
+                for index, candidate in enumerate(self.slots)
+            )
+            held_by_worker = any(
+                held.description_id == resource.description_id
+                for held in self.worker_resources.values()
+            )
         super()._apply_synchronous(operation, line_number)
         if resource is not None:
+            if last_description_reference and held_by_worker:
+                pipe = self.pipes[resource.pipe_id]
+                if resource.endpoint == "reader":
+                    pipe.readers += 1
+                else:
+                    pipe.writers += 1
+                self.adopted_descriptions.add(resource.description_id)
+            elif last_description_reference:
+                self._drop_epoll_description(resource.description_id)
             self._refresh_epolls(resource.pipe_id)
 
     def _epoll_create(self, operation: EpollCreate, line_number: int) -> None:
@@ -640,6 +692,7 @@ class ResourceState(blocking.ResourceState):
             epoll.registrations[operation.target_slot] = EpollRegistration(
                 operation.target_slot,
                 resource.pipe_id,
+                resource.description_id,
                 resource.endpoint,
                 operation.events,
                 operation.data,
@@ -668,6 +721,14 @@ class ResourceState(blocking.ResourceState):
                     "epoll DEL is not registered",
                 )
             del epoll.registrations[operation.target_slot]
+
+    def _drop_epoll_description(self, description_id: int) -> None:
+        for epoll in self.epolls.values():
+            epoll.registrations = {
+                slot: registration
+                for slot, registration in epoll.registrations.items()
+                if registration.description_id != description_id
+            }
 
     def _refresh_epolls(self, pipe_id: int) -> None:
         exclusive: dict[str, list[tuple[int, EpollRegistration]]] = {}

@@ -98,6 +98,21 @@ start-epoll-wait 2 1 1 -1
 assert-all-pending
 read 0 8 0
 join-set 1 2
+eventfd 2 0
+dup 2 3
+epoll-create 4 0
+epoll-ctl 4 add 2 1 153
+close 2
+start-epoll-wait 1 4 1 -1
+assert-pending 1
+write 3 8 0 1
+join 1
+read 3 8 0
+close 3
+eventfd 2 1
+start-epoll-wait 1 4 1 200
+assert-pending 1
+join 1
 scenario generated-0007
 signal-config 10 0
 eventfd 0 0

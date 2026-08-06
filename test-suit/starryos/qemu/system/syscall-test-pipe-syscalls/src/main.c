@@ -6,7 +6,16 @@
 #include <string.h>
 #include <signal.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <stdint.h>
+
+static volatile sig_atomic_t sigpipe_count;
+
+static void count_sigpipe(int signal_number)
+{
+    (void)signal_number;
+    sigpipe_count++;
+}
 
 static int get_cloexec(int fd)
 {
@@ -56,6 +65,49 @@ static void test_pipe(void)
         CHECK(r == -1 && errno == EPIPE, "关闭读端后 write 返回 EPIPE");
         sigaction(SIGPIPE, &old, NULL);
         close(fds[1]);
+    }
+
+    {
+        int fds[2];
+        struct sigaction action = {.sa_handler = count_sigpipe};
+        struct sigaction old;
+
+        CHECK_RET(pipe(fds), 0, "SIGPIPE handler 测试: pipe 创建成功");
+        close(fds[0]);
+        sigemptyset(&action.sa_mask);
+        sigpipe_count = 0;
+        CHECK_RET(sigaction(SIGPIPE, &action, &old), 0,
+                  "安装 SIGPIPE handler 成功");
+        errno = 0;
+        ssize_t r = write(fds[1], "x", 1);
+        CHECK(r == -1 && errno == EPIPE,
+              "SIGPIPE handler 返回后 write 报告 EPIPE");
+        CHECK(sigpipe_count == 1, "关闭最后 reader 后 handler 收到一次 SIGPIPE");
+        CHECK_RET(sigaction(SIGPIPE, &old, NULL), 0,
+                  "恢复 SIGPIPE disposition 成功");
+        close(fds[1]);
+    }
+
+    {
+        pid_t child = fork();
+
+        CHECK(child >= 0, "default SIGPIPE 测试: fork 成功");
+        if (child == 0) {
+            int fds[2];
+
+            if (signal(SIGPIPE, SIG_DFL) == SIG_ERR || pipe(fds) != 0)
+                _exit(120);
+            close(fds[0]);
+            (void)write(fds[1], "x", 1);
+            _exit(121);
+        } else if (child > 0) {
+            int status = 0;
+
+            CHECK(waitpid(child, &status, 0) == child,
+                  "default SIGPIPE 测试: waitpid 成功");
+            CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGPIPE,
+                  "默认 SIGPIPE disposition 终止子进程");
+        }
     }
 
     {
