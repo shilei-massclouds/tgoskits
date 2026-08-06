@@ -326,6 +326,10 @@ class EventFdConcurrentRoutingTests(unittest.TestCase):
         self.assertEqual(concurrent_adapter.SPEC.adapter_id, "eventfd-concurrent-v1")
         self.assertEqual(concurrent_adapter.SPEC.corpus_version, 4)
         self.assertEqual(
+            concurrent_adapter.SPEC.generator_version,
+            "eventfd-concurrent-generator-v3",
+        )
+        self.assertEqual(
             concurrent_adapter.SPEC.campaign.root,
             Path("coverage/eventfd-concurrent-v1-oracle-fuzz"),
         )

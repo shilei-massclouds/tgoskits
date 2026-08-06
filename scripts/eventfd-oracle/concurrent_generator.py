@@ -51,7 +51,7 @@ from concurrent_scenario import (
 from poll_generator import CampaignRng
 
 
-GENERATOR_VERSION = "eventfd-concurrent-generator-v2"
+GENERATOR_VERSION = "eventfd-concurrent-generator-v3"
 STORY_COUNT = 15
 _FULL_COUNTER_INCREMENT = MAX_COUNTER - ((1 << 32) - 1)
 
