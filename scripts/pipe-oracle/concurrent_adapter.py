@@ -39,6 +39,8 @@ def record_host_converged(
     elf: Path, scenario_path: Path, trace_path: Path
 ) -> HostRecordResult:
     corpus_digest = fnv1a64(scenario_path.read_bytes())
+    document = concurrent_scenario.parse_document(scenario_path.read_bytes())
+    deterministic = concurrent_scenario.deterministic_scenario_indexes(document)
 
     def decode(path: Path):
         return decode_raw_run_trace(
@@ -57,7 +59,7 @@ def record_host_converged(
         magic=TRACE_MAGIC,
         version=7,
         temporary_prefix=".pipe-concurrent-v1-host-",
-        deterministic=(6, 7),
+        deterministic=deterministic,
         indexed_record_once=record_host_scheduled,
     )
 

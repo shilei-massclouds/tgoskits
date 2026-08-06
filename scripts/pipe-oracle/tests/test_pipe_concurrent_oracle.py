@@ -242,6 +242,32 @@ class PipeConcurrentCodecTests(unittest.TestCase):
             concurrent_scenario.canonical_digest(document),
             hashlib.sha256(encoded).hexdigest(),
         )
+        self.assertEqual(
+            concurrent_scenario.deterministic_scenario_indexes(document), (6, 7)
+        )
+
+    def test_recorder_derives_deterministic_indexes_after_combine(self):
+        checked = concurrent_scenario.parse_document(CORPUS_PATH.read_bytes())
+        combined = concurrent_scenario.ScenarioDocument(
+            (checked.scenarios[6], checked.scenarios[0]),
+            version=concurrent_scenario.CORPUS_VERSION,
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            corpus = root / "pipe.ops"
+            corpus.write_text(concurrent_scenario.serialize_document(combined))
+            result = concurrent_adapter.HostRecordResult(True, False, "recorded")
+            with mock.patch.object(
+                concurrent_adapter, "record_converged_host", return_value=result
+            ) as record:
+                self.assertIs(
+                    concurrent_adapter.record_host_converged(
+                        root / "oracle", corpus, root / "linux.trace"
+                    ),
+                    result,
+                )
+
+        self.assertEqual(record.call_args.kwargs["deterministic"], (0,))
 
 
 class PipeConcurrentRoutingTests(unittest.TestCase):

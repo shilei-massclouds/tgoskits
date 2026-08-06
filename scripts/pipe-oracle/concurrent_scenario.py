@@ -231,6 +231,7 @@ class ResourceState(blocking.ResourceState):
         self.workers = controlled_actor.ControlledWorkers[
             ConcurrentOperation, tuple[str, int]
         ]()
+        self.peak_active_workers = 0
         self._next_completion_ordinal = 1
         self.signal_flags: Optional[int] = None
         self.signal_counts = {actor: 0 for actor in controlled_actor.WORKER_ACTORS}
@@ -406,6 +407,9 @@ class ResourceState(blocking.ResourceState):
             lambda: self.workers.start(
                 operation.actor, operation, identify_resource
             ),
+        )
+        self.peak_active_workers = max(
+            self.peak_active_workers, len(self.workers.active_actors)
         )
         if isinstance(operation, (StartRead, StartWrite)):
             self.worker_resources[operation.actor] = self._require_live(
@@ -930,6 +934,16 @@ def analyze_scenario(source_scenario: Scenario) -> ResourceState:
         state.apply(operation, operation_index + 1)
     state.finish_scenario(len(source_scenario.operations) + 1)
     return state
+
+
+def deterministic_scenario_indexes(document: ScenarioDocument) -> Tuple[int, ...]:
+    """Return scenarios that never have more than one active worker."""
+    validate_document(document)
+    return tuple(
+        index
+        for index, source_scenario in enumerate(document.scenarios)
+        if analyze_scenario(source_scenario).peak_active_workers <= 1
+    )
 
 
 def operation_name(operation: Operation) -> str:
