@@ -211,6 +211,44 @@ class FrameworkContractTests(unittest.TestCase):
             self.assertEqual(observation.category, "host-record-failure")
             self.assertEqual(budget.used, 0)
 
+    def test_host_unstable_preserves_typed_category_and_diagnostic(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            host = workspace / "source-runner"
+            host.write_bytes(b"ELF")
+            store = CampaignStore(FAKE_SPEC, workspace)
+            budget = CampaignBudget(1)
+            diagnostic = (
+                "host-unstable: scenario 3 added an alternative in the final 8 runs"
+            )
+
+            @contextmanager
+            def fail_on_host(*_args, **_kwargs):
+                yield mock.Mock(
+                    host_record=HostRecordResult(False, False, diagnostic),
+                    guest_result=None,
+                )
+
+            with mock.patch.object(
+                common_execution,
+                "execute_batch",
+                side_effect=fail_on_host,
+            ):
+                observation = common_execution.execute_inputs(
+                    FAKE_SPEC,
+                    workspace,
+                    store,
+                    host,
+                    (fake_input("host-unstable"),),
+                    budget,
+                    batch_index=0,
+                )
+
+            self.assertFalse(observation.passed)
+            self.assertEqual(observation.category, "host-unstable")
+            self.assertEqual(observation.detail, diagnostic)
+            self.assertEqual(budget.used, 0)
+
     def test_adapter_spec_is_immutable_and_has_no_intrinsic_scenario_roles(self):
         with self.assertRaises(Exception):
             FAKE_SPEC.adapter_id = "changed"
@@ -369,6 +407,37 @@ class FrameworkContractTests(unittest.TestCase):
                 "batch=1/1 qemu=1 result=host-record-failure",
                 error_output.getvalue(),
             )
+
+    def test_failed_foreground_batch_reports_host_diagnostic(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            diagnostic = (
+                "host-unstable: scenario 2 has an alternative observed fewer than 3 times"
+            )
+
+            def observe(*_args, **_kwargs):
+                return driver.ExecutionObservation(
+                    False,
+                    "host-unstable",
+                    (),
+                    "",
+                    diagnostic,
+                )
+
+            error_output = io.StringIO()
+            with (
+                mock.patch.object(driver, "execute_inputs", side_effect=observe),
+                redirect_stderr(error_output),
+            ):
+                status = driver.run_campaign(
+                    FAKE_SPEC,
+                    CampaignRequest(9, 1, 1, 1, 0, False),
+                    workspace,
+                )
+
+            self.assertEqual(status, 1)
+            self.assertIn("result=host-unstable", error_output.getvalue())
+            self.assertIn(diagnostic, error_output.getvalue())
 
     def test_fake_replay_and_coverage_are_entirely_spec_driven(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

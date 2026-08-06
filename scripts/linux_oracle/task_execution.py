@@ -19,10 +19,14 @@ from .tasks import Task, TaskStore
 class CampaignReplayError(RuntimeError):
     """A replay failed before its semantic or coverage predicate was known."""
 
-    def __init__(self, stage: str, category: str):
+    def __init__(self, stage: str, category: str, detail: str = ""):
         self.stage = stage
         self.category = category
-        super().__init__(f"{stage} replay failed: {category}")
+        self.detail = detail
+        message = f"{stage} replay failed: {category}"
+        if detail:
+            message = f"{message}\n{detail}"
+        super().__init__(message)
 
 
 @dataclass(frozen=True)
@@ -57,7 +61,9 @@ def run_attribution_task(
             continue
         observation = _execute_one(runtime, (item,), fixed_elf)
         if not observation.passed:
-            raise CampaignReplayError("attribution", observation.category)
+            raise CampaignReplayError(
+                "attribution", observation.category, observation.detail
+            )
         mapping[item.digest] = observation.regions
         progress["entry_regions"] = {
             digest: list(mapping[digest]) for digest in sorted(mapping)
@@ -72,7 +78,7 @@ def run_attribution_task(
     if not progress["proof_passed"]:
         proof = _execute_one(runtime, representatives, fixed_elf)
         if not proof.passed:
-            raise CampaignReplayError("attribution", proof.category)
+            raise CampaignReplayError("attribution", proof.category, proof.detail)
         if not target_regions <= set(proof.regions):
             task_store.transition(
                 task, "unstable", {"category": "representative-proof"}
@@ -171,7 +177,9 @@ def run_minimization_task(
         item = BatchInput(hashlib.sha256(candidate).hexdigest(), candidate)
         observation = _execute_one(runtime, (item,), fixed_elf)
         if not observation.passed:
-            raise CampaignReplayError("minimization", observation.category)
+            raise CampaignReplayError(
+                "minimization", observation.category, observation.detail
+            )
         return responsibility <= set(observation.regions)
 
     remaining = max(0, runtime.budget.maximum - runtime.budget.used - 3)

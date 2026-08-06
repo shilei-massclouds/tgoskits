@@ -87,6 +87,8 @@ def run_campaign(
                 file=sys.stderr,
                 flush=True,
             )
+            if observation.detail:
+                print(observation.detail, file=sys.stderr, flush=True)
             return 1
         baseline = set(store.load_coverage(observation.starry_elf_digest))
         observed_new_regions = set(observation.regions) - baseline

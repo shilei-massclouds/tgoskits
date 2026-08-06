@@ -29,6 +29,7 @@ class ExecutionObservation:
     category: str
     regions: Tuple[str, ...]
     starry_elf_digest: str
+    detail: str = ""
 
 
 def execute_inputs(
@@ -64,12 +65,19 @@ def execute_inputs(
         pinned_starry_elf=pinned_starry_elf,
     ) as execution:
         if not execution.host_record.passed:
-            category = (
-                "host-parser-rejection"
-                if execution.host_record.parser_rejection
-                else "host-record-failure"
+            if execution.host_record.parser_rejection:
+                category = "host-parser-rejection"
+            elif execution.host_record.log.startswith("host-unstable:"):
+                category = "host-unstable"
+            else:
+                category = "host-record-failure"
+            return ExecutionObservation(
+                False,
+                category,
+                (),
+                "",
+                execution.host_record.log,
             )
-            return ExecutionObservation(False, category, (), "")
         guest = execution.guest_result
         if guest is None:
             return ExecutionObservation(False, "missing-guest-result", (), "")
