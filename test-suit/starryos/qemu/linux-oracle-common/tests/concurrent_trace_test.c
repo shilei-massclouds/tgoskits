@@ -73,6 +73,32 @@ static void test_raw_trace_writer(void)
     assert(memcmp(&encoded[51], second, sizeof(second)) == 0);
 }
 
+static void test_raw_trace_writer_accepts_default_campaign_batch(void)
+{
+    static const unsigned char magic[8] = {
+        'E', 'V', 'F', 'D', 'R', 'U', 'N', '4',
+    };
+    static const uint32_t expected_scenarios = 32U * 8U;
+    const unsigned char payload[] = {0x5a};
+    struct concurrent_raw_writer writer;
+    char path[] = "/tmp/concurrent-trace-batch-test-XXXXXX";
+    int descriptor;
+    uint32_t index;
+
+    descriptor = mkstemp(path);
+    assert(descriptor >= 0);
+    assert(close(descriptor) == 0);
+    assert(concurrent_raw_open(&writer, path, magic, 4, UINT64_C(19)) == 0);
+    for (index = 0; index < expected_scenarios; index++) {
+        assert(concurrent_raw_write_scenario(&writer, index, 1, payload,
+                                             sizeof(payload)) == 0);
+    }
+    assert(concurrent_raw_write_scenario(&writer, expected_scenarios, 1,
+                                         payload, sizeof(payload)) == -1);
+    assert(concurrent_raw_close(&writer) == 0);
+    assert(unlink(path) == 0);
+}
+
 static void test_sha256(void)
 {
     static const unsigned char expected[32] = {
@@ -147,6 +173,7 @@ int main(void)
 {
     test_result_encoding();
     test_raw_trace_writer();
+    test_raw_trace_writer_accepts_default_campaign_batch();
     test_sha256();
     test_python_allowed_trace_fixture();
     puts("concurrent trace tests passed");

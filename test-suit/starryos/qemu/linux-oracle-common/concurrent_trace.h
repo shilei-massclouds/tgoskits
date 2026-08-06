@@ -5,7 +5,8 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#define CONCURRENT_MAX_SCENARIOS 8U
+/* The default campaign combines 32 entries with at most 8 scenarios each. */
+#define CONCURRENT_MAX_SCENARIOS 256U
 #define CONCURRENT_MAX_OPERATIONS 64U
 #define CONCURRENT_MAX_ALTERNATIVES 4U
 #define CONCURRENT_RESULT_DATA_MAX 64U
