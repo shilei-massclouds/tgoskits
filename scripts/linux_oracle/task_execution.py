@@ -10,7 +10,7 @@ from .batch import BatchInput
 from .campaign import CampaignBudgetExhausted, QemuBudget
 from .canonical import canonical_entry
 from .execution import ExecutionObservation, sha256_file
-from .minimization import minimize
+from .minimization import CandidateRejection, RejectCandidate, minimize
 from .persistence import CampaignStore, PersistentStateError, is_digest
 from .spec import AdapterSpec, CampaignHooks
 from .tasks import Task, TaskStore
@@ -177,6 +177,14 @@ def run_minimization_task(
         item = BatchInput(hashlib.sha256(candidate).hexdigest(), candidate)
         observation = _execute_one(runtime, (item,), fixed_elf)
         if not observation.passed:
+            if observation.category == "host-unstable":
+                raise RejectCandidate(
+                    CandidateRejection(
+                        observation.category,
+                        observation.detail,
+                        item.digest,
+                    )
+                )
             raise CampaignReplayError(
                 "minimization", observation.category, observation.detail
             )
@@ -195,6 +203,11 @@ def run_minimization_task(
             runtime.hooks.reduction.complexity,
             min(max_candidates, remaining),
         )
+    except RejectCandidate as error:
+        rejection = error.rejection
+        raise CampaignReplayError(
+            "minimization", rejection.category, rejection.detail
+        ) from error
     except (CampaignReplayError, CampaignBudgetExhausted):
         raise
     except (ValueError, RuntimeError) as error:
@@ -211,6 +224,14 @@ def run_minimization_task(
             "best_size": len(best),
             "attempts": result.attempts,
             "best_digest": entry.digest,
+            "candidate_rejections": [
+                {
+                    "category": rejection.category,
+                    "detail": rejection.detail,
+                    "digest": rejection.digest,
+                }
+                for rejection in result.candidate_rejections
+            ],
         },
     )
     print(

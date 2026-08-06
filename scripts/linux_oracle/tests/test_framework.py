@@ -8,7 +8,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import contextmanager, redirect_stderr
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from unittest import mock
 
@@ -39,6 +39,7 @@ from linux_oracle.spec import (
     ReductionHooks,
 )
 from linux_oracle.tasks import TaskStore
+from linux_oracle.task_execution import TaskRuntime, run_minimization_task
 
 
 @dataclass(frozen=True)
@@ -171,6 +172,116 @@ def fake_input(*items: str) -> BatchInput:
 
 
 class FrameworkContractTests(unittest.TestCase):
+    def test_host_unstable_initial_reduction_input_remains_fatal(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            store = CampaignStore(FAKE_SPEC, workspace)
+            original = fake_input("unstable-original").encoded
+            task_store = TaskStore(FAKE_SPEC, store.root, "minimization")
+            task = task_store.claim(
+                task_store.create("reject-unstable-original", (original,))
+            )
+            diagnostic = "host-unstable: allowed result set did not converge"
+
+            def observe(*_args, **_kwargs):
+                return driver.ExecutionObservation(
+                    False, "host-unstable", (), "", diagnostic
+                )
+
+            runtime = TaskRuntime(
+                FAKE_SPEC,
+                FAKE_SPEC.campaign_hooks,
+                workspace,
+                store,
+                workspace / "host-oracle",
+                CampaignBudget(16),
+                0,
+                observe,
+            )
+            with self.assertRaisesRegex(
+                driver.CampaignReplayError,
+                "minimization replay failed: host-unstable",
+            ):
+                run_minimization_task(
+                    runtime,
+                    task_store,
+                    task,
+                    original,
+                    {"region:1:1"},
+                    workspace / "starryos",
+                    8,
+                )
+
+            recovered = task_store.load(task.path)
+            self.assertEqual(recovered.metadata["state"], "running")
+            self.assertIsNone(recovered.metadata["result"])
+
+    def test_host_unstable_reduction_candidate_is_rejected_with_audit(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            store = CampaignStore(FAKE_SPEC, workspace)
+            original = fake_input("keep", "drop").encoded
+            unstable_candidate = fake_input("keep").encoded
+            reduction = replace(
+                FAKE_SPEC.campaign_hooks.reduction,
+                candidates=lambda encoded: (
+                    (unstable_candidate,) if encoded == original else ()
+                ),
+            )
+            hooks = replace(FAKE_SPEC.campaign_hooks, reduction=reduction)
+            task_store = TaskStore(FAKE_SPEC, store.root, "minimization")
+            task = task_store.claim(
+                task_store.create("reject-unstable-candidate", (original,))
+            )
+            diagnostic = (
+                "host-unstable: scenario 0 has an alternative observed fewer "
+                "than 3 times"
+            )
+
+            def observe(*args, **_kwargs):
+                candidate = args[4][0].encoded
+                if candidate == unstable_candidate:
+                    return driver.ExecutionObservation(
+                        False, "host-unstable", (), "", diagnostic
+                    )
+                return driver.ExecutionObservation(
+                    True, "passed", ("region:1:1",), "e" * 64
+                )
+
+            runtime = TaskRuntime(
+                FAKE_SPEC,
+                hooks,
+                workspace,
+                store,
+                workspace / "host-oracle",
+                CampaignBudget(16),
+                0,
+                observe,
+            )
+            result = run_minimization_task(
+                runtime,
+                task_store,
+                task,
+                original,
+                {"region:1:1"},
+                workspace / "starryos",
+                8,
+            )
+
+            self.assertEqual(result, original)
+            completed = task_store.load(task.path)
+            self.assertEqual(completed.metadata["state"], "completed")
+            self.assertEqual(
+                completed.metadata["result"]["candidate_rejections"],
+                [
+                    {
+                        "category": "host-unstable",
+                        "detail": diagnostic,
+                        "digest": hashlib.sha256(unstable_candidate).hexdigest(),
+                    }
+                ],
+            )
+
     def test_qemu_budget_exhaustion_has_a_distinct_recoverable_category(self):
         budget = CampaignBudget(1)
         budget.charge()

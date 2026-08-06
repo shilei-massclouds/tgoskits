@@ -9,6 +9,22 @@ class MinimizationResult:
     value: object
     attempts: int
     status: str
+    candidate_rejections: Tuple["CandidateRejection", ...]
+
+
+@dataclass(frozen=True)
+class CandidateRejection:
+    category: str
+    detail: str
+    digest: str
+
+
+class RejectCandidate(RuntimeError):
+    """The current reduction candidate cannot establish the predicate."""
+
+    def __init__(self, rejection: CandidateRejection):
+        self.rejection = rejection
+        super().__init__(f"{rejection.category}: {rejection.detail}")
 
 
 def minimize(
@@ -25,6 +41,7 @@ def minimize(
     current = initial
     attempts = 0
     changed = False
+    candidate_rejections = []
     while attempts < maximum_attempts:
         accepted: Optional[object] = None
         for candidate in candidates(current):
@@ -33,9 +50,12 @@ def minimize(
             attempts += 1
             if complexity(candidate) >= complexity(current):
                 continue
-            if predicate(candidate):
-                accepted = candidate
-                break
+            try:
+                if predicate(candidate):
+                    accepted = candidate
+                    break
+            except RejectCandidate as error:
+                candidate_rejections.append(error.rejection)
         if accepted is None:
             break
         current = accepted
@@ -43,5 +63,8 @@ def minimize(
     if not predicate(current) or not predicate(current):
         raise RuntimeError("final minimized input is not stable across two replays")
     return MinimizationResult(
-        current, attempts, "reduced" if changed else "already-minimal"
+        current,
+        attempts,
+        "reduced" if changed else "already-minimal",
+        tuple(candidate_rejections),
     )
