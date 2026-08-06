@@ -1,4 +1,5 @@
 import hashlib
+import os
 import subprocess
 import sys
 import tempfile
@@ -473,6 +474,57 @@ class PipeConcurrentHarnessTests(unittest.TestCase):
                 text=True,
             )
         self.assertEqual(compared.returncode, 0, compared.stderr)
+
+    def test_indexed_completion_schedule_enumerates_two_waiter_groups(self):
+        encoded = (
+            "version 7\nscenario scheduled\n"
+            "pipe2 0 1 0\n"
+            "start-poll 1 0 1 -1\nstart-poll 2 0 1 -1\n"
+            "assert-all-pending\nclose 1\njoin-set 1 2\n"
+            "pipe2 2 3 0\n"
+            "start-poll 1 2 1 -1\nstart-poll 2 2 1 -1\n"
+            "assert-all-pending\nclose 3\njoin-set 1 2\n"
+        )
+        corpus_digest = fnv1a64(encoded.encode())
+        expected = {
+            0: (1, 2, 3, 4),
+            1: (2, 1, 3, 4),
+            2: (1, 2, 4, 3),
+            3: (2, 1, 4, 3),
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            corpus = root / "scheduled.ops"
+            corpus.write_text(encoded)
+            for schedule, expected_ordinals in expected.items():
+                for repetition in range(2):
+                    trace = root / f"schedule-{schedule}-{repetition}.trace"
+                    environment = os.environ.copy()
+                    environment[
+                        "STARRY_PIPE_CONCURRENT_COMPLETION_SCHEDULE"
+                    ] = str(schedule)
+                    recorded = subprocess.run(
+                        [str(self.oracle), "--record", str(corpus), str(trace)],
+                        capture_output=True,
+                        env=environment,
+                        text=True,
+                        timeout=5,
+                    )
+                    self.assertEqual(recorded.returncode, 0, recorded.stderr)
+                    scenario = decode_raw_run_trace(
+                        trace.read_bytes(),
+                        expected_magic=b"PIPERUN7",
+                        expected_version=7,
+                        expected_corpus_digest=corpus_digest,
+                    )[0]
+                    ordinals = tuple(
+                        int.from_bytes(
+                            scenario.payload[index * 112 + 44 : index * 112 + 48],
+                            "little",
+                        )
+                        for index in (1, 2, 7, 8)
+                    )
+                    self.assertEqual(ordinals, expected_ordinals)
 
     def test_epoll_wait_pwait_and_pwait2_execute_on_host(self):
         encoded = (

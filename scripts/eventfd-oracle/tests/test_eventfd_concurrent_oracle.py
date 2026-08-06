@@ -1,4 +1,5 @@
 import hashlib
+import os
 import subprocess
 import sys
 import tempfile
@@ -292,13 +293,13 @@ class EventFdConcurrentCodecTests(unittest.TestCase):
             hashlib.sha256(encoded).hexdigest(),
         )
         self.assertEqual(
-            concurrent_scenario.deterministic_scenario_indexes(document), (6, 7)
+            concurrent_scenario.deterministic_scenario_indexes(document), (7,)
         )
 
     def test_recorder_derives_deterministic_indexes_after_combine(self):
         checked = concurrent_scenario.parse_document(CORPUS_PATH.read_bytes())
         combined = concurrent_scenario.ScenarioDocument(
-            (checked.scenarios[6], checked.scenarios[0]),
+            (checked.scenarios[7], checked.scenarios[0]),
             version=concurrent_scenario.CORPUS_VERSION,
         )
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -520,7 +521,7 @@ class EventFdConcurrentHarnessTests(unittest.TestCase):
                 expected_corpus_digest=corpus_digest,
             )
             self.assertEqual(len(scenarios), 8)
-            self.assertEqual(sum(item.operation_count for item in scenarios), 212)
+            self.assertEqual(sum(item.operation_count for item in scenarios), 216)
 
             aggregate = root / "linux.trace"
             result = concurrent_adapter.record_host_converged(
@@ -534,7 +535,7 @@ class EventFdConcurrentHarnessTests(unittest.TestCase):
                 expected_corpus_digest=corpus_digest,
             )
             self.assertEqual(len(allowed.scenarios), 8)
-            self.assertEqual(len(allowed.scenarios[6].alternatives), 1)
+            self.assertEqual(len(allowed.scenarios[6].alternatives), 2)
             self.assertEqual(len(allowed.scenarios[7].alternatives), 1)
             compared = subprocess.run(
                 [str(self.oracle), "--compare", str(CORPUS_PATH), str(aggregate)],
@@ -544,6 +545,56 @@ class EventFdConcurrentHarnessTests(unittest.TestCase):
         self.assertEqual(compared.returncode, 0, compared.stderr)
         self.assertIn("STARRY_EVENTFD_LINUX_ORACLE_PASSED", compared.stdout)
 
+    def test_indexed_completion_schedule_enumerates_two_waiter_groups(self):
+        encoded = (
+            "version 4\nscenario scheduled\n"
+            "eventfd 0 0\n"
+            "start-poll 1 0 1 -1\nstart-poll 2 0 1 -1\n"
+            "assert-all-pending\nwrite 0 8 0 1\njoin-set 1 2\n"
+            "read 0 8 0\neventfd 1 0\n"
+            "start-poll 1 1 1 -1\nstart-poll 2 1 1 -1\n"
+            "assert-all-pending\nwrite 1 8 0 1\njoin-set 1 2\n"
+        )
+        corpus_digest = fnv1a64(encoded.encode())
+        expected = {
+            0: (1, 2, 3, 4),
+            1: (2, 1, 3, 4),
+            2: (1, 2, 4, 3),
+            3: (2, 1, 4, 3),
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            corpus = root / "scheduled.ops"
+            corpus.write_text(encoded)
+            for schedule, expected_ordinals in expected.items():
+                for repetition in range(2):
+                    trace = root / f"schedule-{schedule}-{repetition}.trace"
+                    environment = os.environ.copy()
+                    environment[
+                        "STARRY_EVENTFD_CONCURRENT_COMPLETION_SCHEDULE"
+                    ] = str(schedule)
+                    recorded = subprocess.run(
+                        [str(self.oracle), "--record", str(corpus), str(trace)],
+                        capture_output=True,
+                        env=environment,
+                        text=True,
+                        timeout=5,
+                    )
+                    self.assertEqual(recorded.returncode, 0, recorded.stderr)
+                    scenario = decode_raw_run_trace(
+                        trace.read_bytes(),
+                        expected_magic=b"EVFDRUN4",
+                        expected_version=4,
+                        expected_corpus_digest=corpus_digest,
+                    )[0]
+                    ordinals = tuple(
+                        int.from_bytes(
+                            scenario.payload[index * 112 + 44 : index * 112 + 48],
+                            "little",
+                        )
+                        for index in (1, 2, 8, 9)
+                    )
+                    self.assertEqual(ordinals, expected_ordinals)
     def test_epoll_wait_pwait_and_pwait2_execute_on_host(self):
         encoded = (
             "version 4\nscenario lt\neventfd 0 0\nepoll-create 1 0\n"

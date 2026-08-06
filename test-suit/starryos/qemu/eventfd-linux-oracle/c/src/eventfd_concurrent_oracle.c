@@ -133,6 +133,7 @@ struct concurrent_worker_state {
     int mask_failed;
     int timeout_too_early;
     long start_delay_nanoseconds;
+    long completion_delay_nanoseconds;
 };
 
 struct concurrent_context {
@@ -158,6 +159,9 @@ struct concurrent_context {
     long signal_flags;
     int signal_configured;
     int preferred_actor;
+    int completion_schedule_enabled;
+    unsigned int completion_schedule;
+    unsigned int completion_group_index;
 };
 
 static _Thread_local atomic_uint *current_handler_count;
@@ -419,6 +423,7 @@ static void initialize_scenario(struct concurrent_context *context)
         atomic_init(&context->signal_counts[index], 0U);
     context->signal_flags = 0;
     context->signal_configured = 0;
+    context->completion_group_index = 0;
 }
 
 static int cleanup_scenario(struct concurrent_context *context)
@@ -710,6 +715,19 @@ static void *run_worker(void *argument)
     }
     worker->syscall_result.handler_count =
         atomic_load_explicit(worker->handler_count, memory_order_acquire);
+    if (worker->completion_delay_nanoseconds > 0) {
+        struct timespec delay = {
+            .tv_sec = 0,
+            .tv_nsec = worker->completion_delay_nanoseconds,
+        };
+
+        while (nanosleep(&delay, &delay) != 0) {
+            if (errno != EINTR) {
+                worker->clock_failed = 1;
+                break;
+            }
+        }
+    }
     controlled_worker_publish_completed(worker->controller);
     current_handler_count = NULL;
     return NULL;
@@ -1202,6 +1220,23 @@ static int execute_epoll_ctl(struct concurrent_context *context, char *save,
     return selected != 0 ? wait_for_trigger_progress(context, selected) : 0;
 }
 
+static void schedule_worker_completion(struct concurrent_context *context,
+                                       struct concurrent_worker_state *worker,
+                                       int actor)
+{
+    unsigned int preferred_actor;
+
+    if (!context->completion_schedule_enabled)
+        return;
+    preferred_actor =
+        ((context->completion_schedule >>
+          (context->completion_group_index % 2U)) &
+         1U) +
+        1U;
+    worker->completion_delay_nanoseconds =
+        preferred_actor != (unsigned int)actor ? 10000000L : 0L;
+}
+
 static int execute_start_worker(struct concurrent_context *context, char *save,
                                 struct concurrent_operation_result *result,
                                 enum worker_kind kind)
@@ -1280,6 +1315,7 @@ static int execute_start_worker(struct concurrent_context *context, char *save,
         context->preferred_actor != 0 && context->preferred_actor != actor ?
             10000000L :
             0L;
+    schedule_worker_completion(context, worker, actor);
     worker->poll_fd.fd = worker->fd;
     worker->poll_fd.events = (short)argument;
     worker->poll_fd.revents = POLL_REVENTS_SENTINEL;
@@ -1377,6 +1413,7 @@ static int execute_start_epoll_worker(
         context->preferred_actor != 0 && context->preferred_actor != actor ?
             10000000L :
             0L;
+    schedule_worker_completion(context, worker, actor);
     if (controlled_worker_start(worker->controller, run_worker, worker) !=
         CONTROLLED_WORKER_OK) {
         worker->active = 0;
@@ -1503,6 +1540,7 @@ static int execute_join_set(struct concurrent_context *context, char *save,
         return -2;
     for (actor = 0; actor < CONTROLLED_WORKER_COUNT; actor++)
         context->workers[actor].active = 0;
+    context->completion_group_index++;
     result->kind = OP_JOIN_SET;
     result->value = 3;
     return 0;
@@ -1878,6 +1916,8 @@ int eventfd_concurrent_run(int record_mode, const char *corpus_path,
     context.corpus_digest = corpus_digest;
     if (record_mode) {
         const char *bias = getenv("STARRY_EVENTFD_CONCURRENT_START_BIAS");
+        const char *schedule =
+            getenv("STARRY_EVENTFD_CONCURRENT_COMPLETION_SCHEDULE");
 
         if (bias != NULL) {
             long actor;
@@ -1885,6 +1925,14 @@ int eventfd_concurrent_run(int record_mode, const char *corpus_path,
             if (parse_long_value(bias, 1, CONTROLLED_WORKER_COUNT, &actor) != 0)
                 return fail("invalid concurrent start bias");
             context.preferred_actor = (int)actor;
+        }
+        if (schedule != NULL) {
+            long value;
+
+            if (parse_long_value(schedule, 0, 3, &value) != 0)
+                return fail("invalid concurrent completion schedule");
+            context.completion_schedule_enabled = 1;
+            context.completion_schedule = (unsigned int)value;
         }
     }
     initialize_scenario(&context);

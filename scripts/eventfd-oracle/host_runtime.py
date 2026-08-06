@@ -35,6 +35,7 @@ def find_or_build_host_oracle(workspace: Path) -> Optional[Path]:
 def record_host(elf: Path, ops: Path, trace: Path) -> HostRecordResult:
     environment = os.environ.copy()
     environment.pop("STARRY_EVENTFD_CONCURRENT_START_BIAS", None)
+    environment.pop("STARRY_EVENTFD_CONCURRENT_COMPLETION_SCHEDULE", None)
     return _record_host(elf, ops, trace, environment)
 
 
@@ -44,6 +45,9 @@ def record_host_scheduled(
     environment = os.environ.copy()
     environment["STARRY_EVENTFD_CONCURRENT_START_BIAS"] = str(
         run_index % 2 + 1
+    )
+    environment["STARRY_EVENTFD_CONCURRENT_COMPLETION_SCHEDULE"] = str(
+        run_index % 4
     )
     return _record_host(elf, ops, trace, environment)
 
