@@ -9,16 +9,51 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static int tests_pass;
 static int tests_fail;
+
+enum {
+    SAME_FD_DIAGNOSTIC_ITERATIONS = 100,
+    SAME_FD_POLL_TIMEOUT_MS = 250,
+};
+
+struct same_fd_poll_worker {
+    int fd;
+    atomic_int entered;
+    atomic_int completed;
+    int result;
+    int error;
+    short revents;
+};
+
+struct same_fd_poll_distribution {
+    int close_completed;
+    int peer_completed;
+    int final_completed;
+    int cleanup_timeouts;
+    int trigger_writes;
+    int trigger_epipe;
+    int result_zero;
+    int result_one;
+    int result_error;
+    int error_eintr;
+    int revents_in;
+    int revents_hup;
+    int revents_nval;
+    int revents_other;
+};
 
 #define TEST(cond, msg)                                                        \
     do {                                                                      \
@@ -30,6 +65,66 @@ static int tests_fail;
             printf("  FAIL: %s (%s:%d)\n", msg, __FILE__, __LINE__);          \
         }                                                                     \
     } while (0)
+
+static void diagnostic_signal_handler(int signo) {
+    (void)signo;
+}
+
+static void sleep_one_millisecond(void) {
+    const struct timespec delay = {.tv_sec = 0, .tv_nsec = 1000000};
+    (void)nanosleep(&delay, NULL);
+}
+
+static int wait_for_flag(atomic_int *flag, int timeout_ms) {
+    for (int elapsed_ms = 0; elapsed_ms < timeout_ms; elapsed_ms++) {
+        if (atomic_load_explicit(flag, memory_order_acquire) != 0) {
+            return 1;
+        }
+        sleep_one_millisecond();
+    }
+    return atomic_load_explicit(flag, memory_order_acquire) != 0;
+}
+
+static void *same_fd_poll_worker_main(void *argument) {
+    struct same_fd_poll_worker *worker = argument;
+    struct pollfd pfd = {.fd = worker->fd, .events = POLLIN};
+
+    atomic_store_explicit(&worker->entered, 1, memory_order_release);
+    errno = 0;
+    worker->result = poll(&pfd, 1, SAME_FD_POLL_TIMEOUT_MS);
+    worker->error = worker->result < 0 ? errno : 0;
+    worker->revents = pfd.revents;
+    atomic_store_explicit(&worker->completed, 1, memory_order_release);
+    return NULL;
+}
+
+static void record_same_fd_poll_result(
+    const struct same_fd_poll_worker *worker,
+    struct same_fd_poll_distribution *distribution) {
+    if (worker->result == 0) {
+        distribution->result_zero++;
+    } else if (worker->result == 1) {
+        distribution->result_one++;
+    } else {
+        distribution->result_error++;
+        if (worker->error == EINTR) {
+            distribution->error_eintr++;
+        }
+    }
+
+    if ((worker->revents & POLLIN) != 0) {
+        distribution->revents_in++;
+    }
+    if ((worker->revents & POLLHUP) != 0) {
+        distribution->revents_hup++;
+    }
+    if ((worker->revents & POLLNVAL) != 0) {
+        distribution->revents_nval++;
+    }
+    if ((worker->revents & ~(POLLIN | POLLHUP | POLLNVAL)) != 0) {
+        distribution->revents_other++;
+    }
+}
 
 
 // ─── Test 1: poll detects pipe close (HUP) ──────────────────────────────
@@ -276,7 +371,7 @@ static void test_poll_two_fds_one_closes(void) {
 // Edge case: fd added to epoll, child writes and exits, parent hasn't
 // drained yet.  epoll must deliver both IN (data) and HUP (close).
 static void test_epoll_lt_close_with_data(void) {
-    printf("Test 6: epoll LT delivers both data and close in one event\n");
+    printf("Test 5: epoll LT delivers both data and close in one event\n");
     int pipefd[2];
     TEST(pipe(pipefd) == 0, "pipe created");
 
@@ -336,6 +431,137 @@ static void test_epoll_lt_close_with_data(void) {
     close(epfd);
 }
 
+// Linux does not define a portable result when one thread closes the same
+// descriptor that another thread is polling. Keep this as a distributional
+// diagnostic: only harness, crash, and bounded-cleanup failures are gates.
+static void diagnose_same_fd_cross_thread_poll_close(void) {
+    printf("Test 6: diagnose same-fd cross-thread poll close (100 runs)\n");
+
+    struct sigaction handler = {0};
+    struct sigaction old_usr1;
+    struct sigaction ignore_pipe = {0};
+    struct sigaction old_pipe;
+    handler.sa_handler = diagnostic_signal_handler;
+    ignore_pipe.sa_handler = SIG_IGN;
+    sigemptyset(&handler.sa_mask);
+    sigemptyset(&ignore_pipe.sa_mask);
+    if (sigaction(SIGUSR1, &handler, &old_usr1) != 0) {
+        TEST(0, "same-fd diagnostic installed signal dispositions");
+        return;
+    }
+    if (sigaction(SIGPIPE, &ignore_pipe, &old_pipe) != 0) {
+        (void)sigaction(SIGUSR1, &old_usr1, NULL);
+        TEST(0, "same-fd diagnostic installed signal dispositions");
+        return;
+    }
+
+    struct same_fd_poll_distribution distribution = {0};
+    int harness_failed = 0;
+    int completed_iterations = 0;
+
+    for (int iteration = 0; iteration < SAME_FD_DIAGNOSTIC_ITERATIONS;
+         iteration++) {
+        int pipefd[2];
+        if (pipe(pipefd) != 0) {
+            harness_failed = 1;
+            break;
+        }
+
+        struct same_fd_poll_worker worker = {.fd = pipefd[0]};
+        atomic_init(&worker.entered, 0);
+        atomic_init(&worker.completed, 0);
+        pthread_t thread;
+        int thread_error = pthread_create(
+            &thread, NULL, same_fd_poll_worker_main, &worker);
+        if (thread_error != 0) {
+            close(pipefd[0]);
+            close(pipefd[1]);
+            harness_failed = 1;
+            break;
+        }
+
+        if (!wait_for_flag(&worker.entered, 1000)) {
+            harness_failed = 1;
+        }
+        // Give the worker an opportunity to cross from the published entry
+        // point into poll before the controller closes the numeric fd.
+        sleep_one_millisecond();
+        if (close(pipefd[0]) != 0) {
+            harness_failed = 1;
+        }
+
+        if (wait_for_flag(&worker.completed, 5)) {
+            distribution.close_completed++;
+        } else {
+            errno = 0;
+            ssize_t written = write(pipefd[1], "x", 1);
+            if (written == 1) {
+                distribution.trigger_writes++;
+            } else if (written < 0 && errno == EPIPE) {
+                distribution.trigger_epipe++;
+            } else {
+                harness_failed = 1;
+            }
+
+            if (wait_for_flag(&worker.completed, 20)) {
+                distribution.peer_completed++;
+            } else {
+                thread_error = pthread_kill(thread, SIGUSR1);
+                if (thread_error != 0 && thread_error != ESRCH) {
+                    harness_failed = 1;
+                }
+                if (wait_for_flag(&worker.completed, 500)) {
+                    distribution.final_completed++;
+                } else {
+                    distribution.cleanup_timeouts++;
+                    harness_failed = 1;
+                }
+            }
+        }
+
+        close(pipefd[1]);
+        if (atomic_load_explicit(&worker.completed, memory_order_acquire) == 0) {
+            // Exiting the process is the only safe fallback after reporting
+            // an uncleanable worker; never block the grouped suite in join.
+            break;
+        }
+        thread_error = pthread_join(thread, NULL);
+        if (thread_error != 0) {
+            harness_failed = 1;
+            break;
+        }
+        record_same_fd_poll_result(&worker, &distribution);
+        completed_iterations++;
+    }
+
+    struct utsname system_name;
+    const char *release = "unknown";
+    if (uname(&system_name) == 0) {
+        release = system_name.release;
+    }
+    printf("SAME_FD_POLL_CLOSE_DIAGNOSTIC: release=%s iterations=%d "
+           "completed=%d "
+           "close_completed=%d peer_completed=%d final_completed=%d "
+           "cleanup_timeouts=%d trigger_writes=%d trigger_epipe=%d "
+           "result_zero=%d result_one=%d result_error=%d eintr=%d "
+           "pollin=%d pollhup=%d pollnval=%d other=%d\n",
+           release, SAME_FD_DIAGNOSTIC_ITERATIONS, completed_iterations,
+           distribution.close_completed, distribution.peer_completed,
+           distribution.final_completed, distribution.cleanup_timeouts,
+           distribution.trigger_writes, distribution.trigger_epipe,
+           distribution.result_zero, distribution.result_one,
+           distribution.result_error, distribution.error_eintr,
+           distribution.revents_in, distribution.revents_hup,
+           distribution.revents_nval, distribution.revents_other);
+
+    if (sigaction(SIGUSR1, &old_usr1, NULL) != 0 ||
+        sigaction(SIGPIPE, &old_pipe, NULL) != 0) {
+        harness_failed = 1;
+    }
+    TEST(!harness_failed,
+         "same-fd diagnostic completed and cleaned all 100 workers");
+}
+
 int main(void) {
     printf("=== pipe-poll-close regression ===\n");
 
@@ -344,6 +570,7 @@ int main(void) {
     test_epoll_in_only_detects_close();
     test_poll_two_fds_one_closes();
     test_epoll_lt_close_with_data();
+    diagnose_same_fd_cross_thread_poll_close();
 
     printf("\n=== Results: %d pass, %d fail ===\n", tests_pass, tests_fail);
     if (tests_fail == 0) {
