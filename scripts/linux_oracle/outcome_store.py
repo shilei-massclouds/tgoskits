@@ -5,6 +5,7 @@ import fcntl
 import hashlib
 import json
 import os
+import struct
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,7 @@ from .outcomes import AllowedAlternative, AllowedScenario, AllowedTrace
 
 _SCHEMA_NAME = "linux-oracle-concurrent-outcomes"
 _SCHEMA_VERSION = 1
+_RESULT_SIZE = 112
 
 
 class OutcomeStoreError(RuntimeError):
@@ -63,7 +65,15 @@ class OutcomeStore:
                     AllowedScenario(
                         scenario.scenario_index,
                         scenario.operation_count,
-                        evidence.alternatives,
+                        tuple(
+                            AllowedAlternative(
+                                _rebase_payload(
+                                    alternative.payload,
+                                    scenario.scenario_index,
+                                )
+                            )
+                            for alternative in evidence.alternatives
+                        ),
                     )
                 )
             return AllowedTrace(trace.version, trace.corpus_digest, tuple(merged))
@@ -94,9 +104,16 @@ class OutcomeStore:
                 raise OutcomeStoreError("scenario operation count changed")
             releases.update(encoded["kernel_releases"])
             for alternative in encoded["alternatives"]:
-                recordings[alternative["payload"]] = alternative["recordings"]
+                payload = alternative["payload"]
+                recordings[payload] = (
+                    recordings.get(payload, 0) + alternative["recordings"]
+                )
         for alternative in scenario.alternatives:
-            recordings[alternative.payload] = recordings.get(alternative.payload, 0) + 1
+            payload = _canonical_payload(
+                alternative.payload,
+                expected_index=scenario.scenario_index,
+            )
+            recordings[payload] = recordings.get(payload, 0) + 1
         document = {
             "schema_name": _SCHEMA_NAME,
             "schema_version": _SCHEMA_VERSION,
@@ -122,12 +139,15 @@ class OutcomeStore:
 
 def _decode(path: Path, scenario_key: str) -> StoredScenario:
     document = _load_document(path, scenario_key)
+    payloads = sorted(
+        {alternative["payload"] for alternative in document["alternatives"]}
+    )
     return StoredScenario(
         scenario_key,
         document["operation_count"],
         tuple(
-            AllowedAlternative(alternative["payload"])
-            for alternative in document["alternatives"]
+            AllowedAlternative(payload)
+            for payload in payloads
         ),
         tuple(document["kernel_releases"]),
     )
@@ -177,9 +197,15 @@ def _load_document(path: Path, scenario_key: str) -> dict:
             raise OutcomeStoreError("outcome payload is invalid") from error
         if not payload:
             raise OutcomeStoreError("outcome payload is empty")
-        decoded.append({"payload": payload, "recordings": alternative["recordings"]})
-    payloads = tuple(alternative["payload"] for alternative in decoded)
-    if payloads != tuple(sorted(set(payloads))):
+        decoded.append(
+            {
+                "raw_payload": payload,
+                "payload": _canonical_payload(payload),
+                "recordings": alternative["recordings"],
+            }
+        )
+    raw_payloads = tuple(alternative["raw_payload"] for alternative in decoded)
+    if raw_payloads != tuple(sorted(set(raw_payloads))):
         raise OutcomeStoreError("outcome alternatives are not canonical")
     document["alternatives"] = decoded
     return document
@@ -216,6 +242,32 @@ def _validate_digest(value: str) -> None:
         or hashlib.sha256(bytes.fromhex(value)).digest_size != 32
     ):
         raise OutcomeStoreError("scenario digest is invalid")
+
+
+def _canonical_payload(payload: bytes, *, expected_index: int = None) -> bytes:
+    if not payload or len(payload) % _RESULT_SIZE != 0:
+        raise OutcomeStoreError("outcome payload is not a result vector")
+    canonical = bytearray(payload)
+    indexes = {
+        struct.unpack_from("<I", payload, offset)[0]
+        for offset in range(0, len(payload), _RESULT_SIZE)
+    }
+    if len(indexes) != 1:
+        raise OutcomeStoreError("outcome payload mixes scenario indexes")
+    (scenario_index,) = tuple(indexes)
+    if expected_index is not None and scenario_index != expected_index:
+        raise OutcomeStoreError("outcome payload scenario index is invalid")
+    for offset in range(0, len(canonical), _RESULT_SIZE):
+        struct.pack_into("<I", canonical, offset, 0)
+    return bytes(canonical)
+
+
+def _rebase_payload(payload: bytes, scenario_index: int) -> bytes:
+    canonical = _canonical_payload(payload, expected_index=0)
+    rebased = bytearray(canonical)
+    for offset in range(0, len(rebased), _RESULT_SIZE):
+        struct.pack_into("<I", rebased, offset, scenario_index)
+    return bytes(rebased)
 
 
 def _sorted_unique_strings(value: object) -> bool:

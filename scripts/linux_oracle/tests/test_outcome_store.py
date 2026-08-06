@@ -1,6 +1,7 @@
 """Fail-first tests for persistent, monotonically growing Linux outcomes."""
 
 import hashlib
+import struct
 import sys
 import tempfile
 import unittest
@@ -28,7 +29,7 @@ class OutcomeStoreTests(unittest.TestCase):
                 AllowedScenario(
                     0,
                     2,
-                    (AllowedAlternative(b"first"),),
+                    (AllowedAlternative(_result_vector(0, b"first")),),
                 ),
             ),
         )
@@ -39,7 +40,7 @@ class OutcomeStoreTests(unittest.TestCase):
                 AllowedScenario(
                     0,
                     2,
-                    (AllowedAlternative(b"second"),),
+                    (AllowedAlternative(_result_vector(0, b"second")),),
                 ),
             ),
         )
@@ -61,13 +62,69 @@ class OutcomeStoreTests(unittest.TestCase):
                 alternative.payload
                 for alternative in second_merged.scenarios[0].alternatives
             ),
-            (b"first", b"second"),
+            (_result_vector(0, b"first"), _result_vector(0, b"second")),
         )
         self.assertEqual(
             tuple(alternative.payload for alternative in reloaded.alternatives),
-            (b"first", b"second"),
+            (_result_vector(0, b"first"), _result_vector(0, b"second")),
         )
         self.assertEqual(reloaded.kernel_releases, ("linux-a", "linux-b"))
+
+    def test_batch_scenario_indexes_do_not_create_semantic_alternatives(self):
+        target_key = hashlib.sha256(b"target scenario").hexdigest()
+        dummy_key = hashlib.sha256(b"dummy scenario").hexdigest()
+        first = AllowedTrace(
+            4,
+            7,
+            (
+                AllowedScenario(
+                    0,
+                    1,
+                    (AllowedAlternative(_result_vector(0, b"target")),),
+                ),
+            ),
+        )
+        second = AllowedTrace(
+            4,
+            9,
+            (
+                AllowedScenario(
+                    0,
+                    1,
+                    (AllowedAlternative(_result_vector(0, b"dummy")),),
+                ),
+                AllowedScenario(
+                    1,
+                    1,
+                    (AllowedAlternative(_result_vector(1, b"target")),),
+                ),
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = OutcomeStore(Path(temporary_directory))
+            store.merge((target_key,), first, kernel_release="linux-a")
+            merged = store.merge(
+                (dummy_key, target_key), second, kernel_release="linux-a"
+            )
+            stored = store.load(target_key)
+
+        self.assertEqual(len(merged.scenarios[1].alternatives), 1)
+        self.assertEqual(
+            struct.unpack_from("<I", merged.scenarios[1].alternatives[0].payload)[0],
+            1,
+        )
+        self.assertEqual(
+            struct.unpack_from("<I", stored.alternatives[0].payload)[0],
+            0,
+        )
+
+
+def _result_vector(scenario_index: int, label: bytes) -> bytes:
+    encoded = bytearray(112)
+    struct.pack_into("<I", encoded, 0, scenario_index)
+    encoded[48 : 48 + len(label)] = label
+    return bytes(encoded)
 
 
 if __name__ == "__main__":

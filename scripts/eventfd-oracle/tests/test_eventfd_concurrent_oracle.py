@@ -519,7 +519,12 @@ class EventFdConcurrentRoutingTests(unittest.TestCase):
         )
         encoded = concurrent_scenario.serialize_document(document).encode("utf-8")
         item = BatchInput(hashlib.sha256(encoded).hexdigest(), encoded)
-        payloads = iter((b"first", b"second"))
+        payload_size = len(document.scenarios[0].operations) * 112
+        first_payload = bytes(payload_size)
+        second_payload_buffer = bytearray(payload_size)
+        second_payload_buffer[48] = 1
+        second_payload = bytes(second_payload_buffer)
+        payloads = iter((first_payload, second_payload))
 
         def record(_elf, scenario_path, trace_path):
             payload = next(payloads)
@@ -571,7 +576,7 @@ class EventFdConcurrentRoutingTests(unittest.TestCase):
                 alternative.payload
                 for alternative in merged.scenarios[0].alternatives
             ),
-            (b"first", b"second"),
+            (first_payload, second_payload),
         )
 
     def test_syscall_schedule_and_qemu_timeouts_are_distinct(self):
