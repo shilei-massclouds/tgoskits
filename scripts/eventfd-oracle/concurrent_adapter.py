@@ -1,5 +1,6 @@
 """Adapter specification for eventfd concurrent v1 scenarios."""
 
+import hashlib
 import sys
 from pathlib import Path
 
@@ -41,6 +42,15 @@ def record_host_converged(
     corpus_digest = fnv1a64(scenario_path.read_bytes())
     document = concurrent_scenario.parse_document(scenario_path.read_bytes())
     deterministic = concurrent_scenario.deterministic_scenario_indexes(document)
+    scenario_digest = hashlib.sha256(scenario_path.read_bytes()).hexdigest()
+
+    def report_progress(completed: int, total: int) -> None:
+        if completed == 1 or completed % 8 == 0 or completed == total:
+            print(
+                "host-record progress: adapter=eventfd-concurrent-v1 "
+                f"scenario={scenario_digest[:12]} runs={completed}/{total}",
+                flush=True,
+            )
 
     def decode(path: Path):
         return decode_raw_run_trace(
@@ -61,6 +71,7 @@ def record_host_converged(
         temporary_prefix=".eventfd-concurrent-v1-host-",
         deterministic=deterministic,
         indexed_record_once=record_host_scheduled,
+        progress=report_progress,
     )
 
 

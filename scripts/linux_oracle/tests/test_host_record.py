@@ -103,6 +103,38 @@ class StableHostRecordTests(unittest.TestCase):
 
 
 class ConvergedHostRecordTests(unittest.TestCase):
+    def test_reports_progress_after_each_completed_run(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            scenario = root / "scenario.ops"
+            scenario.write_bytes(b"version 4\nscenario checked\n")
+            trace = root / "linux.trace"
+            progress = []
+
+            def record(_elf, _scenario, destination):
+                destination.write_bytes(b"stable")
+                return HostRecordResult(True, False, "recorded")
+
+            result = record_converged_host(
+                record,
+                lambda path: (ScenarioRun(0, 1, path.read_bytes()),),
+                Path("oracle"),
+                scenario,
+                trace,
+                magic=b"EVFDORC4",
+                version=4,
+                temporary_prefix=".test-progress-",
+                progress=lambda completed, total: progress.append(
+                    (completed, total)
+                ),
+            )
+
+            self.assertTrue(result.passed)
+            self.assertEqual(
+                progress,
+                [(completed, 32) for completed in range(1, 33)],
+            )
+
     def test_indexed_recorder_receives_every_run_number(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

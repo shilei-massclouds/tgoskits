@@ -17,6 +17,7 @@ from .outcomes import (
 HostRecorder = Callable[[Path, Path, Path], HostRecordResult]
 IndexedHostRecorder = Callable[[Path, Path, Path, int], HostRecordResult]
 RunTraceDecoder = Callable[[Path], Iterable[ScenarioRun]]
+ProgressReporter = Callable[[int, int], None]
 
 
 def record_converged_host(
@@ -31,6 +32,7 @@ def record_converged_host(
     temporary_prefix: str,
     deterministic: Iterable[int] = (),
     indexed_record_once: Optional[IndexedHostRecorder] = None,
+    progress: Optional[ProgressReporter] = None,
 ) -> HostRecordResult:
     """Record 32 host runs and atomically persist one converged allowed set."""
     trace_path.parent.mkdir(parents=True, exist_ok=True)
@@ -54,6 +56,8 @@ def record_converged_host(
                         False, result.parser_rejection, "\n".join(logs)
                     )
                 recorder.add_run(tuple(decode_run_trace(raw_trace)))
+                if progress is not None:
+                    progress(index + 1, recorder.expected_runs)
             allowed = recorder.finish(
                 version=version,
                 corpus_digest=fnv1a64(scenario_path.read_bytes()),
@@ -104,6 +108,7 @@ def record_stable_host(
 __all__ = [
     "HostRecorder",
     "IndexedHostRecorder",
+    "ProgressReporter",
     "RunTraceDecoder",
     "record_converged_host",
     "record_stable_host",
