@@ -28,7 +28,6 @@ success_regex = [
     '(?m)^STARRY_EVENTFD_LINUX_ORACLE_PASSED: operations=[0-9]+ scenarios=[0-9]+\r?$',
 ]
 fail_regex = [
-    "(?m)^STARRY_EVENTFD_LINUX_ORACLE_FAILED:",
     # Let the harness finish printing the complete concurrent fingerprint;
     # the shell emits AXTEST_COVERAGE_DEFERRED_FAIL after its nonzero exit.
     "(?m)^STARRY_EVENTFD_LINUX_ORACLE_SYSCALL_TIMEOUT:",

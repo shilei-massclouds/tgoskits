@@ -524,7 +524,9 @@ class EventFdOracleTests(unittest.TestCase):
     def test_runner_uses_explicit_default_off_eventfd_case(self):
         config = (CASE_DIR / "qemu-x86_64.toml").read_text()
         self.assertIn('default_run = false', config)
-        self.assertIn("STARRY_EVENTFD_LINUX_ORACLE_FAILED:", config)
+        fail_regex = config.split("fail_regex = [", maxsplit=1)[1]
+        self.assertNotIn("STARRY_EVENTFD_LINUX_ORACLE_FAILED", fail_regex)
+        self.assertIn("AXTEST_COVERAGE_DEFERRED_FAIL", fail_regex)
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             workspace = root / "workspace"
