@@ -652,6 +652,152 @@ class FrameworkContractTests(unittest.TestCase):
             self.assertEqual(resumed[0][1], {"regions": ["a"]})
             self.assertEqual(tasks.recoverable(), ())
 
+    def test_representative_proof_task_is_the_only_retryable_unstable_task(self):
+        spec = replace(
+            FAKE_SPEC,
+            outcomes=OutcomeSetHooks(
+                b"FAUXOUT1",
+                lambda document: tuple("0" * 64 for _item in document),
+                lambda _document: (),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            tasks = TaskStore(spec, root, "attribution")
+            encoded = fake_input("recover").encoded
+            retryable = tasks.create("retry-proof", (encoded,))
+            tasks.transition(
+                retryable,
+                "unstable",
+                {"category": "representative-proof"},
+            )
+            fatal = tasks.create("fatal-proof", (encoded,))
+            tasks.transition(fatal, "unstable", {"category": "other"})
+
+            recoverable = tasks.recoverable()
+            self.assertEqual(
+                tuple(task.metadata["task_id"] for task in recoverable),
+                ("retry-proof",),
+            )
+            claimed = tasks.claim(recoverable[0])
+            self.assertEqual(claimed.metadata["state"], "running")
+            self.assertIsNone(claimed.metadata["result"])
+
+    def test_concurrent_unreproducible_coverage_does_not_block_campaign(self):
+        spec = replace(
+            FAKE_SPEC,
+            outcomes=OutcomeSetHooks(
+                b"FAUXOUT1",
+                lambda document: tuple("0" * 64 for _item in document),
+                lambda _document: (),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            kernel = workspace / spec.qemu.coverage_object_path
+            kernel.parent.mkdir(parents=True)
+            kernel.write_bytes(b"fixed kernel")
+            kernel_digest = hashlib.sha256(kernel.read_bytes()).hexdigest()
+            invocation = 0
+
+            def observe(*args, **_kwargs):
+                nonlocal invocation
+                invocation += 1
+                args[5].charge()
+                regions = ("subsystem/alpha.py:1:1",) if invocation < 3 else ()
+                return driver.ExecutionObservation(
+                    True,
+                    "passed",
+                    regions,
+                    kernel_digest,
+                )
+
+            with mock.patch.object(driver, "execute_inputs", side_effect=observe):
+                status = driver.run_campaign(
+                    spec,
+                    CampaignRequest(9, 1, 1, 8, 0, False),
+                    workspace,
+                )
+
+            self.assertEqual(status, 0)
+            store = CampaignStore(spec, workspace)
+            self.assertEqual(store.load_entries(), ())
+            self.assertEqual(store.load_coverage(kernel_digest), ())
+            tasks = tuple(
+                TaskStore(spec, store.root, "attribution").root.iterdir()
+            )
+            self.assertEqual(len(tasks), 1)
+            task = TaskStore(spec, store.root, "attribution").load(tasks[0])
+            self.assertEqual(task.metadata["state"], "completed")
+            self.assertEqual(
+                task.metadata["result"]["category"],
+                "unreproducible-coverage",
+            )
+            self.assertEqual(
+                task.metadata["result"]["missing_regions"],
+                ["subsystem/alpha.py:1:1"],
+            )
+            self.assertEqual(task.metadata["result"]["admitted_digests"], [])
+            runs = tuple(store.runs_root.iterdir())
+            self.assertEqual(len(runs), 1)
+            metadata = json.loads(
+                (runs[0] / "metadata.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                metadata["result"],
+                "passed-unreproducible-coverage",
+            )
+
+    def test_nonconcurrent_unreproducible_coverage_remains_fatal(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            kernel = workspace / FAKE_SPEC.qemu.coverage_object_path
+            kernel.parent.mkdir(parents=True)
+            kernel.write_bytes(b"fixed kernel")
+            kernel_digest = hashlib.sha256(kernel.read_bytes()).hexdigest()
+            invocation = 0
+
+            def observe(*args, **_kwargs):
+                nonlocal invocation
+                invocation += 1
+                args[5].charge()
+                regions = ("subsystem/alpha.py:1:1",) if invocation < 3 else ()
+                return driver.ExecutionObservation(
+                    True,
+                    "passed",
+                    regions,
+                    kernel_digest,
+                )
+
+            with (
+                mock.patch.object(driver, "execute_inputs", side_effect=observe),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "representative coverage proof failed",
+                ),
+            ):
+                driver.run_campaign(
+                    FAKE_SPEC,
+                    CampaignRequest(9, 1, 1, 8, 0, False),
+                    workspace,
+                )
+
+            store = CampaignStore(FAKE_SPEC, workspace)
+            tasks = tuple(
+                TaskStore(FAKE_SPEC, store.root, "attribution").root.iterdir()
+            )
+            self.assertEqual(len(tasks), 1)
+            task = TaskStore(FAKE_SPEC, store.root, "attribution").load(tasks[0])
+            self.assertEqual(task.metadata["state"], "unstable")
+            self.assertEqual(
+                task.metadata["result"],
+                {"category": "representative-proof"},
+            )
+            self.assertEqual(
+                TaskStore(FAKE_SPEC, store.root, "attribution").recoverable(),
+                (),
+            )
+
     def test_fake_adapter_completes_common_campaign_state_machine(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             workspace = Path(temporary_directory)

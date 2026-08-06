@@ -98,12 +98,30 @@ class TaskStore:
             task
             for task in tasks
             if task.metadata["state"] in ("pending", "running")
+            or self._retryable_representative_proof(task)
         )
 
     def claim(self, task: Task) -> Task:
+        if self._retryable_representative_proof(task):
+            metadata = dict(task.metadata)
+            metadata["state"] = "running"
+            metadata["result"] = None
+            atomic_replace_file(
+                task.path / "metadata.json",
+                lambda temporary: write_json(temporary, metadata),
+            )
+            return self.load(task.path)
         if task.metadata["state"] not in ("pending", "running"):
             raise PersistentStateError("only recoverable tasks may be claimed")
         return self.transition(task, "running")
+
+    def _retryable_representative_proof(self, task: Task) -> bool:
+        return (
+            self.kind == "attribution"
+            and self.spec.outcomes is not None
+            and task.metadata["state"] == "unstable"
+            and task.metadata["result"] == {"category": "representative-proof"}
+        )
 
     def transition(self, task: Task, state: str, result=None) -> Task:
         if state not in TASK_STATES:

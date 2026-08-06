@@ -129,7 +129,11 @@ def run_campaign(
             refreshed = TaskStore(spec, store.root, "attribution").load(task.path)
             if refreshed.metadata["state"] == "completed":
                 admitted = _completed_attribution_digests(refreshed)
-                result = "passed-new-coverage"
+                result = (
+                    "passed-unreproducible-coverage"
+                    if _completed_attribution_is_unreproducible(refreshed)
+                    else "passed-new-coverage"
+                )
             else:
                 result = "passed-new-coverage-pending-attribution"
         elif set(observation.regions) - set(
@@ -473,8 +477,12 @@ def recover_pending_tasks(
                 minimize_enabled,
                 batch_index,
             )
+            completed = task_store.load(task.path)
             baseline = set(store.load_coverage(elf_digest))
-            store.save_coverage(elf_digest, baseline | targets)
+            store.save_coverage(
+                elf_digest,
+                baseline | _completed_attribution_regions(completed),
+            )
 
 
 def _recover_background_with_reserve(
@@ -532,6 +540,34 @@ def _completed_attribution_digests(task: Task) -> Tuple[str, ...]:
     ):
         raise PersistentStateError("completed attribution digests are invalid")
     return tuple(values)
+
+
+def _completed_attribution_regions(task: Task) -> Set[str]:
+    result = task.metadata["result"]
+    if not isinstance(result, dict):
+        raise PersistentStateError("completed attribution result is invalid")
+    values = result.get("proven_regions")
+    if values is None:
+        return _context_string_set(task.metadata["context"], "target_regions")
+    if (
+        not isinstance(values, list)
+        or values != sorted(set(values))
+        or not all(isinstance(value, str) and value for value in values)
+    ):
+        raise PersistentStateError("completed attribution regions are invalid")
+    targets = _context_string_set(task.metadata["context"], "target_regions")
+    regions = set(values)
+    if not regions <= targets:
+        raise PersistentStateError("completed attribution regions exceed targets")
+    return regions
+
+
+def _completed_attribution_is_unreproducible(task: Task) -> bool:
+    result = task.metadata["result"]
+    return (
+        isinstance(result, dict)
+        and result.get("category") == "unreproducible-coverage"
+    )
 
 
 def combined_digest(inputs: Iterable[BatchInput]) -> str:

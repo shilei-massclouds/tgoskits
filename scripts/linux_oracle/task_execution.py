@@ -80,6 +80,32 @@ def run_attribution_task(
         if not proof.passed:
             raise CampaignReplayError("attribution", proof.category, proof.detail)
         if not target_regions <= set(proof.regions):
+            if runtime.spec.outcomes is not None:
+                proof_regions = target_regions & set(proof.regions)
+                missing_regions = target_regions - proof_regions
+                task_store.transition(
+                    task,
+                    "completed",
+                    {
+                        "category": "unreproducible-coverage",
+                        "target_regions": sorted(target_regions),
+                        "representatives": sorted(responsibilities),
+                        "entry_regions": {
+                            digest: list(mapping[digest])
+                            for digest in sorted(mapping)
+                        },
+                        "proof_regions": sorted(proof_regions),
+                        "missing_regions": sorted(missing_regions),
+                        "proven_regions": [],
+                        "admitted_digests": [],
+                    },
+                )
+                print(
+                    "attribution: status=unreproducible-coverage "
+                    f"missing_regions={len(missing_regions)}",
+                    flush=True,
+                )
+                return ()
             task_store.transition(
                 task, "unstable", {"category": "representative-proof"}
             )
@@ -112,8 +138,11 @@ def run_attribution_task(
         task,
         "completed",
         {
+            "category": "passed",
             "target_regions": sorted(target_regions),
             "representatives": sorted(responsibilities),
+            "proven_regions": sorted(target_regions),
+            "missing_regions": [],
             "admitted_digests": list(admitted_digests),
         },
     )
