@@ -159,11 +159,13 @@ pub fn sys_poll(fds: UserPtr<pollfd>, nfds: u32, timeout: i32) -> AxResult<isize
     } else {
         Some(TimeValue::from_millis(timeout as u64))
     };
-    let res = do_poll(&mut poll_fds, timeout, None)?;
+    let res = do_poll(&mut poll_fds, timeout, None);
+    // Linux copies the cleared/recomputed revents array back even when the
+    // wait is interrupted. A copy fault still takes precedence over EINTR.
     if nfds > 0 {
         write_poll_revents(fds, &poll_fds)?;
     }
-    Ok(res)
+    res
 }
 
 pub fn sys_ppoll(
@@ -185,11 +187,13 @@ pub fn sys_ppoll(
         &mut poll_fds,
         timeout,
         nullable!(sigmask.get_as_ref())?.copied(),
-    )?;
+    );
+    // Match poll(2): interruption does not leave the caller's old revents
+    // values visible, and a failed writeback is reported as EFAULT.
     if nfds > 0 {
         write_poll_revents(fds, &poll_fds)?;
     }
-    Ok(res)
+    res
 }
 
 #[cfg(axtest)]
