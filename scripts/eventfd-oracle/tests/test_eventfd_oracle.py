@@ -393,6 +393,16 @@ class EventFdOracleTests(unittest.TestCase):
                 },
             )
 
+            def complete_attribution(*args, **_kwargs):
+                active_task_store = args[5]
+                active_task = args[6]
+                active_task_store.transition(
+                    active_task,
+                    "completed",
+                    {"admitted_digests": []},
+                )
+                return ()
+
             with (
                 mock.patch.object(
                     common_driver,
@@ -400,7 +410,9 @@ class EventFdOracleTests(unittest.TestCase):
                     return_value=workspace / "starryos",
                 ),
                 mock.patch.object(
-                    common_driver, "run_attribution_task", return_value=[]
+                    common_driver,
+                    "run_attribution_task",
+                    side_effect=complete_attribution,
                 ),
             ):
                 common_driver.recover_pending_tasks(

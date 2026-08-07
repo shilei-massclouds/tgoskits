@@ -98,11 +98,11 @@ class TaskStore:
             task
             for task in tasks
             if task.metadata["state"] in ("pending", "running")
-            or self._retryable_representative_proof(task)
+            or self._retryable_concurrent_coverage_proof(task)
         )
 
     def claim(self, task: Task) -> Task:
-        if self._retryable_representative_proof(task):
+        if self._retryable_concurrent_coverage_proof(task):
             metadata = dict(task.metadata)
             metadata["state"] = "running"
             metadata["result"] = None
@@ -115,13 +115,16 @@ class TaskStore:
             raise PersistentStateError("only recoverable tasks may be claimed")
         return self.transition(task, "running")
 
-    def _retryable_representative_proof(self, task: Task) -> bool:
-        return (
-            self.kind == "attribution"
-            and self.spec.outcomes is not None
-            and task.metadata["state"] == "unstable"
-            and task.metadata["result"] == {"category": "representative-proof"}
-        )
+    def _retryable_concurrent_coverage_proof(self, task: Task) -> bool:
+        if self.spec.outcomes is None or task.metadata["state"] != "unstable":
+            return False
+        if self.kind == "attribution":
+            return task.metadata["result"] == {
+                "category": "representative-proof"
+            }
+        return task.metadata["result"] == {
+            "reason": "initial minimization input does not reproduce"
+        }
 
     def transition(self, task: Task, state: str, result=None) -> Task:
         if state not in TASK_STATES:

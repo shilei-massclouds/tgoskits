@@ -29,6 +29,15 @@ class CampaignReplayError(RuntimeError):
         super().__init__(message)
 
 
+class UnreproducibleCoverage(RuntimeError):
+    """A concurrent coverage predicate disappeared on a proof replay."""
+
+    def __init__(self, proof_regions: Set[str], missing_regions: Set[str]):
+        self.proof_regions = tuple(sorted(proof_regions))
+        self.missing_regions = tuple(sorted(missing_regions))
+        super().__init__("concurrent coverage proof is not reproducible")
+
+
 @dataclass(frozen=True)
 class TaskRuntime:
     spec: AdapterSpec
@@ -114,26 +123,54 @@ def run_attribution_task(
         task = task_store.transition(task, "running", progress)
 
     admitted = dict(progress["admitted"])
+    unreproducible_regions: Set[str] = set()
     for representative in representatives:
         if representative.digest in admitted:
             continue
         regions = set(responsibilities[representative.digest])
         encoded = representative.encoded
         if minimize_enabled:
-            encoded = minimize_representative(
-                runtime,
-                task.metadata["task_id"],
-                encoded,
-                regions,
-                fixed_elf,
-                max_minimize,
-            )
+            try:
+                encoded = minimize_representative(
+                    runtime,
+                    task.metadata["task_id"],
+                    encoded,
+                    regions,
+                    fixed_elf,
+                    max_minimize,
+                )
+            except UnreproducibleCoverage:
+                unreproducible_regions.update(regions)
+                continue
         entry = runtime.store.save_entry(encoded, regions)
         admitted[representative.digest] = entry.digest
         progress["admitted"] = dict(sorted(admitted.items()))
         task = task_store.transition(task, "running", progress)
 
     admitted_digests = tuple(sorted(set(admitted.values())))
+    if unreproducible_regions:
+        task_store.transition(
+            task,
+            "completed",
+            {
+                "category": "unreproducible-coverage",
+                "target_regions": sorted(target_regions),
+                "representatives": sorted(responsibilities),
+                "entry_regions": {
+                    digest: list(mapping[digest]) for digest in sorted(mapping)
+                },
+                "proof_regions": sorted(target_regions - unreproducible_regions),
+                "missing_regions": sorted(unreproducible_regions),
+                "proven_regions": [],
+                "admitted_digests": list(admitted_digests),
+            },
+        )
+        print(
+            "attribution: status=unreproducible-coverage "
+            f"missing_regions={len(unreproducible_regions)}",
+            flush=True,
+        )
+        return admitted_digests
     task_store.transition(
         task,
         "completed",
@@ -198,8 +235,10 @@ def run_minimization_task(
     max_candidates: int,
 ) -> bytes:
     initial = runtime.hooks.reduction.initial(encoded)
+    last_regions: Set[str] = set()
 
     def predicate(value: object) -> bool:
+        nonlocal last_regions
         candidate = canonical_entry(
             runtime.spec, runtime.hooks.reduction.encode(value)
         )
@@ -220,7 +259,8 @@ def run_minimization_task(
             raise CampaignReplayError(
                 "minimization", observation.category, observation.detail
             )
-        return responsibility <= set(observation.regions)
+        last_regions = set(observation.regions)
+        return responsibility <= last_regions
 
     remaining = max(0, runtime.budget.maximum - runtime.budget.used - 3)
     if runtime.budget.maximum - runtime.budget.used < 3:
@@ -242,7 +282,38 @@ def run_minimization_task(
         ) from error
     except (CampaignReplayError, CampaignBudgetExhausted):
         raise
-    except (ValueError, RuntimeError) as error:
+    except ValueError as error:
+        if (
+            runtime.spec.outcomes is not None
+            and str(error) == "initial minimization input does not reproduce"
+        ):
+            proof_regions = responsibility & last_regions
+            missing_regions = responsibility - proof_regions
+            task_store.transition(
+                task,
+                "completed",
+                {
+                    "category": "unreproducible-coverage",
+                    "status": "unreproducible-coverage",
+                    "original_size": len(encoded),
+                    "best_size": len(encoded),
+                    "attempts": 0,
+                    "proof_regions": sorted(proof_regions),
+                    "missing_regions": sorted(missing_regions),
+                    "candidate_rejections": [],
+                },
+            )
+            print(
+                "minimization: status=unreproducible-coverage "
+                f"missing_regions={len(missing_regions)}",
+                flush=True,
+            )
+            raise UnreproducibleCoverage(
+                proof_regions, missing_regions
+            ) from error
+        task_store.transition(task, "unstable", {"reason": str(error)})
+        raise
+    except RuntimeError as error:
         task_store.transition(task, "unstable", {"reason": str(error)})
         raise
     best = canonical_entry(runtime.spec, runtime.hooks.reduction.encode(result.value))
@@ -322,6 +393,19 @@ def _attribution_progress(task: Task) -> Dict:
 
 def _completed_minimized_input(store: CampaignStore, task: Task) -> bytes:
     result = task.metadata["result"]
+    if (
+        isinstance(result, dict)
+        and result.get("category") == "unreproducible-coverage"
+    ):
+        proof_regions = result.get("proof_regions")
+        missing_regions = result.get("missing_regions")
+        if not _sorted_string_list(proof_regions) or not _sorted_string_list(
+            missing_regions
+        ):
+            raise PersistentStateError(
+                "completed minimization coverage proof is invalid"
+            )
+        raise UnreproducibleCoverage(set(proof_regions), set(missing_regions))
     if not isinstance(result, dict) or not is_digest(result.get("best_digest")):
         raise PersistentStateError("completed minimization result is invalid")
     entries = {entry.digest: entry.encoded for entry in store.load_entries()}
@@ -344,6 +428,7 @@ def _sorted_string_list(value: object) -> bool:
 __all__ = [
     "CampaignReplayError",
     "TaskRuntime",
+    "UnreproducibleCoverage",
     "minimize_representative",
     "run_attribution_task",
     "run_minimization_task",

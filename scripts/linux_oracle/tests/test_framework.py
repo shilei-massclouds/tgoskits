@@ -652,7 +652,7 @@ class FrameworkContractTests(unittest.TestCase):
             self.assertEqual(resumed[0][1], {"regions": ["a"]})
             self.assertEqual(tasks.recoverable(), ())
 
-    def test_representative_proof_task_is_the_only_retryable_unstable_task(self):
+    def test_only_known_concurrent_coverage_proofs_are_retryable(self):
         spec = replace(
             FAKE_SPEC,
             outcomes=OutcomeSetHooks(
@@ -682,6 +682,31 @@ class FrameworkContractTests(unittest.TestCase):
             claimed = tasks.claim(recoverable[0])
             self.assertEqual(claimed.metadata["state"], "running")
             self.assertIsNone(claimed.metadata["result"])
+
+            minimizations = TaskStore(spec, root, "minimization")
+            retryable_minimization = minimizations.create(
+                "retry-minimization-proof", (encoded,)
+            )
+            minimizations.transition(
+                retryable_minimization,
+                "unstable",
+                {"reason": "initial minimization input does not reproduce"},
+            )
+            recovered_minimizations = minimizations.recoverable()
+            self.assertEqual(
+                tuple(
+                    task.metadata["task_id"]
+                    for task in recovered_minimizations
+                ),
+                ("retry-minimization-proof",),
+            )
+            claimed_minimization = minimizations.claim(
+                recovered_minimizations[0]
+            )
+            self.assertEqual(
+                claimed_minimization.metadata["state"], "running"
+            )
+            self.assertIsNone(claimed_minimization.metadata["result"])
 
     def test_concurrent_unreproducible_coverage_does_not_block_campaign(self):
         spec = replace(
@@ -747,6 +772,131 @@ class FrameworkContractTests(unittest.TestCase):
                 metadata["result"],
                 "passed-unreproducible-coverage",
             )
+
+    def test_concurrent_minimization_input_may_lose_attributed_coverage(self):
+        spec = replace(
+            FAKE_SPEC,
+            outcomes=OutcomeSetHooks(
+                b"FAUXOUT1",
+                lambda document: tuple("0" * 64 for _item in document),
+                lambda _document: (),
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            kernel = workspace / spec.qemu.coverage_object_path
+            kernel.parent.mkdir(parents=True)
+            kernel.write_bytes(b"fixed kernel")
+            kernel_digest = hashlib.sha256(kernel.read_bytes()).hexdigest()
+            invocation = 0
+
+            def observe(*args, **_kwargs):
+                nonlocal invocation
+                invocation += 1
+                args[5].charge()
+                regions = (
+                    ("subsystem/alpha.py:1:1",)
+                    if invocation <= 3
+                    else ()
+                )
+                return driver.ExecutionObservation(
+                    True,
+                    "passed",
+                    regions,
+                    kernel_digest,
+                )
+
+            with mock.patch.object(driver, "execute_inputs", side_effect=observe):
+                status = driver.run_campaign(
+                    spec,
+                    CampaignRequest(9, 1, 1, 12, 0, True),
+                    workspace,
+                )
+
+            self.assertEqual(status, 0)
+            store = CampaignStore(spec, workspace)
+            self.assertEqual(store.load_entries(), ())
+            self.assertEqual(store.load_coverage(kernel_digest), ())
+            attribution_tasks = tuple(
+                TaskStore(spec, store.root, "attribution").root.iterdir()
+            )
+            self.assertEqual(len(attribution_tasks), 1)
+            attribution = TaskStore(spec, store.root, "attribution").load(
+                attribution_tasks[0]
+            )
+            self.assertEqual(attribution.metadata["state"], "completed")
+            self.assertEqual(
+                attribution.metadata["result"]["category"],
+                "unreproducible-coverage",
+            )
+            self.assertEqual(
+                attribution.metadata["result"]["missing_regions"],
+                ["subsystem/alpha.py:1:1"],
+            )
+            minimization_tasks = tuple(
+                TaskStore(spec, store.root, "minimization").root.iterdir()
+            )
+            self.assertEqual(len(minimization_tasks), 1)
+            minimization = TaskStore(spec, store.root, "minimization").load(
+                minimization_tasks[0]
+            )
+            self.assertEqual(minimization.metadata["state"], "completed")
+            self.assertEqual(
+                minimization.metadata["result"]["category"],
+                "unreproducible-coverage",
+            )
+
+    def test_nonconcurrent_minimization_input_coverage_loss_remains_fatal(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            kernel = workspace / FAKE_SPEC.qemu.coverage_object_path
+            kernel.parent.mkdir(parents=True)
+            kernel.write_bytes(b"fixed kernel")
+            kernel_digest = hashlib.sha256(kernel.read_bytes()).hexdigest()
+            invocation = 0
+
+            def observe(*args, **_kwargs):
+                nonlocal invocation
+                invocation += 1
+                args[5].charge()
+                regions = (
+                    ("subsystem/alpha.py:1:1",)
+                    if invocation <= 3
+                    else ()
+                )
+                return driver.ExecutionObservation(
+                    True,
+                    "passed",
+                    regions,
+                    kernel_digest,
+                )
+
+            with (
+                mock.patch.object(driver, "execute_inputs", side_effect=observe),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "initial minimization input does not reproduce",
+                ),
+            ):
+                driver.run_campaign(
+                    FAKE_SPEC,
+                    CampaignRequest(9, 1, 1, 12, 0, True),
+                    workspace,
+                )
+
+            store = CampaignStore(FAKE_SPEC, workspace)
+            minimization_tasks = tuple(
+                TaskStore(FAKE_SPEC, store.root, "minimization").root.iterdir()
+            )
+            self.assertEqual(len(minimization_tasks), 1)
+            minimizations = TaskStore(FAKE_SPEC, store.root, "minimization")
+            minimization = minimizations.load(minimization_tasks[0])
+            self.assertEqual(minimization.metadata["state"], "unstable")
+            self.assertEqual(
+                minimization.metadata["result"],
+                {"reason": "initial minimization input does not reproduce"},
+            )
+            self.assertEqual(minimizations.recoverable(), ())
 
     def test_nonconcurrent_unreproducible_coverage_remains_fatal(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

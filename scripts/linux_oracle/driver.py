@@ -33,6 +33,7 @@ from .spec import AdapterSpec, CampaignHooks
 from .task_execution import (
     CampaignReplayError,
     TaskRuntime,
+    UnreproducibleCoverage,
     minimize_representative as _minimize_representative,
     run_attribution_task as _run_attribution_task,
     run_minimization_task as _run_minimization_task,
@@ -438,21 +439,24 @@ def recover_pending_tasks(
                 maximum = _context_nonnegative_integer(
                     context, "max_candidates"
                 )
-                run_minimization_task(
-                    spec,
-                    hooks,
-                    workspace,
-                    store,
-                    host_oracle,
-                    task_store,
-                    task,
-                    inputs[0].encoded,
-                    responsibility,
-                    fixed_elf,
-                    budget,
-                    maximum,
-                    batch_index,
-                )
+                try:
+                    run_minimization_task(
+                        spec,
+                        hooks,
+                        workspace,
+                        store,
+                        host_oracle,
+                        task_store,
+                        task,
+                        inputs[0].encoded,
+                        responsibility,
+                        fixed_elf,
+                        budget,
+                        maximum,
+                        batch_index,
+                    )
+                except UnreproducibleCoverage:
+                    pass
                 continue
             targets = _context_string_set(context, "target_regions")
             maximum = _context_nonnegative_integer(context, "max_minimize")
