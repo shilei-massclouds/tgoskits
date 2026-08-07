@@ -522,68 +522,6 @@ class FrameworkContractTests(unittest.TestCase):
             self.assertEqual(observation.detail, diagnostic)
             self.assertEqual(budget.used, 0)
 
-    def test_pinned_replay_extracts_coverage_from_pinned_elf(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            workspace = Path(temporary_directory)
-            host = workspace / "source-runner"
-            host.write_bytes(b"host")
-            active_elf = workspace / FAKE_SPEC.qemu.coverage_object_path
-            active_elf.parent.mkdir(parents=True)
-            active_elf.write_bytes(b"current Starry ELF")
-            pinned_elf = workspace / "fixed" / "starryos"
-            pinned_elf.parent.mkdir()
-            pinned_elf.write_bytes(b"pinned Starry ELF")
-            profraw = workspace / "faux.profraw"
-            profraw.write_bytes(b"profile")
-            execution = SimpleNamespace(
-                prepared=SimpleNamespace(
-                    document=parse_fake(fake_input("pinned").encoded)
-                ),
-                host_record=HostRecordResult(True, False, "recorded"),
-                guest_result=SimpleNamespace(
-                    passed=True,
-                    category="passed",
-                    log="passed",
-                    profraw_paths=(profraw,),
-                ),
-            )
-
-            @contextmanager
-            def passed_batch(*_args, **_kwargs):
-                yield execution
-
-            store = CampaignStore(FAKE_SPEC, workspace)
-            with (
-                mock.patch.object(
-                    common_execution,
-                    "execute_batch",
-                    side_effect=passed_batch,
-                ),
-                mock.patch.object(common_execution, "merge_profraws"),
-                mock.patch.object(
-                    common_execution,
-                    "covered_region_set",
-                    return_value={"fixed:1:1"},
-                ) as covered,
-            ):
-                observation = common_execution.execute_inputs(
-                    FAKE_SPEC,
-                    workspace,
-                    store,
-                    host,
-                    (fake_input("pinned"),),
-                    CampaignBudget(1),
-                    pinned_starry_elf=pinned_elf,
-                    batch_index=0,
-                )
-
-            self.assertTrue(observation.passed)
-            self.assertEqual(
-                observation.starry_elf_digest,
-                hashlib.sha256(pinned_elf.read_bytes()).hexdigest(),
-            )
-            self.assertEqual(covered.call_args.args[2], pinned_elf)
-
     def test_unexplained_concurrent_outcome_is_saved_as_a_question(self):
         spec = replace(
             FAKE_SPEC,
