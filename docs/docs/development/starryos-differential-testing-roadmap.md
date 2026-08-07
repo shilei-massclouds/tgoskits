@@ -709,7 +709,7 @@ pipe buffer slot。默认 `simple-single` 和历史 replay routing 未改变。
 
 ### 10.4 Stage 6.4：并发、signal、timeout、epoll 与生命周期闭环
 
-**状态：进行中（实现完成，aggregate acceptance 进行中；2026-08-06）。**
+**状态：已完成（2026-08-07）。**
 
 Stage 6 的最终纵向能力使用两个独立的新 adapter，绝不升级或迁移历史格式：
 
@@ -722,11 +722,12 @@ Stage 6 的最终纵向能力使用两个独立的新 adapter，绝不升级或�
 `--model blocking` 仍选择已验收的 blocking-poll adapter。replay 必须先按 artifact
 中的精确 adapter ID 分派，再解析版本化内容。
 
-最终范围固定为两个受控 worker、场景级有限结果集合、multi-waiter 有界进展、
+最终范围固定为两个受控 worker、场景级经验结果集合、multi-waiter 有界进展、
 `SIGUSR1`/`EINTR`/`SA_RESTART`、`poll`/`ppoll` 有限 timeout、pipe/eventfd 的 epoll
 LT/ET/ONESHOT/EXCLUSIVE、多 fd 轮转，以及 alias/OFD/peer 生命周期、`POLLERR`、
-`SIGPIPE` 和 `EPIPE`。自然调度只允许以完整场景结果向量形成至多四个 alternative，
-不得对单条 operation 分别取并集。
+`SIGPIPE` 和 `EPIPE`。自然调度结果只能以完整场景结果向量进入集合，不得对单条
+operation 分别取并集。Linux 证据按规范化场景持久化并单调扩展；32 次 host record
+是固定证据预算，不再以“至少观察三次、末八次无新增、至多四种”宣称概率收敛。
 
 网络 EPOLLET 留给 Stage 7。另一个线程关闭正被 `poll` 监视的同一 fd 只作为
 Linux-specific 诊断，不作为兼容 gate；panic、UAF、harness failure 或无法清理的
@@ -747,14 +748,52 @@ epoll LT alias 在多 waiter 间重复返回、fd-multiplexing wait 被 `SA_REST
 同 fd cross-thread `poll` close 的 100-run Linux/Starry 诊断均可有界清理；两侧结果
 分布不同但按既定边界不作为语义 gate。
 
-最终 campaign 验收尚未完成。`eventfd-concurrent-v1` 的 seed 42 第一批 foreground
-Linux record 和 Starry QEMU 已通过并产生新 coverage；16 个 attribution 单项已
-完成，当前正在诊断五个代表项合并后的 Linux allowed-set record failure。完成该
-可恢复任务后，仍须执行 eventfd/pipe 的 4 × 16 campaign、recovery-only 清空后台
-任务，以及最终 fmt、clippy、sync/lockdep/stress QEMU 验收。在这些 gate 全部通过
-前，Stage 6 不标记 complete，Stage 7 也不据此提前开始。
+最终 campaign 验收采用下述 bounded gate。并发 adapter 已改用可持续扩展的 Linux
+outcome store；Starry 的非确定并发结果若不在当前经验集合中，保存为
+`unexplained-outcome` 而不直接宣判生产缺陷。并发 coverage representative 若在
+复证时不能重现目标 region，则以 `unreproducible-coverage` 完成归因事务，不准入
+corpus、也不推进稳定 coverage baseline；历史 adapter 仍保持严格失败语义。
+
+截至 2026-08-07，`eventfd-concurrent-v1` 上一次中断的第二批 attribution 已通过
+recovery-only 完成：本轮使用 39 次 QEMU，三个代表项复证全部 2326 个目标 region，
+13 个 minimization job 全部完成，有效 corpus 为 15，`background_pending=0`。随后两个
+adapter 均通过 seed 42、2 batches × 2 candidates 的端到端 bounded campaign：eventfd
+两批分别复证 2105/2105、2192/2192 个 target region，最终 `qemu=24`、`corpus=16`；
+pipe 两批分别复证 2441/2441、2411/2411 个 target region，最终 `qemu=24`、
+`corpus=10`。两者均为 `background_pending=0`，且没有 failure 或 question artifact。
+
+2 × 2 是 Stage 6 的机制验收 gate：它已经覆盖 generator/mutator、Linux outcome
+持久化、Starry replay、coverage attribution、minimization、corpus admission 和事务
+清理的完整链路。4 × 16 不再作为 Stage 6 的概率性收敛条件；它作为 Stage 7 的覆盖
+扩展工作，继续利用已有 corpus 和单调增长的 Linux outcome store。
+
+Stage 6 开始前，历史同步根 `coverage/eventfd-oracle-fuzz` 已有 5 个 pending 和 2 个
+running 事务，它们固定到旧 Starry ELF
+`beb061ae1fef8abd79ea555be8a47529fa3d770055fb915d38aca5d9ea175e00`。生产修复后，
+构建器按设计拒绝以当前可执行段复放旧 coverage 身份；事务元数据又没有足够的源码
+revision/toolchain 信息重建原环境。因此这 7 个事务继续只读冻结：不删除、不伪造
+completed、不迁移到当前 ELF，也不计入两个 concurrent 根的 `background_pending`。
+两个新根的后台任务已经全部完成。
+
+最终聚合验收也于 2026-08-07 完成：common/eventfd/pipe Python suite 合计
+380 passed、1 个环境相关 skip；公共 C harness 在 `-Wall -Wextra -Werror` 下构建，
+CTest 2/2 通过。Starry x86_64 QEMU 通过 eventfd raw 92/92、pipe raw 47/47、
+select/poll family 45 个 module、eventfd EPOLLET 31/31、signal/EINTR 1/1，以及
+`epoll_pwait` sigsetsize 9/9。额外的 SMP=4 ArceOS QEMU 通过 lockdep baseline 1/1
+和 remote wait-queue wake 1/1；select/poll family 已包含 `stress_loop` 与
+`stress_many_fds`。`py_compile`、workspace rustfmt、`axpoll` clippy 2/2、
+`starry-kernel` clippy 23/23、覆盖 186 个 package 的 sync-lint 和
+`git diff --check` 均通过。当前 Starry 顶层 package 不暴露 `lockdep` feature，
+因此 runtime lockdep 使用仓库现行的 ArceOS 专项 QEMU case，而不是旧的
+`FEATURES=lockdep` Starry 命令。至此 Stage 6 的实现、确定性回归、bounded campaign、
+并发专项检查和证据冻结边界全部闭环；Stage 7 从持久 corpus/outcome store 继续扩展。
 
 ## 11. 阶段 7：持续扩展与优先级管理
+
+Stage 7 的第一项证据扩展是分别运行 eventfd/pipe concurrent 的 seed 42、4 batches ×
+16 candidates campaign，并以 recovery-only 清空其后台任务。该运行用于发现更多覆盖
+和补充 Linux 经验结果，不回退为“至少三次、末八次无新增”之类的概率收敛 gate。
+网络 EPOLLET、跨架构并发 trace 与 CI 周期性高强度 campaign 也在本阶段按证据排序。
 
 后续场景不按 syscall 数量推进，而按以下证据排序：
 

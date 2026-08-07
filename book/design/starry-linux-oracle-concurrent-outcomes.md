@@ -3,10 +3,11 @@
 ## Status and decision
 
 This is the independently reviewable high-risk design for the common part of
-Stage 6.4. Implementation must not start until this protocol and the resource
-design in `starry-eventfd-pipe-concurrent-oracle.md` are reviewable on their
-own. The change is test infrastructure; a Linux/Starry mismatch discovered by
-it requires a separate fail-first regression and production fix.
+Stage 6.4. The protocol and the resource design in
+`starry-eventfd-pipe-concurrent-oracle.md` were reviewed independently before
+implementation. The change is test infrastructure; a confirmed Linux/Starry
+mismatch discovered by it requires a separate fail-first regression and
+production fix.
 
 Stage 6.4 adds two workers and a scenario-level allowed-outcome set. It does
 not replace `SingleWorkerLifecycle`, change the three-record policy of any
@@ -35,10 +36,12 @@ following without depending on scheduler luck:
   started pthreads before the harness exits?
 
 The common work is complete when two workers have independent typed
-lifecycles, a host recorder converges on at most four complete alternatives,
-the aggregate trace is canonical and self-verifying, compare accepts exactly
-one alternative, failure evidence identifies the earliest difference against
-the whole set, and reduction re-records the host set for every candidate.
+lifecycles, a host recorder captures complete alternatives without breaking
+their correlation, persistent evidence grows monotonically per canonical
+scenario, the aggregate trace is canonical and self-verifying, comparison
+accepts exactly one witnessed alternative, failure or question evidence
+identifies the earliest difference against the whole current set, and
+reduction re-records Linux evidence for every candidate.
 
 ## Existing boundary and alternatives
 
@@ -55,7 +58,7 @@ normalization stay in the pipe/eventfd adapters.
 | Record a fixed winner | Rejected because Linux does not promise one scheduler order. |
 | Put a scheduler in Python | Rejected because the syscall wait queues and delivery order must remain real kernel behavior. |
 | Accept invariant-only results | Rejected for v1 because it weakens errno, data, event, and handler evidence. |
-| Record a bounded set of complete scenario vectors | Selected; nondeterminism is explicit and correlation is preserved. |
+| Persist a monotonic empirical set of complete scenario vectors | Selected; nondeterminism is explicit, correlation is preserved, and later tool runs may add rare Linux outcomes. |
 
 ## Python worker lifecycle
 
@@ -155,7 +158,7 @@ digest, and the complete alternatives. The trace rejects:
 
 - a wrong magic, exact version, corpus digest, host ABI metadata, count, or
   digest;
-- zero or more than four alternatives;
+- zero alternatives or a count that cannot be represented by the format;
 - an unsorted or duplicate alternative;
 - an alternative with a different operation identity or vector length; and
 - trailing bytes.
@@ -163,39 +166,41 @@ digest, and the complete alternatives. The trace rejects:
 Historical v1--v6 trace layouts and online operation comparison remain
 unchanged.
 
-## Host convergence policy
+## Host observation and persistence policy
 
 The concurrent recorder executes the complete canonical corpus 32 times on
-one host executable and kernel. Each raw run produces one vector per scenario.
+one host executable and kernel. This is a fixed evidence budget, not a
+statistical convergence claim. Each raw run produces one vector per scenario.
 After every run, the recorder updates per-scenario alternative counts.
 
 An adapter may use the recorder's zero-based run index to alternate a bounded
 worker-entry delay. This changes only which real pthread reaches the kernel
 wait queue first; it does not choose a winner, synthesize a return value, or
 alter the corpus. The delay is host-record-only and is absent from guest
-comparison. Its purpose is to repeat legal but strongly biased Linux orders
-often enough for the minimum-observation rule to remain meaningful.
+comparison. It improves exploration but makes no probability guarantee.
 
-Admission requires all of the following:
+Every successful recording is merged into an `outcomes/` store keyed by the
+SHA-256 of one canonical scenario. Stored result vectors normalize their
+temporary batch scenario index to zero; an artifact rebases them to its current
+batch position. The store records observation counts and every contributing
+Linux kernel release. Merges take an exclusive file lock and replace JSON
+evidence atomically. Existing alternatives are never removed, and replay with
+`--refresh-host` may extend the set.
 
-- no scenario exceeds four alternatives;
-- the final eight runs add no alternative to any scenario;
-- every retained alternative occurs at least three times; and
-- scenarios declared deterministic by the adapter have exactly one
-  alternative.
+There is no minimum observation count, quiet-tail requirement, or fixed
+alternative cap. Scenarios declared deterministic by the adapter must still
+have exactly one persistent alternative; multiple alternatives there are an
+evidence or model error and fail before QEMU. Parser rejection, an initial
+scenario schedule timeout, inconsistent operation identity, and harness or
+storage errors also remain fatal. A schedule timeout from a strictly smaller
+reduction candidate rejects only that candidate and is retained in its audit.
 
-Failure is `host-unstable`; it does not run QEMU and does not enter the corpus.
-
-This policy is an admission heuristic, not a proof that the observed set is
-the complete mathematical support of the scheduler. Without a lower bound on
-an outcome's probability, no finite number of repetitions can prove that a
-rare legal outcome is absent. Controlled entry orders and resource stories
-must therefore witness every branch predicted by the adapter model; larger
-uncontrolled stress runs remain diagnostics for finding missing branches.
-The comparator claims exact membership in the converged, witnessed Linux set,
-not equality of scheduler distributions or formal outcome completeness.
-On success, the recorder writes one canonical aggregate trace atomically. The
-checked aggregate is independently recorded three times and must be
+Without a lower bound on an outcome's probability, no finite number of
+repetitions can prove that a rare legal outcome is absent. The comparator
+therefore claims exact membership only in the empirical Linux set witnessed so
+far. On success, the recorder writes one canonical aggregate snapshot
+atomically. Once persistent evidence stops changing for the checked inputs,
+the checked aggregate is independently recorded three times and must be
 byte-identical. Elapsed times and pthread identities never enter results.
 
 ## Compare and failure evidence
@@ -210,11 +215,18 @@ completion-ordinal
 ```
 
 The reported representative is the alternative whose first difference is
-earliest; ties use canonical alternative order. The guest failure line
-contains the actual full-vector digest, allowed-set digest, selected
-alternative index, operation identity, and differing fields. The saved
-failure metadata retains the structured mismatch plus the aggregate trace,
-canonical scenario, host ELF, Starry ELF, log, and profraw files.
+earliest; ties use canonical alternative order. For a deterministic scenario
+or an explicit invariant violation, this is a confirmed mismatch. For a
+nondeterministic concurrent scenario whose result is merely outside the
+current empirical set, the run is classified as `unexplained-outcome`, saved
+under `questions/`, and excluded from coverage admission. Future Linux runs
+may extend the evidence set; deciding or automatically resolving old question
+artifacts is outside Stage 6.
+
+Both failure and question evidence contain the actual full-vector digest,
+allowed-set digest, selected alternative index, operation identity, differing
+fields, aggregate snapshot, canonical scenario, host ELF, Starry ELF, log, and
+available profraw files.
 
 ## Reduction and campaign integration
 
@@ -222,15 +234,27 @@ The common campaign continues treating corpus bytes as opaque. A concurrent
 reducer must run this sequence for every candidate:
 
 1. validate and serialize the candidate canonically;
-2. record a fresh 32-run Linux allowed set;
-3. execute Starry with that set; and
-4. retain the candidate only when the original mismatch class remains and the
-   current Starry result is outside the freshly recorded set.
+2. record a fresh 32-run Linux set and merge it with that scenario's persistent
+   evidence;
+3. execute Starry with the resulting immutable snapshot; and
+4. retain the candidate only when the original semantic or coverage predicate
+   remains true.
 
-It is forbidden to reuse the parent's allowed set or add an alternative
-because Starry produced it. Host instability makes the candidate invalid for
-reduction. Attribution, minimization, ELF pinning, and corpus admission retain
-the existing adapter-ID and coverage-target isolation.
+It is forbidden to reuse only the parent's snapshot or add an alternative
+because Starry produced it. A candidate must obtain its own Linux observation
+and persistent merge. Candidate schedule timeout makes that candidate invalid;
+parser, storage, initial-input, and harness failures remain fatal.
+Attribution, minimization, ELF pinning, and corpus admission retain the
+existing adapter-ID and coverage-target isolation.
+
+Coverage evidence has a separate uncertainty boundary from syscall outcomes.
+If a concurrent adapter's representative replay cannot reproduce every target
+region, the attribution task completes as `unreproducible-coverage` with the
+candidate-to-region map, representative set, proof regions, and missing regions
+preserved. It admits no corpus entry and does not advance the stable coverage
+baseline. This is neither a Linux outcome question nor a Starry semantic
+mismatch. Historical adapters retain their strict representative-proof failure
+behavior; only concurrent adapters use this classification.
 
 ## Frozen historical state
 
@@ -251,18 +275,31 @@ values:
 The six historical campaign roots are read-only to Stage 6.4. The audit found
 pre-existing pending/running work only in the synchronous
 `coverage/eventfd-oracle-fuzz` root. Concurrent implementation must not claim
-that state, rewrite it, or consume its RNG. Stage closure requires a separate
-recovery-only invocation of the exact historical adapter until no historical
-task is pending or running.
+that state, rewrite it, or consume its RNG. Recovery is valid only while the
+active Starry executable and coverage sections still match the task's pinned
+ELF. Once production changes make that identity stale, the old task remains
+frozen evidence: it is not deleted, marked complete, replayed against a
+different kernel, or counted as Stage 6 concurrent background work. Stage
+closure audits and records such tasks, while requiring both new concurrent
+campaign roots to have no pending or running task.
 
 ## Validation and rollback
 
 Fail-first tests cover actor 2, grouped pending/join, early and partial
 completion, independent deadlines, every helper error, cleanup, alternative
-correlation, canonical sorting, convergence, set digest, trace rejection,
-failure selection, and fresh-set reduction. Both C harnesses build with
+correlation, canonical sorting, monotonic persistence, scenario-index
+normalization, set digest, trace rejection, failure/question selection, and
+fresh-set reduction. Both C harnesses build with
 `-Wall -Wextra -Werror`; checked traces are independently aggregate-recorded
 three times and self-compared.
+
+The 2026-08-07 aggregate closure passed 380 Python tests with one
+environmental skip, both common C tests, the two bounded concurrent campaigns,
+the raw and focused Starry QEMU suites, and the SMP=4 lockdep and remote-wake
+cases. Workspace formatting, Python bytecode compilation, two `axpoll` clippy
+configurations, 23 `starry-kernel` clippy configurations, and sync-lint across
+186 packages were clean. The select/poll QEMU family includes both the loop and
+many-fd stress subtests.
 
 Rollback removes only the new concurrent adapters, campaign roots, and v4/v7
 branches. Historical code and persisted artifacts require no migration.

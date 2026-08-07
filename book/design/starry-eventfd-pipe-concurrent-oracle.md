@@ -32,7 +32,8 @@ Starry file, signal, task, and I/O-multiplexing maintainers.
 Success requires bounded checked stories proving:
 
 - two eventfd or pipe waiters both make progress after sufficient triggers;
-- all observed scheduler orders belong to a converged Linux scenario set;
+- each Starry scheduler order either belongs to the empirical Linux scenario
+  set or is preserved as an explicit unexplained outcome;
 - `SIGUSR1`, `EINTR`, `SA_RESTART`, and temporary signal masks match Linux;
 - immediate, finite, readiness-before-expiry, and infinite waits are distinct;
 - epoll LT, ET, ONESHOT, EXCLUSIVE, multi-fd, truncation, and rotation behave
@@ -218,18 +219,50 @@ restore, pending proof, cleanup, and the fresh-host-set mismatch rule.
 
 ## Checked acceptance and diagnostic
 
-Each checked corpus is recorded 32 times into an allowed set, then the
-aggregate is recorded independently three times byte-identically and
-self-compared. Historical corpus hashes and traces are verified before and
-after C changes. Python suites cover codecs, actor/mask/timeout/epoll bounds,
-all fixed seeds and mutations, resource-aware reduction, routing, failure,
-cleanup, replay, and campaign isolation.
+Each checked corpus is recorded 32 times and merged into the persistent Linux
+outcome store. Once that evidence is unchanged for the checked inputs, the
+aggregate snapshot is recorded independently three times byte-identically and
+self-compared. A later run may still add a rare Linux alternative; no finite
+checked run claims scheduler completeness. Historical corpus hashes and traces
+are verified before and after C changes. Python suites cover codecs,
+actor/mask/timeout/epoll bounds, all fixed seeds and mutations,
+resource-aware reduction, routing, failure versus unexplained-outcome
+classification, cleanup, replay, and campaign isolation.
 
 QEMU runs serially: existing raw eventfd/pipe/signal/poll/epoll cases, every
-historical adapter artifact, then the two concurrent checked artifacts. Each
-new campaign runs seed 42 with four batches of 16 and a 64-QEMU budget,
-followed by recovery-only runs with a 128-QEMU budget until no background task
-remains. No new RNG is consumed during recovery.
+historical adapter artifact, then the two concurrent checked artifacts. Stage
+6 campaign acceptance uses seed 42 with two batches of two and a 64-QEMU
+budget, followed by recovery-only runs with a 128-QEMU budget until no
+background task remains. This bounded gate exercises generation, Linux
+recording and persistence, Starry replay, coverage attribution, minimization,
+and corpus admission without making campaign volume a release condition. The
+larger four-batch, 16-candidate campaign is Stage 7 evidence expansion and
+continues from the persistent corpus and Linux outcome store. No new RNG is
+consumed during recovery.
+
+Concurrent coverage attribution also preserves non-reproducible evidence. If
+the selected representatives cannot reproduce every target region, the task is
+completed as `unreproducible-coverage`, records the full proof and missing-region
+sets, admits no corpus entry, and leaves the stable coverage baseline unchanged.
+This coverage classification is independent of `semantic-mismatch` and
+`unexplained-outcome` result comparison.
+
+The final Stage 6 campaign acceptance on 2026-08-07 completed both bounded
+campaigns with no background work, failure, or question artifact:
+
+| Adapter | Batch coverage proof | QEMU | Final corpus |
+|---|---|---:|---:|
+| `eventfd-concurrent-v1` | 2105/2105 and 2192/2192 regions | 24 | 16 |
+| `pipe-concurrent-v1` | 2441/2441 and 2411/2411 regions | 24 | 10 |
+
+The aggregate closure suite also passed 380 Python tests with one
+environmental skip, both common C tests, raw eventfd (92/92), raw pipe
+(47/47), the 45-module select/poll family, eventfd EPOLLET (31/31), the
+signal/EINTR case, and all nine `epoll_pwait` sigset-size assertions. The
+SMP=4 lockdep baseline and remote wait-queue wake QEMU cases passed as well.
+Workspace formatting, Python bytecode compilation, both `axpoll` clippy
+configurations, all 23 `starry-kernel` clippy configurations, and the
+186-package sync-lint scan were clean.
 
 The non-gating same-fd cross-thread poll-close diagnostic executes 100 host and
 100 Starry iterations and records kernel release, completion/timeout, and
@@ -261,4 +294,3 @@ Credentials and namespaces are not involved. Compatibility is x86_64 only in
 v1 because raw `sigsetsize`, `timespec`, and `epoll_event` layouts are recorded
 against the existing x86_64 harness; cross-architecture work belongs to Stage
 7.
-
