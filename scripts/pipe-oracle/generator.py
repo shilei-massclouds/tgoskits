@@ -3,7 +3,7 @@
 import hashlib
 import struct
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Sequence
 
 from scenario import (
     Close,
@@ -182,6 +182,11 @@ class CampaignRng:
             value = self.next()
             if value < rejection_limit:
                 return lower + value % width
+
+    def choice(self, values: Sequence):
+        if not values:
+            raise ValueError("cannot choose from an empty sequence")
+        return values[self.range(0, len(values))]
 
 
 class LegacyLcgRng:

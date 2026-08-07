@@ -418,6 +418,34 @@ class PipeConcurrentRoutingTests(unittest.TestCase):
         )
         self.assertIs(qemu_timeout.category, guest_result.GuestResultCategory.TIMEOUT)
 
+    def test_default_mutation_kind_uses_campaign_rng(self):
+        parent = concurrent_scenario.ScenarioDocument(
+            (
+                concurrent_generator.generate_scenario(
+                    concurrent_generator.CampaignRng(41), story=0
+                ),
+            ),
+            version=7,
+        )
+        donor = concurrent_scenario.ScenarioDocument(
+            (
+                concurrent_generator.generate_scenario(
+                    concurrent_generator.CampaignRng(43), story=8
+                ),
+            ),
+            version=7,
+        )
+
+        first = concurrent_mutation.mutate_document(
+            concurrent_generator.CampaignRng(42), parent, donor
+        )
+        second = concurrent_mutation.mutate_document(
+            concurrent_generator.CampaignRng(42), parent, donor
+        )
+
+        self.assertEqual(first, second)
+        self.assertIn(first.kind, concurrent_mutation.MUTATION_KINDS)
+
 
 class PipeConcurrentHarnessTests(unittest.TestCase):
     @classmethod
