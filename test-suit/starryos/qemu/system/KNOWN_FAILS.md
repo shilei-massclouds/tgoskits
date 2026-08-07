@@ -5,7 +5,6 @@ but the grouped CI runner only executes `/usr/bin/starry-test-suit/*`.
 
 - `test-ebpf-advanced`: `BPF_OBJ_CLOSE` map/program fd semantics.
 - `test-ebpf-attach`: perf kprobe plus BPF attach/link semantics.
-- `test-epoll-eventfd`: `EPOLLET` eventfd wakeup consumption.
 - `test-epoll-network`: `EPOLLET` socket wakeup consumption.
 - `test-io-getevents`: Linux AIO negative `nr` errno precedence.
 - `test-io-submit`: Linux AIO negative `nr` errno precedence.
