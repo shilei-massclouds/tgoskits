@@ -83,7 +83,11 @@ def execute_inputs(
         guest = execution.guest_result
         if guest is None:
             return ExecutionObservation(False, "missing-guest-result", (), "")
-        starry_elf = coverage_object(spec, workspace)
+        starry_elf = (
+            pinned_starry_elf
+            if pinned_starry_elf is not None
+            else coverage_object(spec, workspace)
+        )
         category = effective_guest_category(
             spec,
             execution.prepared.document,
@@ -92,10 +96,6 @@ def execute_inputs(
         if not starry_elf.is_file():
             return ExecutionObservation(False, "coverage-missing", (), "")
         elf_digest = sha256_file(starry_elf)
-        if pinned_starry_elf is not None and elf_digest != sha256_file(
-            pinned_starry_elf
-        ):
-            return ExecutionObservation(False, "starry-elf-changed", (), elf_digest)
         if category == "unexplained-outcome":
             _save_execution_evidence(
                 spec,
