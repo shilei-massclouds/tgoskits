@@ -19,23 +19,33 @@ pub(crate) const AXTEST_COVERAGE_RUSTFLAGS: &[&str] = &[
 ];
 
 const COVERAGE_FEATURE: &str = "axtest/coverage";
+const STARRY_COVERAGE_FEATURE: &str = "axtest-coverage";
 const MARKER_PREFIX: &str = "AXTEST_COVERAGE status=ready";
 const SUITE_OK_MARKER: &str = "AXTEST_SUITE_OK";
 pub(crate) const COVERAGE_DONE_MARKER: &str = "AXTEST_COVERAGE_DONE";
+pub(crate) const DEFERRED_FAIL_MARKER: &str = "AXTEST_COVERAGE_DEFERRED_FAIL";
 
 pub(crate) fn enabled(cargo: &Cargo) -> bool {
     crate::build::env_truthy(&cargo.env, "AXTEST_COVERAGE")
 }
 
 pub(crate) fn prepare_cargo(cargo: &mut Cargo) {
+    prepare_cargo_with_feature(cargo, COVERAGE_FEATURE);
+}
+
+pub(crate) fn prepare_starry_cargo(cargo: &mut Cargo) {
+    prepare_cargo_with_feature(cargo, STARRY_COVERAGE_FEATURE);
+}
+
+fn prepare_cargo_with_feature(cargo: &mut Cargo, coverage_feature: &str) {
     // Coverage is enabled only after the caller explicitly selected coverage
     // mode; do not alter ordinary test builds.
     if !cargo
         .features
         .iter()
-        .any(|feature| feature == COVERAGE_FEATURE)
+        .any(|feature| feature == coverage_feature)
     {
-        cargo.features.push(COVERAGE_FEATURE.to_string());
+        cargo.features.push(coverage_feature.to_string());
     }
     crate::build::append_encoded_rustflags(cargo, AXTEST_COVERAGE_RUSTFLAGS);
 }
@@ -112,23 +122,12 @@ fn remove_stale_profraw(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Replace the QEMU success regex so that ostool waits for coverage extraction
-/// to complete (signaled by `AXTEST_COVERAGE_DONE`) instead of matching
-/// `AXTEST_SUITE_OK` prematurely.
-pub(crate) fn update_success_regex(qemu: &mut QemuConfig) {
-    for regex in &mut qemu.success_regex {
-        if regex.contains(SUITE_OK_MARKER) {
-            *regex = regex.replace(SUITE_OK_MARKER, COVERAGE_DONE_MARKER);
-        }
-    }
-    // If no success regex contained the marker, add one for coverage done.
-    if !qemu
-        .success_regex
-        .iter()
-        .any(|r| r.contains(COVERAGE_DONE_MARKER))
-    {
-        qemu.success_regex.push(COVERAGE_DONE_MARKER.to_string());
-    }
+/// Makes coverage completion the QEMU stop condition while returning the
+/// case's original success contract for independent verification.
+pub(crate) fn update_success_regex(qemu: &mut QemuConfig) -> Vec<String> {
+    let test_success_regex = qemu.success_regex.clone();
+    qemu.success_regex = vec![format!("(?m)^{COVERAGE_DONE_MARKER}$")];
+    test_success_regex
 }
 
 #[cfg(unix)]
@@ -147,8 +146,8 @@ mod capture {
     use regex::Regex;
 
     use super::{
-        AxtestCoveragePaths, COVERAGE_DONE_MARKER, MARKER_PREFIX, SUITE_OK_MARKER,
-        remove_stale_profraw,
+        AxtestCoveragePaths, COVERAGE_DONE_MARKER, DEFERRED_FAIL_MARKER, MARKER_PREFIX,
+        SUITE_OK_MARKER, remove_stale_profraw,
     };
 
     pub(crate) struct AxtestCoverageCaptureGuard {
@@ -165,6 +164,7 @@ mod capture {
         line_buf: String,
         dumped: bool,
         completion_signaled: bool,
+        deferred_fail: bool,
         error: Option<String>,
         monitor_conn: Option<UnixStream>,
     }
@@ -201,6 +201,7 @@ mod capture {
                 line_buf: String::new(),
                 dumped: false,
                 completion_signaled: false,
+                deferred_fail: false,
                 error: None,
                 monitor_conn: None,
             }));
@@ -235,7 +236,11 @@ mod capture {
                                 // to ostool so it can stop waiting.
                                 if state.dumped && !state.completion_signaled {
                                     state.completion_signaled = true;
-                                    let marker = format!("{COVERAGE_DONE_MARKER}\n");
+                                    let mut marker = format!("{COVERAGE_DONE_MARKER}\n");
+                                    if state.deferred_fail {
+                                        marker.push_str(DEFERRED_FAIL_MARKER);
+                                        marker.push('\n');
+                                    }
                                     terminal.write_all(marker.as_bytes())?;
                                 }
                             }
@@ -246,7 +251,9 @@ mod capture {
                             // coverage extraction finishes.
                             while let Some(newline) = tee_buf.find('\n') {
                                 let line = &tee_buf[..=newline];
-                                if !line.contains(SUITE_OK_MARKER) {
+                                if !line.contains(SUITE_OK_MARKER)
+                                    && !line.contains(DEFERRED_FAIL_MARKER)
+                                {
                                     terminal.write_all(line.as_bytes())?;
                                 }
                                 tee_buf.drain(..=newline);
@@ -257,7 +264,10 @@ mod capture {
                     }
                 }
                 // Flush any remaining partial line
-                if !tee_buf.is_empty() && !tee_buf.contains(SUITE_OK_MARKER) {
+                if !tee_buf.is_empty()
+                    && !tee_buf.contains(SUITE_OK_MARKER)
+                    && !tee_buf.contains(DEFERRED_FAIL_MARKER)
+                {
                     terminal.write_all(tee_buf.as_bytes())?;
                 }
                 terminal.flush()
@@ -332,6 +342,10 @@ mod capture {
         }
 
         fn process_line(&mut self, line: &str) {
+            if line.contains(DEFERRED_FAIL_MARKER) {
+                self.deferred_fail = true;
+                return;
+            }
             if self.dumped || !line.starts_with(MARKER_PREFIX) {
                 return;
             }
@@ -372,7 +386,12 @@ mod capture {
                 .write_all(command.as_bytes())
                 .context("failed to send QEMU memsave command")?;
             stream.flush().ok();
-            wait_for_profraw(&self.profraw_path, size)
+            wait_for_profraw(&self.profraw_path, size)?;
+            stream
+                .write_all(b"quit\n")
+                .context("failed to stop QEMU after coverage extraction")?;
+            stream.flush().ok();
+            Ok(())
         }
     }
 
@@ -454,6 +473,9 @@ mod capture {
             fs::write(&profraw_path, b"old-profile-data").unwrap();
 
             let (client, mut server) = UnixStream::pair().unwrap();
+            server
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
             let (written_tx, written_rx) = mpsc::channel();
             let writer_path = profraw_path.clone();
             let writer = std::thread::spawn(move || {
@@ -464,6 +486,9 @@ mod capture {
                 std::thread::sleep(Duration::from_millis(100));
                 fs::write(writer_path, b"new!").unwrap();
                 written_tx.send(()).unwrap();
+                let mut quit_command = String::new();
+                reader.read_line(&mut quit_command).unwrap();
+                assert_eq!(quit_command, "quit\n");
             });
 
             let mut state = AxtestCoverageState {
@@ -472,6 +497,7 @@ mod capture {
                 line_buf: String::new(),
                 dumped: false,
                 completion_signaled: false,
+                deferred_fail: false,
                 error: None,
                 monitor_conn: Some(client),
             };
@@ -507,3 +533,53 @@ mod capture {
 }
 
 pub(crate) use capture::AxtestCoverageCaptureGuard;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn starry_coverage_uses_package_forwarding_feature() {
+        let mut cargo = Cargo::default();
+
+        prepare_starry_cargo(&mut cargo);
+
+        assert!(
+            cargo
+                .features
+                .iter()
+                .any(|feature| feature == "axtest-coverage")
+        );
+        assert!(
+            cargo
+                .features
+                .iter()
+                .all(|feature| feature != COVERAGE_FEATURE)
+        );
+    }
+
+    #[test]
+    fn coverage_wait_marker_preserves_test_success_contract() {
+        let mut qemu = QemuConfig {
+            success_regex: vec![
+                format!("(?m)^{SUITE_OK_MARKER}$"),
+                "CUSTOM_TEST_PASSED".to_string(),
+            ],
+            ..QemuConfig::default()
+        };
+
+        let test_success_regex = update_success_regex(&mut qemu);
+
+        assert_eq!(
+            test_success_regex,
+            vec![
+                format!("(?m)^{SUITE_OK_MARKER}$"),
+                "CUSTOM_TEST_PASSED".to_string(),
+            ]
+        );
+        assert_eq!(
+            qemu.success_regex,
+            vec![format!("(?m)^{COVERAGE_DONE_MARKER}$")]
+        );
+    }
+}

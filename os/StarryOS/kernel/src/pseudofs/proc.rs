@@ -1794,6 +1794,18 @@ fn unsupported_limit_sysctl_file(fs: &Arc<SimpleFs>, value: &'static str) -> Arc
         }),
     )
 }
+
+#[cfg(axtest_coverage)]
+fn print_starry_test_coverage(arguments: core::fmt::Arguments<'_>) {
+    ax_print!("{arguments}");
+}
+
+#[cfg(axtest_coverage)]
+fn dump_starry_test_coverage() {
+    axtest::set_printer(print_starry_test_coverage);
+    axtest::dump_coverage();
+}
+
 fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     let mut root = DirMapping::new();
     root.add(
@@ -1883,6 +1895,22 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
                 Ok("0\n".to_string())
             }
         }),
+    );
+    // Test-only control plane for serializing LLVM coverage into guest memory.
+    // Production builds do not compile this procfs entry.
+    #[cfg(axtest_coverage)]
+    root.add(
+        "starry-test-coverage",
+        SimpleFile::new_regular(
+            fs.clone(),
+            RwFile::new(|operation| match operation {
+                SimpleFileOperation::Read => Ok(Some(Vec::new())),
+                SimpleFileOperation::Write(_) => {
+                    dump_starry_test_coverage();
+                    Ok(None)
+                }
+            }),
+        ),
     );
     // Timer-tick callbacks registered once on the boot CPU.
     // IRQ counting: increment the module-level IRQ_CNT on every tick.
