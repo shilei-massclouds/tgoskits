@@ -439,7 +439,6 @@ pub(super) fn discover_qemu_case_index(
                             variant,
                         });
                     }
-                    continue;
                 }
                 None
             }
@@ -452,11 +451,10 @@ pub(super) fn discover_qemu_case_index(
         if let Some((variant, build_config_path)) = build_config_path {
             build_wrappers.push(TestBuildWrapper {
                 name: build_wrapper_name(test_group_dir, &dir, variant.as_deref())?,
-                dir,
+                dir: dir.clone(),
                 build_config_path,
                 variant,
             });
-            continue;
         }
 
         if is_case_asset_dir(&dir) {

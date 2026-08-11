@@ -4,7 +4,7 @@ use super::*;
 fn qemu_case_defaults_to_batch_execution() {
     let root = tempdir().unwrap();
     write_flat_qemu_build_config(root.path(), "qemu", "x86_64-unknown-none");
-    write_qemu_test_config(root.path(), "qemu", "ordinary", "x86_64");
+    write_qemu_test_config(root.path(), "qemu", "qemu", "ordinary", "x86_64");
 
     let cases = discover_qemu_cases(root.path(), "x86_64", "x86_64-unknown-none", None).unwrap();
 
@@ -39,6 +39,34 @@ fn manual_only_case_runs_when_explicitly_selected() {
 
     assert_eq!(cases.len(), 1);
     assert_eq!(cases[0].case.display_name, "qemu/manual-only");
+}
+
+#[test]
+fn explicit_nested_build_wrapper_case_is_preferred_over_system_subcase() {
+    let root = tempdir().unwrap();
+    write_flat_qemu_build_config(root.path(), "qemu", "x86_64-unknown-none");
+    write_flat_grouped_qemu_test_config(root.path(), "qemu", "system", "x86_64");
+    write_flat_qemu_build_config(root.path(), "qemu/kerndiff", "x86_64-unknown-none");
+    let qemu_config = root
+        .path()
+        .join("test-suit/starryos/qemu/kerndiff/qemu-x86_64.toml");
+    fs::write(&qemu_config, "timeout = 1\ndefault_run = false\n").unwrap();
+
+    let cases = discover_qemu_cases(
+        root.path(),
+        "x86_64",
+        "x86_64-unknown-none",
+        Some("qemu/kerndiff"),
+    )
+    .unwrap();
+
+    assert_eq!(cases.len(), 1);
+    assert_eq!(cases[0].case.display_name, "qemu/kerndiff");
+    assert_eq!(cases[0].build_group, "qemu/kerndiff");
+    assert_eq!(
+        cases[0].build_config_path.file_name().unwrap(),
+        "build-x86_64-unknown-none.toml"
+    );
 }
 
 #[test]
