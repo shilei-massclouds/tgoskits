@@ -860,6 +860,97 @@ Stage 7 的第一项证据扩展是分别运行 eventfd/pipe concurrent 的 seed
 - generator 和 minimizer 始终只描述输入及资源关系；预期语义始终来自 host
   Linux 实际执行。
 
+## 16. 2026-08-11 阶段 6 复核与 Stage 7 启动基线
+
+本节是后续工作的最新入口；当本节与前文的历史完成记录冲突时，以本节为准。
+
+**复核结论：阶段 6 的主体实现和既有 bounded acceptance 证据仍然有效，但阶段 6
+尚未满足最终完成门槛，Stage 7 暂不启动。** 当前必须先修复多 representative
+归因中的部分 corpus 准入问题，并补齐 Stage 6 证据文档。Stage 7 状态为
+`未开始（被 16.1 阻塞）`。
+
+### 16.1 阻塞项：不可复现覆盖下的部分 corpus 准入
+
+`scripts/linux_oracle/task_execution.py` 当前逐个处理 representative：前一个
+representative 最小化成功后会立即调用 `save_entry`，后一个 representative 若抛出
+`UnreproducibleCoverage`，任务仍会以 `unreproducible-coverage` 完成并返回已经准入的
+digest。结果是同一归因任务虽然存在不可复现覆盖，仍可能留下 active corpus entry，
+并影响后续 coverage baseline。这违反了“不可复现归因不准入任何 corpus entry，且
+baseline 不变”的 fail-closed 约束。
+
+现有回归只覆盖单 representative，不能触发“第一个成功、第二个失败”的部分准入
+路径。Stage 7 的 4 batches × 16 candidates campaign 更容易产生多个 representative，
+因此不能在此缺陷存在时扩大 campaign。
+
+修复的完成条件如下：
+
+1. 先增加两个 representative 的确定性回归：第一个最小化成功，第二个丢失已归因
+   coverage；测试必须在当前实现上失败。
+2. 将 corpus 准入延迟到所有 representative 均完成可复现证明之后，或使用等价的
+   原子提交方案。
+3. 任一 representative 不可复现时，断言无新增 active corpus entry、
+   `admitted_digests` 为空且 coverage baseline 不变。
+4. 全部 representative 可复现时，断言准入结果确定且任务恢复不会暴露部分有效的
+   corpus 状态。
+5. 既有同步适配器和单 representative 路径的行为保持不变。
+
+### 16.2 本次串行复核证据
+
+本项目当前不支持并行验证。以下结果均由单一验证任务严格串行执行；后续也应一次只
+运行一个 adapter 或 QEMU 实例，不能把并行运行产生的超时作为产品失败证据。
+
+| 检查项 | 2026-08-11 结果 | 说明 |
+|---|---:|---|
+| 公共 Python 测试 | 56/56 通过 | 串行执行 |
+| eventfd Python 测试 | 82/82 通过 | 包含完整 32-run concurrent host aggregate |
+| pipe Python 测试 | 242/242 通过，1 skip | skip 为环境相关项 |
+| 公共 C harness CTest | 2/2 通过 | 串行执行 |
+| host checked artifact | eventfd 216 operations / 8 scenarios；pipe 259 / 8 | 前文 eventfd 的 212 记录已过期，后续应同步 |
+| concurrent 持久任务 | 无 pending/running、failure 或 question | eventfd attribution 6、minimization 19；pipe attribution 2、minimization 4，均已完成 |
+| 旧同步 eventfd 持久任务 | 5 pending + 2 running | 属于旧 ELF 冻结任务，不计入 concurrent 完成状态 |
+| 静态检查 | 通过 | Python `compileall`、workspace rustfmt check、`git diff --check` |
+
+本次复核没有重跑当前 Starry QEMU、clippy 和 sync-lint；前文 2026-08-07 的验收结果与
+持久 artifact 仍作为这三项的历史证据。完成 16.1 后应使用修复后的代码重新执行相关
+串行回归，再决定是否需要刷新完整 QEMU 证据。
+
+### 16.3 syscall 证据映射缺口
+
+`book/design/starry-eventfd-pipe-concurrent-oracle.md` 的高风险兼容映射尚不完整。
+并发 harness 直接或间接涉及的 syscall 必须逐项保留“规范、Linux 经验、Starry
+结论”证据；不能把多个 syscall 合并为一行。当前已知缺口是：
+
+| syscall | 当前缺口 | 直接规范入口 |
+|---|---|---|
+| `eventfd` | harness 直接使用但映射缺失 | [eventfd(2)](https://man7.org/linux/man-pages/man2/eventfd.2.html) |
+| `fcntl` | `F_GETFL`、`F_SETFL`、`F_SETPIPE_SZ` 映射缺失 | [fcntl(2)](https://man7.org/linux/man-pages/man2/fcntl.2.html) |
+| `ioctl` | `FIONREAD` 映射缺失 | [FIONREAD(2const)](https://man7.org/linux/man-pages/man2/FIONREAD.2const.html) |
+| `gettid` | signal/tid 辅助路径使用但映射缺失 | [gettid(2)](https://man7.org/linux/man-pages/man2/gettid.2.html) |
+| `dup` | 当前与 `dup2`、`dup3` 合并；并发 harness 实际直接使用 `dup` | [dup(2)](https://man7.org/linux/man-pages/man2/dup.2.html) |
+| `dup2` | 必须拆为独立行；若当前变更不影响则明确标记 N/A | [dup2(2)](https://man7.org/linux/man-pages/man2/dup.2.html) |
+| `dup3` | 必须拆为独立行；若当前变更不影响则明确标记 N/A | [dup3(2)](https://man7.org/linux/man-pages/man2/dup.2.html) |
+
+补齐映射时还应逐一核对 `eventfd2`、`pipe2`、`read`、`write`、`poll`、`ppoll`、
+`rt_sigaction`、`rt_sigprocmask`、`tgkill`、`epoll_create1`、`epoll_ctl`、
+`epoll_wait`、`epoll_pwait`、`epoll_pwait2` 和 `close`，避免辅助路径被遗漏。
+
+### 16.4 后续步骤与状态表
+
+| 顺序 | 工作项 | 完成证据 | 状态 |
+|---:|---|---|---|
+| 1 | 增加多 representative 部分准入的 fail-first 回归 | 回归在旧实现上确定失败 | 未开始 |
+| 2 | 实现 fail-closed 的原子 corpus 准入 | 不可复现时 corpus、digest、baseline 均不变 | 未开始 |
+| 3 | 串行重跑公共、eventfd、pipe Python 测试和公共 CTest | 所有适用测试通过，环境 skip 单独说明 | 未开始 |
+| 4 | 更新 Stage 6 文档证据 | eventfd 216/8 已同步；逐 syscall 映射完整 | 未开始 |
+| 5 | 细化 Stage 7 验收表 | 明确 QEMU 预算、recovery-only 停止条件、failure/question 处理和证据路径 | 未开始 |
+| 6 | 运行 eventfd concurrent seed 42、4 × 16 campaign | 串行 campaign 后 recovery-only 清空后台任务并冻结 artifact | 阻塞 |
+| 7 | 运行 pipe concurrent seed 42、4 × 16 campaign | eventfd 完成后串行执行并冻结 artifact | 阻塞 |
+| 8 | 根据新增 coverage、outcome 和 mismatch 排序下一场景 | 形成带证据的 Stage 7 优先级决定 | 阻塞 |
+
+步骤 1--5 全部闭环后，才把阶段 6 标记为完成并开始步骤 6；Stage 7 不以概率性的
+“连续若干次无新增”作为收敛条件，而以固定预算、持久任务状态和可 replay artifact
+作为验收边界。
+
 ## 参考资料
 
 - [Syzkaller syscall descriptions](https://github.com/google/syzkaller/blob/master/docs/syscall_descriptions.md)
