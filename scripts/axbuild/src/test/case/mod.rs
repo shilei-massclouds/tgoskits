@@ -16,7 +16,7 @@ mod types;
 
 pub(crate) use assets::*;
 #[cfg(test)]
-use cache::save_rootfs_cache_image;
+use cache::{rootfs_cache_read_enabled, save_rootfs_cache_image};
 pub(crate) use grouped_runner::*;
 #[cfg(test)]
 use hash::case_asset_cache_key;

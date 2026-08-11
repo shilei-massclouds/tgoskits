@@ -1,0 +1,26 @@
+args = [
+  "-nographic",
+  "-cpu",
+  "Haswell,+avx",
+  "-m",
+  "512M",
+  "-smp",
+  "4",
+  "-device",
+  "nvme,serial=deadbeef,drive=nvm,max_ioqpairs=64,msix_qsize=65",
+  "-drive",
+  "id=nvm,if=none,format=raw,file=${workspace}/tmp/axbuild/rootfs/rootfs-x86_64-alpine.img",
+]
+uefi = true
+to_bin = true
+shell_prefix = "root@starry:"
+shell_init_cmd = "/usr/libexec/kerndiff/run"
+success_regex = ["(?m)^KERNDIFF_GUEST_RESULT version=1 run_id=[0-9a-f]+ exit_code=0\\s*$"]
+fail_regex = [
+  '(?i)\bpanic(?:ked)?\b',
+  "(?m)^lockdep fatal violation\\s*$",
+  "(?m)^KERNDIFF_GUEST_INFRA_ERROR version=1 ",
+  "(?m)^AXTEST_COVERAGE_DEFERRED_FAIL$",
+]
+timeout = 300
+default_run = false

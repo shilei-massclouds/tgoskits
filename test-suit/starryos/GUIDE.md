@@ -19,6 +19,8 @@ test-suit/starryos/<build_wrapper>/<case>/<runtime-config>.toml
 - 构建配置位于 case 或最近的 build wrapper 中，文件名为 `build-<target>.toml`。
 - 如果目录自身同时包含 `build-*` 和 `qemu-*` / `board-*`，它本身也可以作为 case 被发现。
 - 批量运行时，没有当前 arch/runtime config 的目录会被跳过。
+- runtime config 可设置 `default_run = false`；这类手动用例在默认批量运行时跳过，
+  仍由 `-l/--list` 列出，并可用 `-c/--test-case` 显式选择。
 - 显式 `-c/--test-case` 时，case 必须存在，且必须提供当前 arch 对应的 runtime config。
 - Starry QEMU 支持 `qemu/<subcase>` 作为 `qemu/system` 聚合 case 的单子测例
   选择器；也可以写成 `qemu/system/<subcase>`。
@@ -157,6 +159,25 @@ target/<target>/qemu-cases/<build_group>/<case>/cache/rootfs/
 
 plain case 不复制 rootfs，依赖 QEMU `-snapshot` 保证 guest 写入不落回共享镜像。
 
+### KernDiff 外部 overlay 用例
+
+`qemu/kerndiff` 是仅供外部差分驱动显式选择的通用用例，不包含 pipe、eventfd
+等场景语义。调用方必须设置绝对路径 `KERNDIFF_OVERLAY_DIR`，且 overlay 中的
+`/usr/libexec/kerndiff/run` 必须存在并可执行。该目录会通过现有 CMake asset
+pipeline 完整安装到本轮 rootfs 副本中。推荐调用方同时设置
+`AXBUILD_DISABLE_ROOTFS_CACHE=1`，保证每轮不读取或写入 post-injection rootfs
+缓存：
+
+```console
+KERNDIFF_OVERLAY_DIR=/absolute/path/to/overlay \
+AXBUILD_DISABLE_ROOTFS_CACHE=1 \
+cargo xtask starry test qemu --arch x86_64 -c qemu/kerndiff
+```
+
+该 case 设置 `default_run = false`，因此不会增加默认 batch/CI 成本；`-l` 仍会
+列出它。coverage 构建中的 guest runner 应在输出通用结果 marker 后写入
+`/proc/starry-test-coverage`，由现有 QEMU monitor `memsave` 流程导出 profraw。
+
 需要 staging rootfs 的 pipeline 依赖 `debugfs` 和 `fakeroot`。xtask 会在启动
 `debugfs rdump` 前检查 EUID；Linux 上还会检查 UID/GID identity mapping 和有效
 `CAP_CHOWN`。只有能完整恢复 guest ownership 时才直接提取，否则预先进入
@@ -178,6 +199,7 @@ plain case 不复制 rootfs，依赖 QEMU `-snapshot` 保证 guest 写入不落�
 | `success_regex` | 全部匹配才 PASS |
 | `fail_regex` | 任一匹配即 FAIL |
 | `timeout` | 超时时间，单位秒 |
+| `default_run` | 是否参与默认批量运行；缺省为 `true`，设为 `false` 后只接受显式选择 |
 
 示例：
 

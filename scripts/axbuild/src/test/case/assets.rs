@@ -9,7 +9,7 @@ use anyhow::{Context, bail};
 use super::{
     cache::{
         copy_file_fast, is_valid_rootfs_cache_image, rootfs_cache_image_path,
-        save_rootfs_cache_image,
+        rootfs_cache_read_enabled, save_rootfs_cache_image,
     },
     case_sh_source_dir,
     layout::case_asset_layout,
@@ -189,7 +189,9 @@ pub(crate) fn prepare_case_assets_sync(
             .with_context(|| format!("failed to create {}", layout.run_dir.display()))?;
         timing_stage.finish();
 
-        let cache_hit = if is_valid_rootfs_cache_image(&rootfs_cache_img) {
+        let cache_hit = if rootfs_cache_read_enabled()
+            && is_valid_rootfs_cache_image(&rootfs_cache_img)
+        {
             // Cache HIT: copy/reflink the cached post-injection image. No need
             // to copy shared_rootfs, build an overlay, or run inject_overlay.
             let timing_stage = timing::TimingStage::new(

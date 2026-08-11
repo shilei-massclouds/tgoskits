@@ -31,6 +31,10 @@ fn rootfs_cache_write_enabled() -> bool {
     std::env::var_os("CI").is_none()
 }
 
+pub(super) fn rootfs_cache_read_enabled() -> bool {
+    std::env::var_os("AXBUILD_DISABLE_ROOTFS_CACHE").is_none()
+}
+
 fn is_no_space_left(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause

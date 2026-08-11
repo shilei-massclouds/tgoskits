@@ -1,0 +1,13 @@
+#!/bin/sh
+set -u
+
+run_id=0000000000000000
+echo "KERNDIFF_GUEST_START version=1 run_id=$run_id"
+echo "KERNDIFF_GUEST_RESULT version=1 run_id=$run_id exit_code=0"
+echo "KERNDIFF_GUEST_COVERAGE_TRIGGERED version=1 run_id=$run_id"
+if ! printf 1 > /proc/starry-test-coverage; then
+  echo "KERNDIFF_GUEST_INFRA_ERROR version=1 run_id=$run_id reason=coverage-trigger"
+fi
+while :; do
+  sleep 3600
+done
