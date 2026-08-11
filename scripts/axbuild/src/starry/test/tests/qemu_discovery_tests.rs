@@ -1,6 +1,58 @@
 use super::*;
 
 #[test]
+fn qemu_case_defaults_to_batch_execution() {
+    let root = tempdir().unwrap();
+    write_flat_qemu_build_config(root.path(), "qemu", "x86_64-unknown-none");
+    write_qemu_test_config(root.path(), "qemu", "ordinary", "x86_64");
+
+    let cases = discover_qemu_cases(root.path(), "x86_64", "x86_64-unknown-none", None).unwrap();
+
+    assert_eq!(cases.len(), 1);
+    assert!(cases[0].case.default_run);
+}
+
+#[test]
+fn manual_only_case_is_skipped_by_default_discovery() {
+    let root = tempdir().unwrap();
+    write_flat_qemu_build_config(root.path(), "qemu", "x86_64-unknown-none");
+    write_qemu_test_config_with_default_run(root.path(), "qemu", "manual-only", "x86_64", false);
+
+    let cases = discover_qemu_cases(root.path(), "x86_64", "x86_64-unknown-none", None).unwrap();
+
+    assert!(cases.is_empty());
+}
+
+#[test]
+fn manual_only_case_runs_when_explicitly_selected() {
+    let root = tempdir().unwrap();
+    write_flat_qemu_build_config(root.path(), "qemu", "x86_64-unknown-none");
+    write_qemu_test_config_with_default_run(root.path(), "qemu", "manual-only", "x86_64", false);
+
+    let cases = discover_qemu_cases(
+        root.path(),
+        "x86_64",
+        "x86_64-unknown-none",
+        Some("qemu/manual-only"),
+    )
+    .unwrap();
+
+    assert_eq!(cases.len(), 1);
+    assert_eq!(cases[0].case.display_name, "qemu/manual-only");
+}
+
+#[test]
+fn manual_only_case_remains_visible_in_case_list() {
+    let root = tempdir().unwrap();
+    write_flat_qemu_build_config(root.path(), "qemu", "x86_64-unknown-none");
+    write_qemu_test_config_with_default_run(root.path(), "qemu", "manual-only", "x86_64", false);
+
+    let listed = discover_all_qemu_cases_with_archs(root.path(), None).unwrap();
+
+    assert!(listed.iter().any(|case| case.name == "qemu/manual-only"));
+}
+
+#[test]
 fn starry_grouped_cases_install_profile_autorun() {
     let config = starry_case_asset_config();
 

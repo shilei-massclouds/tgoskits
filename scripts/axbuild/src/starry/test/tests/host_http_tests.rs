@@ -20,6 +20,7 @@ fn starry_qemu_case_starts_host_http_server_from_loaded_config() {
             body_byte: b'Z',
             dir: None,
         }),
+        default_run: true,
         subcases: Vec::new(),
         grouped_subcase_filter: None,
     };

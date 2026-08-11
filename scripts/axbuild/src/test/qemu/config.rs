@@ -51,6 +51,7 @@ pub(crate) fn load_test_qemu_case_fields(
         test_commands,
         host_symbolize_success_regex: config.host_symbolize_success_regex,
         host_http_server: config.host_http_server,
+        default_run: config.default_run,
         subcases,
         grouped_subcase_filter: None,
     })

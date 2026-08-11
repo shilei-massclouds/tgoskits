@@ -145,6 +145,22 @@ fn write_qemu_test_config(
     fs::write(path, "timeout = 1\n").unwrap();
 }
 
+fn write_qemu_test_config_with_default_run(
+    root: &Path,
+    build_group: &str,
+    case_name: &str,
+    arch: &str,
+    default_run: bool,
+) {
+    let path = root
+        .join("test-suit/starryos")
+        .join(build_group)
+        .join(case_name)
+        .join(format!("qemu-{arch}.toml"));
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, format!("timeout = 1\ndefault_run = {default_run}\n")).unwrap();
+}
+
 fn write_grouped_qemu_test_config(
     root: &Path,
     _group: &str,
@@ -205,6 +221,7 @@ fn grouped_host_http_test_case(
             body_byte: b'Z',
             dir: None,
         }),
+        default_run: true,
         subcases: grouped_subcase_filter
             .as_ref()
             .into_iter()
@@ -229,6 +246,7 @@ fn prepared_qemu_case(name: &str, build_config_path: PathBuf) -> PreparedStarryQ
             test_commands: Vec::new(),
             host_symbolize_success_regex: Vec::new(),
             host_http_server: None,
+            default_run: true,
             subcases: Vec::new(),
             grouped_subcase_filter: None,
         },

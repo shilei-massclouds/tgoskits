@@ -47,6 +47,7 @@ pub(in crate::starry) async fn prepare_app_board_session_assets(
             test_commands: Vec::new(),
             host_symbolize_success_regex: Vec::new(),
             host_http_server: None,
+            default_run: true,
             subcases: Vec::new(),
             grouped_subcase_filter: None,
         };

@@ -89,6 +89,7 @@ fn fake_case(root: &Path, name: &str) -> TestQemuCase {
         test_commands: Vec::new(),
         host_symbolize_success_regex: Vec::new(),
         host_http_server: None,
+        default_run: true,
         subcases: Vec::new(),
         grouped_subcase_filter: None,
     }
@@ -323,4 +324,12 @@ fn save_rootfs_cache_image_writes_when_enabled() {
     save_rootfs_cache_image(&src, &dst).unwrap();
     assert!(dst.is_file());
     assert_eq!(fs::read(&dst).unwrap().len(), 1024 * 1024);
+}
+
+#[test]
+fn disabling_rootfs_cache_also_disables_reuse() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _disable = TempEnvVar::set("AXBUILD_DISABLE_ROOTFS_CACHE", "1");
+
+    assert!(!rootfs_cache_read_enabled());
 }
