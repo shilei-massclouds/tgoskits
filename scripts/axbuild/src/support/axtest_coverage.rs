@@ -122,11 +122,14 @@ fn remove_stale_profraw(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Makes coverage completion the QEMU stop condition while returning the
-/// case's original success contract for independent verification.
+/// Makes coverage completion the QEMU stop condition, defers the test-result
+/// failure marker, and returns the original success contract for verification.
 pub(crate) fn update_success_regex(qemu: &mut QemuConfig) -> Vec<String> {
     let test_success_regex = qemu.success_regex.clone();
     qemu.success_regex = vec![format!("(?m)^{COVERAGE_DONE_MARKER}$")];
+    let deferred_fail_regex = format!("(?m)^{DEFERRED_FAIL_MARKER}$");
+    qemu.fail_regex
+        .retain(|regex| regex != &deferred_fail_regex);
     test_success_regex
 }
 
@@ -580,6 +583,32 @@ mod tests {
         assert_eq!(
             qemu.success_regex,
             vec![format!("(?m)^{COVERAGE_DONE_MARKER}$")]
+        );
+    }
+
+    #[test]
+    fn deferred_failure_marker_cannot_stop_qemu_before_coverage_dump() {
+        let immediate_failures = vec![
+            "(?i)panic".to_string(),
+            "(?m)^lockdep fatal violation\\s*$".to_string(),
+            "(?m)^GUEST_INFRA_ERROR ".to_string(),
+        ];
+        let mut qemu = QemuConfig {
+            success_regex: vec!["TEST_PASSED".to_string()],
+            fail_regex: immediate_failures
+                .iter()
+                .cloned()
+                .chain([format!("(?m)^{DEFERRED_FAIL_MARKER}$")])
+                .collect(),
+            ..QemuConfig::default()
+        };
+
+        update_success_regex(&mut qemu);
+
+        assert_eq!(
+            qemu.fail_regex, immediate_failures,
+            "the deferred test-result marker must be evaluated only after the coverage profile \
+             has been exported"
         );
     }
 }

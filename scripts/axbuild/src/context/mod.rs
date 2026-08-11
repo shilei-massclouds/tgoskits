@@ -261,7 +261,7 @@ impl AppContext {
             .run_qemu_with_success_contract(cargo, qemu, capture_backtrace, &success_regex)
             .await;
         capture.finish()?;
-        result
+        crate::support::qemu_success::summarize_success_contract_failure(result)
     }
 
     pub(crate) async fn run_prepared_qemu(

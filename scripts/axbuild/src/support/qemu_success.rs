@@ -240,9 +240,22 @@ pub(crate) fn verify_qemu_success_contract(
 {tail}"
     )
 }
+
+/// Removes the captured transcript only from a missing-success error so a
+/// caller that already preserved QEMU output does not replay protocol markers.
+pub(crate) fn summarize_success_contract_failure(result: Result<()>) -> Result<()> {
+    match result {
+        Err(err) if is_benign_qemu_stop_error(&err) => Err(anyhow::anyhow!(BENIGN_QEMU_STOP_ERROR)),
+        result => result,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{QemuSuccessOutput, TRANSCRIPT_TAIL_BYTES, verify_qemu_success_contract};
+    use super::{
+        QemuSuccessOutput, TRANSCRIPT_TAIL_BYTES, summarize_success_contract_failure,
+        verify_qemu_success_contract,
+    };
 
     fn captured_output(patterns: &[&str], chunks: &[&[u8]]) -> QemuSuccessOutput {
         let patterns = patterns.iter().map(ToString::to_string).collect::<Vec<_>>();
@@ -265,6 +278,28 @@ mod tests {
             err.to_string()
                 .contains("without matching a configured success regex")
         );
+    }
+
+    #[test]
+    fn coverage_failure_summary_does_not_replay_guest_protocol_markers() {
+        let output = captured_output(
+            &[r"(?m)^GUEST_PROTOCOL_RESULT .* exit_code=0\s*$"],
+            &[b"GUEST_PROTOCOL_RESULT version=1 run_id=abc exit_code=1\n"],
+        );
+        let result = verify_qemu_success_contract(Ok(()), Some(&output));
+
+        let err = summarize_success_contract_failure(result).unwrap_err();
+
+        assert_eq!(err.to_string(), super::BENIGN_QEMU_STOP_ERROR);
+    }
+
+    #[test]
+    fn coverage_failure_summary_preserves_other_qemu_errors() {
+        let result = Err(anyhow::anyhow!("QEMU timeout"));
+
+        let err = summarize_success_contract_failure(result).unwrap_err();
+
+        assert_eq!(err.to_string(), "QEMU timeout");
     }
 
     #[test]
