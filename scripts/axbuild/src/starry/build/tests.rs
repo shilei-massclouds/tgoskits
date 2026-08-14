@@ -742,6 +742,48 @@ fn ensure_starry_bin_arg_keeps_existing_bin_arg() {
 }
 
 #[test]
+fn pinned_kallsyms_accepts_matching_executable_sections() {
+    let active = vec![ComparableElfSection {
+        name: ".text".to_string(),
+        address: 0x1000,
+        size: 4,
+        data: vec![1, 2, 3, 4],
+    }];
+    let pinned = vec![ComparableElfSection {
+        name: ".text".to_string(),
+        address: 0x1000,
+        size: 4,
+        data: vec![1, 2, 3, 4],
+    }];
+
+    ensure_section_snapshots_match(&active, &pinned).unwrap();
+}
+
+#[test]
+fn pinned_kallsyms_rejects_changed_executable_sections() {
+    let active = vec![ComparableElfSection {
+        name: ".text".to_string(),
+        address: 0x1000,
+        size: 4,
+        data: vec![1, 2, 3, 4],
+    }];
+    let pinned = vec![ComparableElfSection {
+        name: ".text".to_string(),
+        address: 0x1000,
+        size: 4,
+        data: vec![1, 2, 3, 5],
+    }];
+
+    let error = ensure_section_snapshots_match(&active, &pinned).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("executable or coverage sections")
+    );
+}
+
+#[test]
 fn riscv_image_header_accepts_compact_entry_and_fixed_offsets() {
     let image = riscv_image_fixture(0x0032_2297, 0x4982_8067);
 
