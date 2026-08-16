@@ -111,6 +111,10 @@ impl MountTableFile {
 }
 
 impl FileLike for MountTableFile {
+    fn validate_write_access(&self) -> AxResult {
+        self.file.validate_write_access()
+    }
+
     fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
         self.file.read(dst)
     }

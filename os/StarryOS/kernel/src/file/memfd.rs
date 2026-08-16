@@ -431,6 +431,10 @@ pub(crate) fn on_aspace_replace_metadata(
 }
 
 impl FileLike for Memfd {
+    fn validate_write_access(&self) -> AxResult {
+        self.inner.validate_write_access()
+    }
+
     fn read(&self, dst: &mut IoDst) -> AxResult<usize> {
         self.inner.read(dst)
     }

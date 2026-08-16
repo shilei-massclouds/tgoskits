@@ -22,7 +22,7 @@ use super::memfd::{
 };
 use crate::{
     file::{
-        Directory, File, FileLike, Pipe, get_file_like,
+        Directory, File, FileLike, MountTableFile, Pipe, get_file_like,
         memfd::{F_SEAL_ANY_WRITE, F_SEAL_GROW, Memfd},
     },
     mm::{IoVec, IoVectorBuf, UserConstPtr, VmBytesMut, vm_load_path_string},
@@ -55,6 +55,26 @@ fn file_or_espipe_write(fd: c_int) -> AxResult<Arc<File>> {
     })?;
     let _ = f.inner().access(FileFlags::WRITE)?;
     Ok(f)
+}
+
+/// Resolve the regular-file backend for a positioned write.
+///
+/// Linux rejects nonseekable objects with `ESPIPE`, but a seekable file that
+/// is not open for writing must report `EBADF` before user-buffer import.
+fn positioned_write_file(file_like: &Arc<dyn FileLike>) -> AxResult<&File> {
+    let file = if let Some(file) = file_like.downcast_ref::<File>() {
+        file
+    } else if let Some(memfd) = file_like.downcast_ref::<Memfd>() {
+        memfd.inner().as_ref()
+    } else if let Some(mount_table) = file_like.downcast_ref::<MountTableFile>() {
+        mount_table.inner().as_ref()
+    } else if file_like.is::<Directory>() {
+        return Err(AxError::BadFileDescriptor);
+    } else {
+        return Err(AxError::from(LinuxError::ESPIPE));
+    };
+    file.validate_write_access()?;
+    Ok(file)
 }
 
 fn offset_from_hilo(pos_l: __kernel_off_t, _pos_h: usize) -> __kernel_off_t {
@@ -138,6 +158,7 @@ pub fn sys_readv(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> {
 pub fn sys_write(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
     debug!("sys_write <= fd: {fd}, buf: {buf:p}, len: {len}");
     let file_like = get_file_like(fd)?;
+    file_like.validate_write_access()?;
     file_like.validate_write_len(len)?;
     validate_user_read_buf(buf.cast_const(), len)?;
     memfd_checks_before_stream_write(&file_like, len as u64)?;
@@ -148,6 +169,7 @@ pub fn sys_write(fd: i32, buf: *mut u8, len: usize) -> AxResult<isize> {
 pub fn sys_writev(fd: i32, iov: *const IoVec, iovcnt: usize) -> AxResult<isize> {
     debug!("sys_writev <= fd: {fd}, iovcnt: {iovcnt}");
     let file_like = get_file_like(fd)?;
+    file_like.validate_write_access()?;
     // Check length invariants (e.g. eventfd count) before importing segment
     // data, so a count error (EINVAL) takes precedence over a bad segment
     // pointer (EFAULT), matching Linux vfs_writev / eventfd_write ordering.
@@ -557,27 +579,28 @@ pub fn sys_pwritev2(
     if offset == -1 {
         // offset == -1: use current file position (like writev)
         let file_like = get_file_like(fd)?;
+        file_like.validate_write_access()?;
         file_like.validate_write_len(iov_total_len(iov, iovcnt)?)?;
         let total = validate_user_iov_buf_regions(iov, iovcnt)?;
         memfd_checks_before_stream_write(&file_like, total as u64)?;
         let data = copy_user_iov_read_buf(iov, iovcnt)?;
         file_like.write(&mut data.as_slice()).map(|n| n as _)
-    } else if let Ok(memfd) = Memfd::from_fd(fd) {
-        // Route memfd offset writes through the seal-aware path.
-        validate_user_iov_buf_regions(iov, iovcnt)?;
-        let data = copy_user_iov_read_buf(iov, iovcnt)?;
-        memfd
-            .write_at(data.as_slice(), offset as u64)
-            .map(|n| n as _)
     } else {
-        let total = validate_user_iov_buf_regions(iov, iovcnt)?;
-        let f = file_or_espipe_write(fd)?;
         let file_like = get_file_like(fd)?;
-        memfd_checks_before_write_at(&file_like, offset as u64, total as u64)?;
+        let file = positioned_write_file(&file_like)?;
+        let total = validate_user_iov_buf_regions(iov, iovcnt)?;
         let data = copy_user_iov_read_buf(iov, iovcnt)?;
-        f.inner()
-            .write_at(data.as_slice(), offset as _)
-            .map(|n| n as _)
+        if let Some(memfd) = file_like.downcast_ref::<Memfd>() {
+            // Route memfd offset writes through the seal-aware path.
+            memfd
+                .write_at(data.as_slice(), offset as u64)
+                .map(|n| n as _)
+        } else {
+            memfd_checks_before_write_at(&file_like, offset as u64, total as u64)?;
+            file.inner()
+                .write_at(data.as_slice(), offset as _)
+                .map(|n| n as _)
+        }
     }
 }
 
