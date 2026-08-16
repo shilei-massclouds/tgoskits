@@ -5,7 +5,7 @@ use ax_io::prelude::*;
 use bytemuck::AnyBitPattern;
 use starry_vm::{VmPtr, vm_read_slice, vm_write_slice};
 
-use super::check_access;
+use crate::config::{USER_SPACE_BASE, USER_SPACE_SIZE};
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone, AnyBitPattern)]
@@ -34,7 +34,7 @@ impl IoVectorBuf {
             }
             let iov_len = iov.iov_len as usize;
             if iov_len > 0 {
-                check_access(iov.iov_base as usize, iov_len).map_err(|_| AxError::BadAddress)?;
+                validate_iovec_address_range(iov.iov_base as usize, iov_len)?;
             }
             len = len
                 .checked_add(iov_len)
@@ -50,6 +50,19 @@ impl IoVectorBuf {
             start: 0,
             offset: 0,
         }
+    }
+}
+
+fn validate_iovec_address_range(start: usize, len: usize) -> AxResult<()> {
+    const USER_SPACE_END: usize = USER_SPACE_BASE + USER_SPACE_SIZE;
+
+    // Linux import_iovec() performs access_ok(), which rejects addresses past
+    // the user limit but does not require the pages to be mapped. Page faults
+    // are therefore reported only if the file operation reaches this segment.
+    if start < USER_SPACE_END && len <= USER_SPACE_END - start {
+        Ok(())
+    } else {
+        Err(AxError::BadAddress)
     }
 }
 
