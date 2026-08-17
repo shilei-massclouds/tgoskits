@@ -30,6 +30,34 @@ fn command_parses_test_qemu() {
 }
 
 #[test]
+fn starry_boot_stage_emitters_precede_each_runtime_handoff() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let main = std::fs::read_to_string(workspace.join("os/StarryOS/starryos/src/main.rs")).unwrap();
+    let entry = std::fs::read_to_string(workspace.join("os/StarryOS/kernel/src/entry.rs")).unwrap();
+    let init = std::fs::read_to_string(workspace.join("os/StarryOS/starryos/src/init.sh")).unwrap();
+
+    assert!(
+        main.find("STARRY_BOOT_STAGE version=1 stage=kernel-main")
+            .unwrap()
+            < main.find("starry_kernel::entry::init").unwrap(),
+        "kernel-main must be emitted before the kernel hands off to Starry init"
+    );
+    assert!(
+        entry
+            .find("STARRY_BOOT_STAGE version=1 stage=userspace-init")
+            .unwrap()
+            < entry.find("let task = spawn_task_with").unwrap(),
+        "userspace-init must be emitted before PID 1 is scheduled"
+    );
+    assert!(
+        init.find("STARRY_BOOT_STAGE version=1 stage=shell-ready")
+            .unwrap()
+            < init.find("STARRY_GROUPED_AUTORUN_INIT").unwrap(),
+        "shell-ready must precede every grouped guest test marker"
+    );
+}
+
+#[test]
 fn standard_x86_64_and_loongarch64_qemu_configs_use_uefi_boot() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
 

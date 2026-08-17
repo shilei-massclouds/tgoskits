@@ -177,6 +177,24 @@ cargo xtask starry test qemu --arch x86_64 -c qemu/kerndiff
 该 case 设置 `default_run = false`，因此不会增加默认 batch/CI 成本；`-l` 仍会
 列出它。coverage 构建中的 guest runner 应在输出通用结果 marker 后写入
 `/proc/starry-test-coverage`，由现有 QEMU monitor `memsave` 流程导出 profraw。
+`qemu/kerndiff` 的 `timeout = 300` 保持不变。
+
+所有 QEMU case 在 host stdout 输出一对单行 JSON 事件，前缀为
+`[axbuild] qemu-case-event `，schema 为 `axbuild-qemu-case` v1。start 事件记录
+case 和缩放后的有效 timeout；end 事件追加 elapsed milliseconds、`passed`/`failed`
+结果和未改写的错误摘要。Starry 启动同时按顺序输出：
+
+```text
+STARRY_BOOT_STAGE version=1 stage=kernel-main
+STARRY_BOOT_STAGE version=1 stage=userspace-init
+STARRY_BOOT_STAGE version=1 stage=shell-ready
+```
+
+这些 marker 在 grouped/KernDiff guest marker 之前出现，分别表示进入 Starry kernel
+main、PID 1 image 已装载、init shell 已可执行。消费者必须按 schema/version 解析，
+未知版本应忽略；旧的 `KERNDIFF_GUEST_START/RESULT/COVERAGE_TRIGGERED` 协议不变。
+设计和错误优先级见
+[Starry QEMU startup diagnostics](../../book/design/starry-qemu-startup-diagnostics.md)。
 
 需要 staging rootfs 的 pipeline 依赖 `debugfs` 和 `fakeroot`。xtask 会在启动
 `debugfs rdump` 前检查 EUID；Linux 上还会检查 UID/GID identity mapping 和有效

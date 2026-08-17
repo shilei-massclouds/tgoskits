@@ -144,6 +144,7 @@ pub(crate) struct PreparedCaseAssets {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RunPreparedQemuCaseOptions {
+    pub(crate) case_name: String,
     pub(crate) prepare_elapsed: Duration,
     pub(crate) qemu_timing_fields: Option<Vec<(&'static str, String)>>,
 }

@@ -14,6 +14,7 @@ printf "Use \033[1m\033[3mapk\033[0m to install packages.\n"
 echo
 
 # Do your initialization here!
+printf '%s\n' 'STARRY_BOOT_STAGE version=1 stage=shell-ready'
 
 if [ -f /usr/bin/starry-run-case-tests ]; then
     echo "STARRY_GROUPED_AUTORUN_INIT"

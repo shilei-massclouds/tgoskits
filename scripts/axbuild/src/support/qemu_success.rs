@@ -250,11 +250,30 @@ pub(crate) fn summarize_success_contract_failure(result: Result<()>) -> Result<(
     }
 }
 
+/// Preserves a real QEMU failure as the primary error while retaining a
+/// simultaneous coverage-finalization failure as compact diagnostic context.
+pub(crate) fn combine_qemu_and_coverage_results(
+    qemu_result: Result<()>,
+    coverage_result: Result<()>,
+) -> Result<()> {
+    match (qemu_result, coverage_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Err(coverage_error)) => Err(coverage_error),
+        (Err(qemu_error), Ok(())) => summarize_success_contract_failure(Err(qemu_error)),
+        (Err(qemu_error), Err(coverage_error)) if is_benign_qemu_stop_error(&qemu_error) => {
+            Err(coverage_error)
+        }
+        (Err(qemu_error), Err(coverage_error)) => Err(anyhow::anyhow!(
+            "{qemu_error:#}; additional coverage failure: {coverage_error:#}"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        QemuSuccessOutput, TRANSCRIPT_TAIL_BYTES, summarize_success_contract_failure,
-        verify_qemu_success_contract,
+        QemuSuccessOutput, TRANSCRIPT_TAIL_BYTES, combine_qemu_and_coverage_results,
+        summarize_success_contract_failure, verify_qemu_success_contract,
     };
 
     fn captured_output(patterns: &[&str], chunks: &[&[u8]]) -> QemuSuccessOutput {
@@ -300,6 +319,19 @@ mod tests {
         let err = summarize_success_contract_failure(result).unwrap_err();
 
         assert_eq!(err.to_string(), "QEMU timeout");
+    }
+
+    #[test]
+    fn qemu_timeout_remains_primary_when_coverage_is_missing() {
+        let result = combine_qemu_and_coverage_results(
+            Err(anyhow::anyhow!("QEMU timed out after 300 seconds")),
+            Err(anyhow::anyhow!("no coverage profile was captured")),
+        );
+
+        let error = result.unwrap_err().to_string();
+        assert!(error.starts_with("QEMU timed out after 300 seconds"));
+        assert!(error.contains("additional coverage failure"));
+        assert!(error.contains("no coverage profile was captured"));
     }
 
     #[test]

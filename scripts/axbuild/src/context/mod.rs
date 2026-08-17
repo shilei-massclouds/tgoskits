@@ -260,8 +260,8 @@ impl AppContext {
         let result = self
             .run_qemu_with_success_contract(cargo, qemu, capture_backtrace, &success_regex)
             .await;
-        capture.finish()?;
-        crate::support::qemu_success::summarize_success_contract_failure(result)
+        let coverage_result = capture.finish();
+        crate::support::qemu_success::combine_qemu_and_coverage_results(result, coverage_result)
     }
 
     pub(crate) async fn run_prepared_qemu(

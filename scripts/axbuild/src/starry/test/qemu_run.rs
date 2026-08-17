@@ -531,6 +531,7 @@ impl Starry {
             &case.qemu_config_path,
             prepared_assets,
             case::RunPreparedQemuCaseOptions {
+                case_name: case.display_name.clone(),
                 prepare_elapsed,
                 qemu_timing_fields: Some(vec![("case", case.display_name.clone())]),
             },

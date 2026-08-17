@@ -308,6 +308,7 @@ impl Axvisor {
             &case.case.case.qemu_config_path,
             prepared_assets,
             test_case::RunPreparedQemuCaseOptions {
+                case_name: case.case.case.display_name.clone(),
                 prepare_elapsed: prepare_started.elapsed(),
                 qemu_timing_fields: None,
             },
