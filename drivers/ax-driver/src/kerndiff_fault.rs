@@ -29,13 +29,15 @@ const ESB_RELOAD_OFFSET: usize = 0x0c;
 const ESB_UNLOCK1: u16 = 0x80;
 const ESB_UNLOCK2: u16 = 0x86;
 const ESB_RELOAD: u16 = 0x100;
-const ESB_ENABLE: u32 = 0x02;
+const ESB_CONFIG_VALUE: u16 = 0x0003;
+const ESB_ENABLE: u8 = 0x02;
 
 pub const WATCHDOG_STAGE_SECONDS: u64 = 30;
 pub const WATCHDOG_TIMEOUT_SECONDS: u64 = WATCHDOG_STAGE_SECONDS * 2;
 pub const LIVENESS_STALE_SECONDS: u64 = 15;
 pub const DIAGNOSTIC_PAGE_BYTES: usize = 4096;
-const TIMER_TICKS: u32 = (WATCHDOG_STAGE_SECONDS as u32) << 9;
+// The configured heartbeat is split evenly across the two hardware stages.
+const TIMER_TICKS: u32 = (WATCHDOG_TIMEOUT_SECONDS as u32) << 9;
 const MAX_CPUS: usize = 64;
 const DIAGNOSTIC_MAGIC: u32 = 0x4b44_5744;
 const DIAGNOSTIC_VERSION: u32 = 1;
@@ -106,17 +108,11 @@ mod i6300_driver {
         });
         let mmio = crate::mmio::iomap(bar.start, bar.count().max(16))?;
 
-        // 1 kHz, WDT output enabled, timer-one interrupt disabled.
-        let old_config = endpoint.read(ESB_CONFIG_OFFSET);
-        endpoint.write(ESB_CONFIG_OFFSET, (old_config & 0xffff_0000) | 0x0003);
-        let old_lock = endpoint.read(ESB_LOCK_OFFSET);
-        endpoint.write(ESB_LOCK_OFFSET, old_lock & !0xff);
         let address = endpoint.address();
         let config_address = 0x8000_0000
             | (u32::from(address.bus()) << 16)
             | (u32::from(address.device()) << 11)
-            | (u32::from(address.function()) << 8)
-            | u32::from(ESB_LOCK_OFFSET & !3);
+            | (u32::from(address.function()) << 8);
         WATCHDOG_CONFIG_ADDRESS.store(config_address, Ordering::Release);
         WATCHDOG_MMIO.store(mmio.as_ptr() as usize, Ordering::Release);
         log::info!(
@@ -161,7 +157,7 @@ mod pvpanic_driver {
 /// Arms the two-stage watchdog and initializes its host-readable page.
 pub fn arm_watchdog(online_mask: u64, boot_epoch: u64) -> bool {
     let base = WATCHDOG_MMIO.load(Ordering::Acquire);
-    if base == 0 || online_mask == 0 {
+    if base == 0 || online_mask == 0 || !configure_watchdog() {
         return false;
     }
     DIAGNOSTIC.boot_epoch.store(boot_epoch, Ordering::Release);
@@ -359,27 +355,81 @@ unsafe fn apply_programming_sequence(base: usize, operations: &[ProgrammingOpera
 }
 
 #[cfg(target_arch = "x86_64")]
-fn enable_watchdog() -> bool {
-    use core::arch::asm;
-
+fn configure_watchdog() -> bool {
     let config_address = WATCHDOG_CONFIG_ADDRESS.load(Ordering::Acquire);
     if config_address == 0 {
         return false;
     }
-    let mut value: u32;
     unsafe {
-        asm!("out dx, eax", in("dx") 0xcf8u16, in("eax") config_address, options(nostack));
-        asm!("in eax, dx", in("dx") 0xcfcu16, out("eax") value, options(nostack));
-        value = (value & !0xff) | ESB_ENABLE;
-        asm!("out dx, eax", in("dx") 0xcf8u16, in("eax") config_address, options(nostack));
-        asm!("out dx, eax", in("dx") 0xcfcu16, in("eax") value, options(nostack));
+        pci_config_write_u16(config_address, ESB_CONFIG_OFFSET, ESB_CONFIG_VALUE);
+        pci_config_write_u8(config_address, ESB_LOCK_OFFSET, 0);
+        pci_config_read_u16(config_address, ESB_CONFIG_OFFSET) == ESB_CONFIG_VALUE
+            && pci_config_read_u8(config_address, ESB_LOCK_OFFSET) == 0
     }
-    true
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn configure_watchdog() -> bool {
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
+fn enable_watchdog() -> bool {
+    let config_address = WATCHDOG_CONFIG_ADDRESS.load(Ordering::Acquire);
+    if config_address == 0 {
+        return false;
+    }
+    unsafe {
+        pci_config_write_u8(config_address, ESB_LOCK_OFFSET, ESB_ENABLE);
+        pci_config_read_u8(config_address, ESB_LOCK_OFFSET) & ESB_ENABLE != 0
+    }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
 fn enable_watchdog() -> bool {
     false
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn pci_config_write_u8(config_address: u32, offset: u16, value: u8) {
+    unsafe {
+        x86::io::outl(0xcf8, pci_config_selector(config_address, offset));
+        x86::io::outb(pci_config_data_port(offset), value);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn pci_config_write_u16(config_address: u32, offset: u16, value: u16) {
+    unsafe {
+        x86::io::outl(0xcf8, pci_config_selector(config_address, offset));
+        x86::io::outw(pci_config_data_port(offset), value);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn pci_config_read_u8(config_address: u32, offset: u16) -> u8 {
+    unsafe {
+        x86::io::outl(0xcf8, pci_config_selector(config_address, offset));
+        x86::io::inb(pci_config_data_port(offset))
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn pci_config_read_u16(config_address: u32, offset: u16) -> u16 {
+    unsafe {
+        x86::io::outl(0xcf8, pci_config_selector(config_address, offset));
+        x86::io::inw(pci_config_data_port(offset))
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+const fn pci_config_selector(config_address: u32, offset: u16) -> u32 {
+    config_address | (offset & !3) as u32
+}
+
+#[cfg(target_arch = "x86_64")]
+const fn pci_config_data_port(offset: u16) -> u16 {
+    0xcfc + (offset & 3)
 }
 
 #[cfg(test)]
@@ -389,16 +439,26 @@ mod tests {
     #[test]
     fn programs_two_thirty_second_stages_with_required_unlocks() {
         let operations = watchdog_programming_sequence();
-        assert_eq!(TIMER_TICKS, 30 << 9);
+        assert_eq!(TIMER_TICKS, 60 << 9);
         assert_eq!(
             operations[0..3],
             [
                 ProgrammingOperation::Write16(ESB_RELOAD_OFFSET, ESB_UNLOCK1),
                 ProgrammingOperation::Write16(ESB_RELOAD_OFFSET, ESB_UNLOCK2),
-                ProgrammingOperation::Write32(ESB_TIMER1_OFFSET, 30 << 9),
+                ProgrammingOperation::Write32(ESB_TIMER1_OFFSET, 60 << 9),
             ]
         );
-        assert!(operations.contains(&ProgrammingOperation::Write32(ESB_TIMER2_OFFSET, 30 << 9)));
+        assert!(operations.contains(&ProgrammingOperation::Write32(ESB_TIMER2_OFFSET, 60 << 9)));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn uses_exact_width_pci_config_ports_for_qemu_watchdog_registers() {
+        let address = 0x8000_2800;
+        assert_eq!(pci_config_selector(address, ESB_CONFIG_OFFSET), 0x8000_2860);
+        assert_eq!(pci_config_selector(address, ESB_LOCK_OFFSET), 0x8000_2868);
+        assert_eq!(pci_config_data_port(ESB_CONFIG_OFFSET), 0xcfc);
+        assert_eq!(pci_config_data_port(ESB_LOCK_OFFSET), 0xcfc);
     }
 
     #[test]
