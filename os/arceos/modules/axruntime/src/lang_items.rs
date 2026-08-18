@@ -29,9 +29,32 @@ fn panic(info: &PanicInfo) -> ! {
 
 fn panic_primary(info: &PanicInfo) -> ! {
     let _oops_guard = axpanic::enter_oops();
+    #[cfg(feature = "kerndiff-fault-observer")]
+    kerndiff_panic_notify(info);
     panic_message(info);
     panic_backtrace();
     panic_shutdown()
+}
+
+#[cfg(feature = "kerndiff-fault-observer")]
+fn kerndiff_panic_notify(info: &PanicInfo) {
+    // Establish the allocation-free, lock-free QMP authority before touching
+    // the console path.  The marker below is supporting identity evidence and
+    // must not be able to prevent PVPANIC_PANICKED from reaching the host.
+    ax_driver::kerndiff_fault::notify_panic();
+    if let Some(location) = info.location() {
+        ax_println!(
+            "STARRY_KERNEL_PANIC version=1 panic_type=panic callsite={}:{} cpu={}",
+            location.file(),
+            location.line(),
+            current_cpu_id(),
+        );
+    } else {
+        ax_println!(
+            "STARRY_KERNEL_PANIC version=1 panic_type=panic callsite=unknown cpu={}",
+            current_cpu_id(),
+        );
+    }
 }
 
 fn panic_message(info: &PanicInfo) {

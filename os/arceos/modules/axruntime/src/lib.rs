@@ -50,6 +50,8 @@ mod stack_protector;
 #[cfg(feature = "smp")]
 mod mp;
 
+#[cfg(feature = "kerndiff-fault-observer")]
+mod kerndiff_fault;
 #[cfg(feature = "paging")]
 mod kernel_mapping;
 mod klib;
@@ -309,6 +311,12 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
 
     devices::probe_all_devices();
 
+    // KernDiff's hardware watchdog becomes authoritative as soon as its PCI
+    // devices have been discovered.  At this point only the bootstrap CPU is
+    // online, so a temporary CPU0 feeder covers the rest of runtime bring-up.
+    #[cfg(feature = "kerndiff-fault-observer")]
+    kerndiff_fault::start_bootstrap();
+
     #[cfg(feature = "serial")]
     serial::init(cpu_id);
 
@@ -355,6 +363,12 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
 
     #[cfg(all(feature = "smp", feature = "ipi"))]
     fs::online_smp();
+
+    // All CPUs and SMP filesystem state are now online.  Replace the bootstrap
+    // feeder with the full pinned per-CPU liveness policy before entering the
+    // operating-system/application entry point.
+    #[cfg(feature = "kerndiff-fault-observer")]
+    kerndiff_fault::handoff_to_percpu();
 
     ax_app_entry();
 
@@ -533,6 +547,8 @@ fn program_next_timer() {
 #[cfg(feature = "irq")]
 fn timer_irq_handler(ctx: ax_hal::irq::IrqContext) -> ax_hal::irq::IrqReturn {
     let _ = ctx;
+    #[cfg(feature = "kerndiff-fault-observer")]
+    ax_driver::kerndiff_fault::record_timer_irq(ax_hal::percpu::this_cpu_id());
     // SAFETY: the local timer IRQ excludes migration and nested local
     // scheduler-clock publication for this complete stamp.
     unsafe { ax_hal::time::scheduler_clock_tick() }

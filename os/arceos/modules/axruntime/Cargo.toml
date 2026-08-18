@@ -40,6 +40,12 @@ lockdep = ["multitask", "ax-sync/lockdep", "ax-task?/lockdep", "ax-fs-ng?/lockde
 stack-guard-page = ["ipi", "multitask", "paging", "ax-task?/stack-guard-page"]
 stack-protector = []
 tls = ["ax-hal/tls", "ax-task?/tls"]
+kerndiff-fault-observer = [
+  "irq",
+  "multitask",
+  "smp",
+  "ax-driver/kerndiff-fault-observer",
+]
 
 display = ["paging", "dep:ax-display", "ax-driver/display"]
 fs = [

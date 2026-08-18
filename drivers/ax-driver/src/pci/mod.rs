@@ -194,6 +194,7 @@ pub const fn has_pci_endpoint_drivers() -> bool {
         feature = "virtio-input",
         feature = "virtio-socket",
         feature = "list-pci-devices",
+        feature = "kerndiff-fault-observer",
     ))
 }
 

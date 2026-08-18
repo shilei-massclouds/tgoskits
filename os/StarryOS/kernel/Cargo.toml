@@ -107,6 +107,10 @@ stack-guard-page = ["ax-runtime/stack-guard-page"]
 stack-protector = ["ax-runtime/stack-protector"]
 axtest = []
 axtest-coverage = ["dep:axtest", "axtest/coverage"]
+kerndiff-fault-observer = [
+    "ax-driver/kerndiff-fault-observer",
+    "ax-runtime/kerndiff-fault-observer",
+]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(axtest)', 'cfg(axtest_coverage)', 'cfg(feature, values("ax-std"))'] }

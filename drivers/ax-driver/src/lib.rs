@@ -71,6 +71,8 @@ pub mod vsock;
 
 #[cfg(feature = "jpeg")]
 pub mod jpeg;
+#[cfg(feature = "kerndiff-fault-observer")]
+pub mod kerndiff_fault;
 #[cfg(feature = "pci")]
 pub mod pci;
 #[cfg(feature = "rk3588-pwm")]

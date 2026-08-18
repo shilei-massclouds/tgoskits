@@ -16,6 +16,7 @@ axtest = ["dep:axtest"]
 
 irq = []
 pci = ["dep:ax-sync", "dep:pcie", "dep:rdif-msi", "dep:rdif-pcie"]
+kerndiff-fault-observer = ["pci"]
 
 block = ["dep:ax-errno", "dep:ax-sync", "dep:rdif-block"]
 net = ["dep:ax-sync", "dep:rd-net"]
