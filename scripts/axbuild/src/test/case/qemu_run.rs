@@ -14,7 +14,7 @@ const QEMU_CASE_EVENT_VERSION: u64 = 1;
 pub(crate) async fn run_qemu_with_prepared_case_assets(
     app: &mut AppContext,
     cargo: &Cargo,
-    qemu: QemuConfig,
+    mut qemu: QemuConfig,
     capture_backtrace: Option<crate::backtrace::BacktraceQemuCapture>,
     qemu_config_path: &Path,
     prepared_assets: PreparedCaseAssets,
@@ -39,10 +39,38 @@ pub(crate) async fn run_qemu_with_prepared_case_assets(
     let effective_timeout = qemu.timeout.filter(|timeout| *timeout > 0);
     print_qemu_case_event(qemu_case_start_event(&options.case_name, effective_timeout));
 
+    let qmp_capture = if crate::support::qemu_fault::enabled() {
+        let paths = crate::support::qemu_fault::QemuFaultPaths::new(app.workspace_root())?;
+        crate::support::qemu_fault::apply_qmp(&mut qemu, &paths)?;
+        Some(crate::support::qemu_fault::QemuFaultCapture::install(
+            &paths,
+            &options.case_name,
+        ))
+    } else {
+        None
+    };
+
     let qemu_started = std::time::Instant::now();
-    let result = app
+    let mut result = app
         .run_qemu_with_axtest_coverage(cargo, qemu, capture_backtrace)
         .await;
+    if let Some(capture) = qmp_capture {
+        match capture.finish() {
+            Ok(events) => {
+                for event in events {
+                    println!("[axbuild] qemu-fault-event {event}");
+                }
+            }
+            Err(error) => {
+                let qmp_error = anyhow::anyhow!("KernDiff QMP capture failed: {error:#}");
+                if result.is_ok() {
+                    result = Err(qmp_error);
+                } else {
+                    eprintln!("[axbuild] {qmp_error:#}");
+                }
+            }
+        }
+    }
     let qemu_elapsed = qemu_started.elapsed();
     print_qemu_case_event(qemu_case_end_event(
         &options.case_name,

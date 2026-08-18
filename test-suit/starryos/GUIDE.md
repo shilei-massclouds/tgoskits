@@ -179,6 +179,20 @@ cargo xtask starry test qemu --arch x86_64 -c qemu/kerndiff
 `/proc/starry-test-coverage`，由现有 QEMU monitor `memsave` 流程导出 profraw。
 `qemu/kerndiff` 的 `timeout = 300` 保持不变。
 
+该专用 profile 还固定加入 `i6300esb`（`watchdog-action=pause`）、`pvpanic-pci`、
+`-no-reboot` 和每 case 唯一 QMP socket。watchdog 采用两阶段生命周期：axruntime 在
+`devices::probe_all_devices()` 完成后立即 arm 两个 30 秒 timer stage，并启动 CPU0
+bootstrap feeder；在 `fs::online_smp()` 完成后、进入 Starry main 前切换为 pinned
+per-CPU liveness task 与 CPU0 coordinator。普通 Starry QEMU case 不启用这些设备或
+feature。
+
+调用方设置 `KERNDIFF_QMP_FAULTS=1` 后，axbuild 监听 `WATCHDOG`、
+`GUEST_PANICKED`、`RESET`、`SHUTDOWN`，输出前缀为
+`[axbuild] qemu-fault-event ` 的 `axbuild-qemu-fault` v1 JSON。WATCHDOG 暂停时会按
+guest armed marker 中的物理地址执行 QMP `memsave`，附带 4 KiB per-CPU 诊断摘要；
+诊断提取失败保留原始 WATCHDOG 事件并写入 `raw_error`。这些事件只描述观测到的故障
+域，不代替 KernDiff 对 finding/基础设施错误的最终分类。
+
 所有 QEMU case 在 host stdout 输出一对单行 JSON 事件，前缀为
 `[axbuild] qemu-case-event `，schema 为 `axbuild-qemu-case` v1。start 事件记录
 case 和缩放后的有效 timeout；end 事件追加 elapsed milliseconds、`passed`/`failed`

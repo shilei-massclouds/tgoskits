@@ -345,6 +345,7 @@ mod capture {
         }
 
         fn process_line(&mut self, line: &str) {
+            crate::support::qemu_fault::observe_guest_output_line(line);
             if line.contains(DEFERRED_FAIL_MARKER) {
                 self.deferred_fail = true;
                 return;

@@ -8,6 +8,7 @@ features = [
   "ax-driver/virtio-socket",
   "ax-driver/xhci-pci",
   "starry-kernel/input",
+  "starry-kernel/kerndiff-fault-observer",
 ]
 max_cpu_num = 4
 
