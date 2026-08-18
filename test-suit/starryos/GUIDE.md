@@ -206,7 +206,7 @@ supervisor 消费，内核只识别但不执行；其余三个值的注入阶段
 调用方设置 `KERNDIFF_QMP_FAULTS=1` 后，axbuild 监听 `WATCHDOG`、
 `GUEST_PANICKED`、`RESET`、`SHUTDOWN`，输出前缀为
 `[axbuild] qemu-fault-event ` 的 `axbuild-qemu-fault` v1 JSON。WATCHDOG 暂停时会按
-guest armed marker 中的物理地址执行 QMP `memsave`，附带 4 KiB per-CPU 诊断摘要；
+guest armed marker 中的物理地址执行 QMP `pmemsave`，附带 4 KiB per-CPU 诊断摘要；
 诊断提取失败保留原始 WATCHDOG 事件并写入 `raw_error`。这些事件只描述观测到的故障
 域，不代替 KernDiff 对 finding/基础设施错误的最终分类。
 

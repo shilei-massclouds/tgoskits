@@ -23,6 +23,7 @@ const DIAGNOSTIC_MAGIC: u32 = 0x4b44_5744;
 const DIAGNOSTIC_VERSION: u32 = 1;
 const MAX_DIAGNOSTIC_CPUS: usize = 64;
 const WATCHDOG_MARKER_PREFIX: &str = "STARRY_KERNEL_WATCHDOG version=1 state=armed ";
+const WATCHDOG_PMEMSAVE_REQUEST_ID: &str = "kerndiff-watchdog-pmemsave";
 static SOCKET_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static DIAGNOSTIC_PAGE_PA: AtomicU64 = AtomicU64::new(0);
 
@@ -280,19 +281,11 @@ fn capture_watchdog_diagnostic(
     }
     let output = socket.with_extension("diagnostic-page.bin");
     let _ = fs::remove_file(&output);
-    let command = serde_json::json!({
-        "execute": "memsave",
-        "arguments": {
-            "val": address,
-            "size": DIAGNOSTIC_PAGE_BYTES,
-            "filename": output,
-        },
-        "id": "kerndiff-watchdog-memsave",
-    });
+    let command = watchdog_diagnostic_page_request(address, &output);
     serde_json::to_writer(&mut *stream, &command)?;
     stream.write_all(b"\n")?;
     stream.flush()?;
-    wait_for_command_return(reader, stop, "kerndiff-watchdog-memsave")?;
+    wait_for_command_return(reader, stop, WATCHDOG_PMEMSAVE_REQUEST_ID)?;
     let encoded = fs::read(&output).with_context(|| {
         format!(
             "failed to read watchdog diagnostic page {}",
@@ -301,6 +294,18 @@ fn capture_watchdog_diagnostic(
     });
     let _ = fs::remove_file(&output);
     decode_diagnostic_page(&encoded?)
+}
+
+fn watchdog_diagnostic_page_request(address: u64, output: &Path) -> serde_json::Value {
+    serde_json::json!({
+        "execute": "pmemsave",
+        "arguments": {
+            "val": address,
+            "size": DIAGNOSTIC_PAGE_BYTES,
+            "filename": output,
+        },
+        "id": WATCHDOG_PMEMSAVE_REQUEST_ID,
+    })
 }
 
 fn wait_for_command_return(
@@ -317,9 +322,9 @@ fn wait_for_command_return(
             return Ok(());
         }
         if let Some(error) = value.get("error") {
-            bail!("QMP memsave failed: {error}")
+            bail!("QMP pmemsave failed: {error}")
         }
-        bail!("QMP memsave returned an invalid response")
+        bail!("QMP pmemsave returned an invalid response")
     }
 }
 
@@ -450,6 +455,26 @@ mod tests {
             assert_eq!(event["case"], "kerndiff-case");
             assert_eq!(event["event"], name);
         }
+    }
+
+    #[test]
+    fn builds_physical_watchdog_diagnostic_page_request() {
+        let output = Path::new("/tmp/watchdog-diagnostic-page.bin");
+
+        let request = watchdog_diagnostic_page_request(0x1234_5000, output);
+
+        assert_eq!(
+            request,
+            serde_json::json!({
+                "execute": "pmemsave",
+                "arguments": {
+                    "val": 0x1234_5000,
+                    "size": 4096,
+                    "filename": output,
+                },
+                "id": "kerndiff-watchdog-pmemsave",
+            })
+        );
     }
 
     #[test]
