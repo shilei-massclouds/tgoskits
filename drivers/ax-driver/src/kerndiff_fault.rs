@@ -18,6 +18,8 @@ const INTEL_VENDOR_ID: u16 = 0x8086;
 const I6300ESB_DEVICE_ID: u16 = 0x25ab;
 const REDHAT_VENDOR_ID: u16 = 0x1b36;
 const PVPANIC_DEVICE_ID: u16 = 0x0011;
+#[cfg(target_arch = "x86_64")]
+const PVPANIC_IO_PORT: u16 = 0x505;
 
 const ESB_CONFIG_OFFSET: u16 = 0x60;
 const ESB_LOCK_OFFSET: u16 = 0x68;
@@ -262,11 +264,21 @@ pub fn notify_panic() {
     let address = PVPANIC_MMIO.load(Ordering::Acquire);
     if address != 0 {
         unsafe { write_pvpanic_panicked(address) };
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        write_pvpanic_panicked_port(PVPANIC_IO_PORT);
     }
 }
 
 unsafe fn write_pvpanic_panicked(address: usize) {
     unsafe { write_volatile(address as *mut u8, 1) };
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn write_pvpanic_panicked_port(port: u16) {
+    unsafe { x86::io::outb(port, 1) };
 }
 
 fn stale_mask(online_mask: u64, now_ns: u64, last_progress: impl Fn(usize) -> u64) -> u64 {

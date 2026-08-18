@@ -179,7 +179,8 @@ cargo xtask starry test qemu --arch x86_64 -c qemu/kerndiff
 `/proc/starry-test-coverage`，由现有 QEMU monitor `memsave` 流程导出 profraw。
 `qemu/kerndiff` 的 `timeout = 300` 保持不变。
 
-该专用 profile 还固定加入 `i6300esb`（`watchdog-action=pause`）、`pvpanic-pci`、
+该专用 profile 还固定加入 `i6300esb`（`watchdog-action=pause`）、x86 ISA `pvpanic`
+（固定 I/O port `0x505`）、
 `-no-reboot` 和每 case 唯一 QMP socket。watchdog 采用两阶段生命周期：axruntime 在
 `devices::probe_all_devices()` 完成后立即 arm 两个 30 秒 timer stage，并启动 CPU0
 bootstrap feeder；在 `fs::online_smp()` 完成后、进入 Starry main 前切换为 pinned

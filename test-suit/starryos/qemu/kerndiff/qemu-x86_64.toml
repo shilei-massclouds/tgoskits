@@ -11,7 +11,7 @@ args = [
   "-watchdog-action",
   "pause",
   "-device",
-  "pvpanic-pci",
+  "pvpanic",
   "-no-reboot",
   "-device",
   "nvme,serial=deadbeef,drive=nvm,max_ioqpairs=64,msix_qsize=65",
