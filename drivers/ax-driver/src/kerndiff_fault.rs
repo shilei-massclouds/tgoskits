@@ -43,6 +43,7 @@ static WATCHDOG_CONFIG_ADDRESS: AtomicU32 = AtomicU32::new(0);
 static PVPANIC_MMIO: AtomicUsize = AtomicUsize::new(0);
 static WATCHDOG_ARMED: AtomicBool = AtomicBool::new(false);
 static PVPANIC_NOTIFIED: AtomicBool = AtomicBool::new(false);
+static FORCED_STALE_MASK: AtomicU64 = AtomicU64::new(0);
 
 #[repr(C, align(4096))]
 struct DiagnosticPage {
@@ -164,6 +165,7 @@ pub fn arm_watchdog(online_mask: u64, boot_epoch: u64) -> bool {
     DIAGNOSTIC.boot_epoch.store(boot_epoch, Ordering::Release);
     DIAGNOSTIC.online_mask.store(online_mask, Ordering::Release);
     DIAGNOSTIC.stale_mask.store(0, Ordering::Release);
+    FORCED_STALE_MASK.store(0, Ordering::Release);
     unsafe {
         apply_programming_sequence(base, &watchdog_programming_sequence());
     }
@@ -189,6 +191,7 @@ pub fn configure_online_mask(online_mask: u64, now_ns: u64) {
     }
     DIAGNOSTIC.online_mask.store(online_mask, Ordering::Release);
     DIAGNOSTIC.stale_mask.store(0, Ordering::Release);
+    FORCED_STALE_MASK.store(0, Ordering::Release);
 }
 
 /// Records and feeds the bootstrap CPU before the full SMP policy is active.
@@ -223,13 +226,26 @@ pub fn coordinator_poll(now_ns: u64) -> u64 {
         return 0;
     }
     let online = DIAGNOSTIC.online_mask.load(Ordering::Acquire);
-    let stale = stale_mask(online, now_ns, |cpu| {
+    let observed = stale_mask(online, now_ns, |cpu| {
         DIAGNOSTIC.last_progress_ns[cpu].load(Ordering::Acquire)
     });
+    let stale = combined_stale_mask(online, observed, FORCED_STALE_MASK.load(Ordering::Acquire));
     DIAGNOSTIC.stale_mask.store(stale, Ordering::Release);
     if stale == 0 {
         ping_watchdog();
     }
+    stale
+}
+
+/// Forces supporting stale-CPU diagnostics for a deliberate validation hang.
+///
+/// This does not arm, ping, or otherwise change the watchdog.  The subsequent
+/// WATCHDOG QMP event remains the only authoritative kernel-hang evidence.
+pub fn force_stale_mask(requested_mask: u64) -> u64 {
+    let online = DIAGNOSTIC.online_mask.load(Ordering::Acquire);
+    let stale = forced_stale_mask(online, requested_mask);
+    FORCED_STALE_MASK.store(stale, Ordering::Release);
+    DIAGNOSTIC.stale_mask.store(stale, Ordering::Release);
     stale
 }
 
@@ -267,6 +283,14 @@ fn stale_mask(online_mask: u64, now_ns: u64, last_progress: impl Fn(usize) -> u6
         }
     }
     stale
+}
+
+const fn forced_stale_mask(online_mask: u64, requested_mask: u64) -> u64 {
+    online_mask & requested_mask
+}
+
+const fn combined_stale_mask(online_mask: u64, observed: u64, forced: u64) -> u64 {
+    online_mask & (observed | forced)
 }
 
 fn ping_watchdog() {
@@ -376,6 +400,13 @@ mod tests {
             }
         });
         assert_eq!(stale, 0b0100);
+    }
+
+    #[test]
+    fn forced_stale_diagnostic_is_limited_to_online_cpus() {
+        assert_eq!(forced_stale_mask(0b1110, 0b0101), 0b0100);
+        assert_eq!(forced_stale_mask(0b1111, 1), 1);
+        assert_eq!(combined_stale_mask(0b1110, 0b0010, 0b0101), 0b0110);
     }
 
     #[test]

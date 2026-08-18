@@ -45,7 +45,7 @@ impl QemuFaultPaths {
 
 /// Observes one complete guest output line from the existing coverage tee.
 pub(crate) fn observe_guest_output_line(line: &str) {
-    let normalized = line.trim_start_matches(|character| character == '\u{1b}' || character == '[');
+    let normalized = line.trim_start_matches(['\u{1b}', '[']);
     let Some(marker) = normalized.find(WATCHDOG_MARKER_PREFIX) else {
         return;
     };

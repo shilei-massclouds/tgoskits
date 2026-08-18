@@ -186,6 +186,22 @@ bootstrap feeder；在 `fs::online_smp()` 完成后、进入 Starry main 前切�
 per-CPU liveness task 与 CPU0 coordinator。普通 Starry QEMU case 不启用这些设备或
 feature。
 
+`KERNDIFF_VALIDATION_FAULT` 是外部 KernDiff 驱动冻结并传入构建环境的测试专用值，
+只允许用于显式选择的 `qemu/kerndiff`，不能加入普通 Starry profile 或通用 syscall
+用例。`application-sigsegv` 和 `application-no-progress` 由 guest application
+supervisor 消费，内核只识别但不执行；其余三个值的注入阶段固定为：
+
+- `kernel-panic`：完成 per-CPU handoff 后触发 panic，`STARRY_KERNEL_PANIC` 仅提供
+  supporting identity，最终仍须收到 pvpanic 对应的 QMP `GUEST_PANICKED`；
+- `kernel-watchdog`：完成 handoff 后先把 CPU0 写入诊断页 stale mask，再关闭本 CPU
+  中断并自旋；约 60 秒后的 QMP `WATCHDOG` 才是 `kernel-hang` 权威证据；
+- `pre-watchdog-hang`：PCI 设备探测后、watchdog arm 前关闭本 CPU 中断并自旋，
+  因而日志中不得出现 armed marker，也不会有权威 QMP fault，只能由调用方外层
+  deadline 结束。
+
+内核会为上述三种路径输出 `STARRY_KERNDIFF_VALIDATION_FAULT` supporting marker，
+但分类器不得用它替代 QMP 权威事件。未设置该环境变量的正常构建不包含任何注入行为。
+
 调用方设置 `KERNDIFF_QMP_FAULTS=1` 后，axbuild 监听 `WATCHDOG`、
 `GUEST_PANICKED`、`RESET`、`SHUTDOWN`，输出前缀为
 `[axbuild] qemu-fault-event ` 的 `axbuild-qemu-fault` v1 JSON。WATCHDOG 暂停时会按

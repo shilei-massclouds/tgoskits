@@ -311,6 +311,11 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
 
     devices::probe_all_devices();
 
+    // This validation fault deliberately runs after device discovery but
+    // before the watchdog is armed, so it must remain non-authoritative.
+    #[cfg(feature = "kerndiff-fault-observer")]
+    kerndiff_fault::inject_before_watchdog_arm();
+
     // KernDiff's hardware watchdog becomes authoritative as soon as its PCI
     // devices have been discovered.  At this point only the bootstrap CPU is
     // online, so a temporary CPU0 feeder covers the rest of runtime bring-up.
@@ -369,6 +374,9 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     // operating-system/application entry point.
     #[cfg(feature = "kerndiff-fault-observer")]
     kerndiff_fault::handoff_to_percpu();
+
+    #[cfg(feature = "kerndiff-fault-observer")]
+    kerndiff_fault::inject_after_percpu_handoff();
 
     ax_app_entry();
 

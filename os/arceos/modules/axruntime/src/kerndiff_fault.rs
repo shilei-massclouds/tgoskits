@@ -19,6 +19,98 @@ const PHASE_PERCPU: u8 = 3;
 
 static PHASE: AtomicU8 = AtomicU8::new(PHASE_DISABLED);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ValidationFault {
+    ApplicationSigsegv,
+    ApplicationNoProgress,
+    KernelPanic,
+    KernelWatchdog,
+    PreWatchdogHang,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InjectionStage {
+    BeforeWatchdogArm,
+    AfterPerCpuHandoff,
+}
+
+fn configured_validation_fault() -> Option<ValidationFault> {
+    parse_validation_fault(option_env!("KERNDIFF_VALIDATION_FAULT"))
+}
+
+fn parse_validation_fault(value: Option<&str>) -> Option<ValidationFault> {
+    match value {
+        Some("application-sigsegv") => Some(ValidationFault::ApplicationSigsegv),
+        Some("application-no-progress") => Some(ValidationFault::ApplicationNoProgress),
+        Some("kernel-panic") => Some(ValidationFault::KernelPanic),
+        Some("kernel-watchdog") => Some(ValidationFault::KernelWatchdog),
+        Some("pre-watchdog-hang") => Some(ValidationFault::PreWatchdogHang),
+        _ => None,
+    }
+}
+
+fn injection_stage(fault: ValidationFault) -> Option<InjectionStage> {
+    match fault {
+        ValidationFault::KernelPanic | ValidationFault::KernelWatchdog => {
+            Some(InjectionStage::AfterPerCpuHandoff)
+        }
+        ValidationFault::PreWatchdogHang => Some(InjectionStage::BeforeWatchdogArm),
+        ValidationFault::ApplicationSigsegv | ValidationFault::ApplicationNoProgress => None,
+    }
+}
+
+/// Stops before the hardware watchdog is armed, leaving only the outer QEMU
+/// deadline able to terminate the validation run.
+pub(super) fn inject_before_watchdog_arm() {
+    let Some(fault) = configured_validation_fault() else {
+        return;
+    };
+    if injection_stage(fault) != Some(InjectionStage::BeforeWatchdogArm) {
+        return;
+    }
+    ax_println!(
+        "STARRY_KERNDIFF_VALIDATION_FAULT version=1 fault=pre-watchdog-hang \
+         phase=before-watchdog-arm"
+    );
+    ax_hal::asm::disable_irqs();
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Injects kernel faults only after the complete per-CPU watchdog handoff.
+pub(super) fn inject_after_percpu_handoff() {
+    let Some(fault) = configured_validation_fault() else {
+        return;
+    };
+    if injection_stage(fault) != Some(InjectionStage::AfterPerCpuHandoff) {
+        return;
+    }
+    match fault {
+        ValidationFault::KernelPanic => {
+            ax_println!(
+                "STARRY_KERNDIFF_VALIDATION_FAULT version=1 fault=kernel-panic \
+                 phase=after-percpu-handoff"
+            );
+            panic!("KernDiff validation kernel panic");
+        }
+        ValidationFault::KernelWatchdog => {
+            let stale = ax_driver::kerndiff_fault::force_stale_mask(1);
+            ax_println!(
+                "STARRY_KERNDIFF_VALIDATION_FAULT version=1 fault=kernel-watchdog \
+                 phase=after-percpu-handoff stale_mask={stale:#x}"
+            );
+            ax_hal::asm::disable_irqs();
+            loop {
+                core::hint::spin_loop();
+            }
+        }
+        ValidationFault::ApplicationSigsegv
+        | ValidationFault::ApplicationNoProgress
+        | ValidationFault::PreWatchdogHang => {}
+    }
+}
+
 /// Arms the hardware immediately after PCI probing and starts the CPU0 feeder.
 pub(super) fn start_bootstrap() {
     let boot_epoch = ax_hal::time::monotonic_time_nanos().max(1);
@@ -136,5 +228,61 @@ fn coordinator_loop() {
         if stale != 0 {
             warn!("KernDiff watchdog stopped feeding: stale CPU mask={stale:#x}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_every_persisted_validation_fault() {
+        assert_eq!(
+            parse_validation_fault(Some("application-sigsegv")),
+            Some(ValidationFault::ApplicationSigsegv)
+        );
+        assert_eq!(
+            parse_validation_fault(Some("application-no-progress")),
+            Some(ValidationFault::ApplicationNoProgress)
+        );
+        assert_eq!(
+            parse_validation_fault(Some("kernel-panic")),
+            Some(ValidationFault::KernelPanic)
+        );
+        assert_eq!(
+            parse_validation_fault(Some("kernel-watchdog")),
+            Some(ValidationFault::KernelWatchdog)
+        );
+        assert_eq!(
+            parse_validation_fault(Some("pre-watchdog-hang")),
+            Some(ValidationFault::PreWatchdogHang)
+        );
+        assert_eq!(parse_validation_fault(Some("unknown")), None);
+    }
+
+    #[test]
+    fn selects_only_kernel_injection_stages() {
+        assert_eq!(
+            injection_stage(ValidationFault::PreWatchdogHang),
+            Some(InjectionStage::BeforeWatchdogArm)
+        );
+        assert_eq!(
+            injection_stage(ValidationFault::KernelPanic),
+            Some(InjectionStage::AfterPerCpuHandoff)
+        );
+        assert_eq!(
+            injection_stage(ValidationFault::KernelWatchdog),
+            Some(InjectionStage::AfterPerCpuHandoff)
+        );
+        assert_eq!(injection_stage(ValidationFault::ApplicationSigsegv), None);
+        assert_eq!(
+            injection_stage(ValidationFault::ApplicationNoProgress),
+            None
+        );
+    }
+
+    #[test]
+    fn normal_build_has_no_validation_injection() {
+        assert_eq!(configured_validation_fault(), None);
     }
 }
