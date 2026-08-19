@@ -10,6 +10,8 @@ use core::{
     time::Duration,
 };
 
+use crate::KernDiffBootPhase;
+
 const PERIOD: Duration = Duration::from_secs(5);
 const MAX_CPUS: usize = 64;
 const PHASE_DISABLED: u8 = 0;
@@ -119,6 +121,7 @@ pub(super) fn start_bootstrap() {
         return;
     }
     PHASE.store(PHASE_BOOTSTRAP, Ordering::Release);
+    publish_boot_phase(KernDiffBootPhase::WatchdogArmed);
     let diagnostic_page = ax_driver::kerndiff_fault::diagnostic_page_physical_address();
     ax_println!(
         "STARRY_KERNEL_WATCHDOG version=1 state=armed timeout_seconds={} online_mask={:#x} \
@@ -133,6 +136,30 @@ pub(super) fn start_bootstrap() {
         String::from("kerndiff-watchdog-bootstrap"),
         ax_task::default_task_stack_size(),
     );
+}
+
+pub(super) fn publish_boot_phase(phase: KernDiffBootPhase) {
+    let Some((sequence, elapsed_ns)) = ax_driver::kerndiff_fault::record_boot_phase(
+        phase as u32,
+        ax_hal::time::monotonic_time_nanos(),
+    ) else {
+        warn!("KernDiff boot phase rejected: {}", phase.as_str());
+        return;
+    };
+    ax_println!(
+        "STARRY_BOOT_STAGE version=2 sequence={} stage={} elapsed_ns={}",
+        sequence,
+        phase.as_str(),
+        elapsed_ns,
+    );
+    if matches!(
+        phase,
+        KernDiffBootPhase::KernelMain
+            | KernDiffBootPhase::UserspaceInit
+            | KernDiffBootPhase::ShellReady
+    ) {
+        ax_println!("STARRY_BOOT_STAGE version=1 stage={}", phase.as_str());
+    }
 }
 
 /// Switches from the early CPU0 feeder to the complete per-CPU policy.
@@ -178,6 +205,7 @@ pub(super) fn handoff_to_percpu() {
         ax_task::default_task_stack_size(),
     );
     PHASE.store(PHASE_PERCPU, Ordering::Release);
+    publish_boot_phase(KernDiffBootPhase::WatchdogHandoff);
     ax_println!(
         "STARRY_KERNEL_WATCHDOG_HANDOFF version=1 state=monitoring online_mask={:#x} \
          stale_seconds={}",

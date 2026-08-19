@@ -12,7 +12,7 @@ pub const CMDLINE: &[&str] = &["/bin/sh", "-c", include_str!("init.sh")];
 
 #[unsafe(no_mangle)]
 extern "C" fn main() {
-    ax_std::println!("STARRY_BOOT_STAGE version=1 stage=kernel-main");
+    ax_runtime::publish_kerndiff_boot_phase(ax_runtime::KernDiffBootPhase::KernelMain);
     let args = CMDLINE
         .iter()
         .copied()

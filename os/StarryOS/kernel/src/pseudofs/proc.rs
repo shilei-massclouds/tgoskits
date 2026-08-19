@@ -1912,6 +1912,25 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             }),
         ),
     );
+    // Test-only bridge from PID 1 to the kernel-owned boot diagnostic page.
+    #[cfg(feature = "kerndiff-fault-observer")]
+    root.add(
+        "starry-test-boot-phase",
+        SimpleFile::new_regular(
+            fs.clone(),
+            RwFile::new(|operation| match operation {
+                SimpleFileOperation::Read => Ok(Some(Vec::new())),
+                SimpleFileOperation::Write(data) if data.is_empty() => Ok(None),
+                SimpleFileOperation::Write(b"shell-ready") => {
+                    ax_runtime::publish_kerndiff_boot_phase(
+                        ax_runtime::KernDiffBootPhase::ShellReady,
+                    );
+                    Ok(None)
+                }
+                SimpleFileOperation::Write(_) => Err(VfsError::InvalidInput),
+            }),
+        ),
+    );
     // Timer-tick callbacks registered once on the boot CPU.
     // IRQ counting: increment the module-level IRQ_CNT on every tick.
     ax_task::register_timer_callback(|_| {

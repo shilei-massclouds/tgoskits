@@ -13,8 +13,14 @@ echo
 printf "Use \033[1m\033[3mapk\033[0m to install packages.\n"
 echo
 
-# Do your initialization here!
-printf '%s\n' 'STARRY_BOOT_STAGE version=1 stage=shell-ready'
+# Do your initialization here. The test-only procfs bridge updates the
+# watchdog diagnostic page before the runtime emits both v2 and v1 markers.
+if [ -w /proc/starry-test-boot-phase ] && \
+        printf '%s' 'shell-ready' > /proc/starry-test-boot-phase; then
+    :
+else
+    printf '%s\n' 'STARRY_BOOT_STAGE version=1 stage=shell-ready'
+fi
 
 if [ -f /usr/bin/starry-run-case-tests ]; then
     echo "STARRY_GROUPED_AUTORUN_INIT"

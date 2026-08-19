@@ -41,6 +41,7 @@ stack-guard-page = ["ipi", "multitask", "paging", "ax-task?/stack-guard-page"]
 stack-protector = []
 tls = ["ax-hal/tls", "ax-task?/tls"]
 kerndiff-fault-observer = [
+  "ipi",
   "irq",
   "multitask",
   "smp",

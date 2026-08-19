@@ -200,6 +200,7 @@ impl Starry {
     ) -> anyhow::Result<Vec<PreparedStarryQemuCase>> {
         let mut prepared = Vec::with_capacity(cases.len());
         let mut rootfs_paths = BTreeSet::new();
+        let frozen_rootfs = Self::frozen_rootfs_from_env()?;
         for starry_case in cases {
             let timing_stage = timing::TimingStage::new(
                 "starry-qemu",
@@ -227,13 +228,18 @@ impl Starry {
                 ],
             );
             Self::rewrite_qemu_case_managed_rootfs_paths(self.app.workspace_root(), &mut qemu)?;
-            let rootfs_path =
-                Self::qemu_case_rootfs_path(self.app.workspace_root(), &qemu, default_rootfs_path)?;
+            let rootfs_path = if let Some(path) = &frozen_rootfs {
+                path.clone()
+            } else {
+                Self::qemu_case_rootfs_path(self.app.workspace_root(), &qemu, default_rootfs_path)?
+            };
             rootfs_paths.insert(rootfs_path.clone());
-            rootfs_paths.extend(Self::qemu_case_managed_rootfs_paths(
-                self.app.workspace_root(),
-                &qemu,
-            )?);
+            if frozen_rootfs.is_none() {
+                rootfs_paths.extend(Self::qemu_case_managed_rootfs_paths(
+                    self.app.workspace_root(),
+                    &qemu,
+                )?);
+            }
             qemu_test::validate_grouped_qemu_commands(&qemu, &starry_case.case, "Starry")?;
             let requirements = Self::qemu_case_requirements(&qemu).with_context(|| {
                 format!(
@@ -274,6 +280,9 @@ impl Starry {
         rootfs_paths: &BTreeSet<PathBuf>,
     ) -> anyhow::Result<()> {
         for rootfs_path in rootfs_paths {
+            if Self::frozen_rootfs_from_env()?.as_ref() == Some(rootfs_path) {
+                continue;
+            }
             let rootfs_kind = if rootfs_path == default_rootfs_path {
                 "default"
             } else {
@@ -305,6 +314,44 @@ impl Starry {
             };
             timing_stage.finish();
             result?;
+        }
+        Ok(())
+    }
+
+    fn frozen_rootfs_from_env() -> anyhow::Result<Option<PathBuf>> {
+        let Some(encoded) = std::env::var_os("KERNDIFF_FROZEN_ROOTFS") else {
+            return Ok(None);
+        };
+        let path = PathBuf::from(encoded);
+        Self::validate_frozen_rootfs(
+            &path,
+            crate::support::qemu_fault::enabled(),
+            crate::support::qemu_fault::boot_probe_enabled(),
+        )?;
+        Ok(Some(path))
+    }
+
+    pub(super) fn validate_frozen_rootfs(
+        path: &Path,
+        qmp_faults: bool,
+        boot_probe: bool,
+    ) -> anyhow::Result<()> {
+        if !qmp_faults || !boot_probe {
+            bail!("KERNDIFF_FROZEN_ROOTFS requires KERNDIFF_QMP_FAULTS=1 and KERNDIFF_BOOT_PROBE=1")
+        }
+        if !path.is_absolute() {
+            bail!("KERNDIFF_FROZEN_ROOTFS must be an absolute path")
+        }
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("failed to inspect frozen rootfs {}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            bail!("KERNDIFF_FROZEN_ROOTFS must name a regular non-symlink file")
+        }
+        let canonical = path
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize frozen rootfs {}", path.display()))?;
+        if canonical != path {
+            bail!("KERNDIFF_FROZEN_ROOTFS may not contain symlinked path components")
         }
         Ok(())
     }

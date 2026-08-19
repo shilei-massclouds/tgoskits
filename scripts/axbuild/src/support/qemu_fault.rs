@@ -20,12 +20,31 @@ const QMP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const QMP_IO_POLL: Duration = Duration::from_millis(250);
 const DIAGNOSTIC_PAGE_BYTES: usize = 4096;
 const DIAGNOSTIC_MAGIC: u32 = 0x4b44_5744;
-const DIAGNOSTIC_VERSION: u32 = 1;
+const DIAGNOSTIC_VERSION_V1: u32 = 1;
+const DIAGNOSTIC_VERSION_V2: u32 = 2;
 const MAX_DIAGNOSTIC_CPUS: usize = 64;
+const V1_DIAGNOSTIC_BYTES: usize = 1576;
+const V2_DIAGNOSTIC_BYTES: usize = 1696;
+const BOOT_PHASE_NAMES: [&str; 12] = [
+    "watchdog-armed",
+    "filesystem-init-start",
+    "filesystem-init-ready",
+    "secondary-startup-start",
+    "secondary-startup-ready",
+    "all-cpus-initialized",
+    "ipi-ready",
+    "smp-filesystem-online",
+    "watchdog-handoff",
+    "kernel-main",
+    "userspace-init",
+    "shell-ready",
+];
 const WATCHDOG_MARKER_PREFIX: &str = "STARRY_KERNEL_WATCHDOG version=1 state=armed ";
+const GUEST_START_MARKER: &str = "KERNDIFF_GUEST_START version=1 ";
 const WATCHDOG_PMEMSAVE_REQUEST_ID: &str = "kerndiff-watchdog-pmemsave";
 static SOCKET_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static DIAGNOSTIC_PAGE_PA: AtomicU64 = AtomicU64::new(0);
+static GUEST_STARTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug)]
 pub(crate) struct QemuFaultPaths {
@@ -35,6 +54,7 @@ pub(crate) struct QemuFaultPaths {
 impl QemuFaultPaths {
     pub(crate) fn new(workspace: &Path) -> anyhow::Result<Self> {
         DIAGNOSTIC_PAGE_PA.store(0, Ordering::Release);
+        GUEST_STARTED.store(false, Ordering::Release);
         let root = workspace.join("tmp/axbuild/qmp");
         fs::create_dir_all(&root)?;
         let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -47,6 +67,9 @@ impl QemuFaultPaths {
 /// Observes one complete guest output line from the existing coverage tee.
 pub(crate) fn observe_guest_output_line(line: &str) {
     let normalized = line.trim_start_matches(['\u{1b}', '[']);
+    if normalized.contains(GUEST_START_MARKER) {
+        GUEST_STARTED.store(true, Ordering::Release);
+    }
     let Some(marker) = normalized.find(WATCHDOG_MARKER_PREFIX) else {
         return;
     };
@@ -69,6 +92,12 @@ pub(crate) fn observe_guest_output_line(line: &str) {
 
 pub(crate) fn enabled() -> bool {
     std::env::var("KERNDIFF_QMP_FAULTS")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "y" | "yes" | "true" | "on"))
+}
+
+pub(crate) fn boot_probe_enabled() -> bool {
+    std::env::var("KERNDIFF_BOOT_PROBE")
         .ok()
         .is_some_and(|value| matches!(value.as_str(), "1" | "y" | "yes" | "true" | "on"))
 }
@@ -175,8 +204,13 @@ fn capture_events(
 
     let mut events = Vec::new();
     while !stop.load(Ordering::Acquire) {
-        let value = match read_qmp_message(&mut reader, stop) {
-            Ok(value) => value,
+        if should_quit_boot_probe(boot_probe_enabled(), GUEST_STARTED.load(Ordering::Acquire)) {
+            write_qmp_command(&mut stream, "quit")?;
+            break;
+        }
+        let value = match read_qmp_message_once(&mut reader) {
+            Ok(Some(value)) => value,
+            Ok(None) => continue,
             Err(error) if is_disconnect(&error) => break,
             Err(error) => return Err(error),
         };
@@ -199,6 +233,10 @@ fn capture_events(
         }
     }
     Ok(events)
+}
+
+const fn should_quit_boot_probe(enabled: bool, guest_started: bool) -> bool {
+    enabled && guest_started
 }
 
 fn connect_qmp(socket: &Path, stop: &AtomicBool) -> anyhow::Result<UnixStream> {
@@ -247,6 +285,25 @@ fn read_qmp_message(
             }
             Err(error) => return Err(error.into()),
         }
+    }
+}
+
+fn read_qmp_message_once(
+    reader: &mut BufReader<UnixStream>,
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(0) => bail!("QMP socket closed"),
+        Ok(_) => serde_json::from_str(line.trim_end())
+            .context("QMP emitted invalid JSON")
+            .map(Some),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::WouldBlock
+                || error.kind() == std::io::ErrorKind::TimedOut =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -339,9 +396,15 @@ fn decode_diagnostic_page(encoded: &[u8]) -> anyhow::Result<serde_json::Value> {
     let version = read_u32(encoded, 4)?;
     let size = read_u32(encoded, 8)?;
     let max_cpus = usize::try_from(read_u32(encoded, 12)?).unwrap_or(usize::MAX);
+    let declared_size = usize::try_from(size).unwrap_or(usize::MAX);
+    let minimum_size = match version {
+        DIAGNOSTIC_VERSION_V1 => V1_DIAGNOSTIC_BYTES,
+        DIAGNOSTIC_VERSION_V2 => V2_DIAGNOSTIC_BYTES,
+        _ => usize::MAX,
+    };
     if magic != DIAGNOSTIC_MAGIC
-        || version != DIAGNOSTIC_VERSION
-        || usize::try_from(size).unwrap_or(usize::MAX) > DIAGNOSTIC_PAGE_BYTES
+        || declared_size < minimum_size
+        || declared_size > DIAGNOSTIC_PAGE_BYTES
         || max_cpus != MAX_DIAGNOSTIC_CPUS
     {
         bail!(
@@ -367,14 +430,70 @@ fn decode_diagnostic_page(encoded: &[u8]) -> anyhow::Result<serde_json::Value> {
             "last_progress_ns": read_u64(encoded, progress_offset + cpu * 8)?,
         }));
     }
-    Ok(serde_json::json!({
+    let mut diagnostic = serde_json::json!({
         "schema_name": "starry-kernel-watchdog-diagnostic",
         "schema_version": version,
         "boot_epoch": boot_epoch,
         "online_cpu_mask": format!("{online_mask:#x}"),
         "stuck_cpu_mask": format!("{stale_mask:#x}"),
         "cpus": cpus,
-    }))
+    });
+    if version == DIAGNOSTIC_VERSION_V2 {
+        let reached = read_u64(encoded, V1_DIAGNOSTIC_BYTES)?;
+        let last_phase = read_u32(encoded, V1_DIAGNOSTIC_BYTES + 8)?;
+        let sequence = read_u64(encoded, V1_DIAGNOSTIC_BYTES + 16)?;
+        validate_boot_phases(reached, last_phase, sequence)?;
+        let mut elapsed = serde_json::Map::new();
+        for (phase, name) in BOOT_PHASE_NAMES.iter().enumerate() {
+            if reached & (1u64 << phase) != 0 {
+                elapsed.insert(
+                    (*name).to_string(),
+                    read_u64(encoded, V1_DIAGNOSTIC_BYTES + 24 + phase * 8)?.into(),
+                );
+            }
+        }
+        let object = diagnostic
+            .as_object_mut()
+            .expect("diagnostic JSON must be an object");
+        object.insert(
+            "reached_phase_bitmap".to_string(),
+            format!("{reached:#x}").into(),
+        );
+        object.insert("phase_sequence".to_string(), sequence.into());
+        object.insert("phase_elapsed_ns".to_string(), elapsed.into());
+        object.insert(
+            "last_phase".to_string(),
+            if sequence == 0 {
+                serde_json::Value::Null
+            } else {
+                BOOT_PHASE_NAMES[last_phase as usize].into()
+            },
+        );
+    }
+    Ok(diagnostic)
+}
+
+fn validate_boot_phases(reached: u64, last_phase: u32, sequence: u64) -> anyhow::Result<()> {
+    if sequence > BOOT_PHASE_NAMES.len() as u64 {
+        bail!("watchdog diagnostic phase sequence is invalid: {sequence}")
+    }
+    let expected_bitmap = if sequence == 0 {
+        0
+    } else {
+        (1u64 << sequence) - 1
+    };
+    let expected_last = if sequence == 0 {
+        u32::MAX
+    } else {
+        u32::try_from(sequence - 1).unwrap()
+    };
+    if reached != expected_bitmap || last_phase != expected_last {
+        bail!(
+            "watchdog diagnostic phase prefix is invalid: bitmap={reached:#x} \
+             last_phase={last_phase} sequence={sequence}"
+        )
+    }
+    Ok(())
 }
 
 fn read_u32(encoded: &[u8], offset: usize) -> anyhow::Result<u32> {
@@ -488,7 +607,7 @@ mod tests {
 
         let mut page = vec![0u8; DIAGNOSTIC_PAGE_BYTES];
         page[0..4].copy_from_slice(&DIAGNOSTIC_MAGIC.to_le_bytes());
-        page[4..8].copy_from_slice(&DIAGNOSTIC_VERSION.to_le_bytes());
+        page[4..8].copy_from_slice(&DIAGNOSTIC_VERSION_V1.to_le_bytes());
         page[8..12].copy_from_slice(&(1576u32).to_le_bytes());
         page[12..16].copy_from_slice(&(64u32).to_le_bytes());
         page[16..24].copy_from_slice(&(99u64).to_le_bytes());
@@ -502,5 +621,45 @@ mod tests {
         assert_eq!(diagnostic["stuck_cpu_mask"], "0x4");
         assert_eq!(diagnostic["cpus"].as_array().unwrap().len(), 2);
         assert_eq!(diagnostic["cpus"][1]["scheduler_epoch"], 8);
+    }
+
+    #[test]
+    fn decodes_v2_phase_prefix_and_rejects_gaps() {
+        let mut page = vec![0u8; DIAGNOSTIC_PAGE_BYTES];
+        page[0..4].copy_from_slice(&DIAGNOSTIC_MAGIC.to_le_bytes());
+        page[4..8].copy_from_slice(&DIAGNOSTIC_VERSION_V2.to_le_bytes());
+        page[8..12].copy_from_slice(&(DIAGNOSTIC_PAGE_BYTES as u32).to_le_bytes());
+        page[12..16].copy_from_slice(&(MAX_DIAGNOSTIC_CPUS as u32).to_le_bytes());
+        page[V1_DIAGNOSTIC_BYTES..V1_DIAGNOSTIC_BYTES + 8]
+            .copy_from_slice(&(0b111u64).to_le_bytes());
+        page[V1_DIAGNOSTIC_BYTES + 8..V1_DIAGNOSTIC_BYTES + 12]
+            .copy_from_slice(&(2u32).to_le_bytes());
+        page[V1_DIAGNOSTIC_BYTES + 16..V1_DIAGNOSTIC_BYTES + 24]
+            .copy_from_slice(&(3u64).to_le_bytes());
+        page[V1_DIAGNOSTIC_BYTES + 24..V1_DIAGNOSTIC_BYTES + 32]
+            .copy_from_slice(&(10u64).to_le_bytes());
+        page[V1_DIAGNOSTIC_BYTES + 40..V1_DIAGNOSTIC_BYTES + 48]
+            .copy_from_slice(&(30u64).to_le_bytes());
+
+        let diagnostic = decode_diagnostic_page(&page).unwrap();
+        assert_eq!(diagnostic["schema_version"], 2);
+        assert_eq!(diagnostic["last_phase"], "filesystem-init-ready");
+        assert_eq!(diagnostic["phase_sequence"], 3);
+        assert_eq!(diagnostic["phase_elapsed_ns"]["watchdog-armed"], 10);
+        assert_eq!(diagnostic["phase_elapsed_ns"]["filesystem-init-ready"], 30);
+
+        page[V1_DIAGNOSTIC_BYTES..V1_DIAGNOSTIC_BYTES + 8]
+            .copy_from_slice(&(0b101u64).to_le_bytes());
+        assert!(decode_diagnostic_page(&page).is_err());
+    }
+
+    #[test]
+    fn guest_start_enables_only_an_explicit_boot_probe_quit() {
+        GUEST_STARTED.store(false, Ordering::Release);
+        observe_guest_output_line("KERNDIFF_GUEST_START version=1 run_id=sample");
+        assert!(GUEST_STARTED.load(Ordering::Acquire));
+        assert!(should_quit_boot_probe(true, true));
+        assert!(!should_quit_boot_probe(false, true));
+        assert!(!should_quit_boot_probe(true, false));
     }
 }

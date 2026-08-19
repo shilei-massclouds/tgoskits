@@ -60,7 +60,7 @@ pub fn init(args: &[String], envs: &[String]) {
 
     let (entry_vaddr, ustack_top, auxv) = load_user_app(&mut uspace, loc, &args[0], args, envs)
         .unwrap_or_else(|e| panic!("Failed to load user app: {}", e));
-    ax_println!("STARRY_BOOT_STAGE version=1 stage=userspace-init");
+    ax_runtime::publish_kerndiff_boot_phase(ax_runtime::KernDiffBootPhase::UserspaceInit);
 
     let uctx = UserContext::new(entry_vaddr.into(), ustack_top, 0);
     let mut task = new_user_task(&name, uctx, 0);

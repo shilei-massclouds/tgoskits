@@ -40,7 +40,8 @@ pub const DIAGNOSTIC_PAGE_BYTES: usize = 4096;
 const TIMER_TICKS: u32 = (WATCHDOG_TIMEOUT_SECONDS as u32) << 9;
 const MAX_CPUS: usize = 64;
 const DIAGNOSTIC_MAGIC: u32 = 0x4b44_5744;
-const DIAGNOSTIC_VERSION: u32 = 1;
+const DIAGNOSTIC_VERSION: u32 = 2;
+pub const BOOT_PHASE_COUNT: usize = 12;
 
 static WATCHDOG_MMIO: AtomicUsize = AtomicUsize::new(0);
 static WATCHDOG_CONFIG_ADDRESS: AtomicU32 = AtomicU32::new(0);
@@ -61,6 +62,11 @@ struct DiagnosticPage {
     scheduler_epoch: [AtomicU64; MAX_CPUS],
     irq_epoch: [AtomicU64; MAX_CPUS],
     last_progress_ns: [AtomicU64; MAX_CPUS],
+    reached_phase_bitmap: AtomicU64,
+    last_phase: AtomicU32,
+    reserved: u32,
+    phase_sequence: AtomicU64,
+    phase_elapsed_ns: [AtomicU64; BOOT_PHASE_COUNT],
 }
 
 impl DiagnosticPage {
@@ -76,6 +82,11 @@ impl DiagnosticPage {
             scheduler_epoch: [const { AtomicU64::new(0) }; MAX_CPUS],
             irq_epoch: [const { AtomicU64::new(0) }; MAX_CPUS],
             last_progress_ns: [const { AtomicU64::new(0) }; MAX_CPUS],
+            reached_phase_bitmap: AtomicU64::new(0),
+            last_phase: AtomicU32::new(u32::MAX),
+            reserved: 0,
+            phase_sequence: AtomicU64::new(0),
+            phase_elapsed_ns: [const { AtomicU64::new(0) }; BOOT_PHASE_COUNT],
         }
     }
 }
@@ -163,6 +174,12 @@ pub fn arm_watchdog(online_mask: u64, boot_epoch: u64) -> bool {
     DIAGNOSTIC.boot_epoch.store(boot_epoch, Ordering::Release);
     DIAGNOSTIC.online_mask.store(online_mask, Ordering::Release);
     DIAGNOSTIC.stale_mask.store(0, Ordering::Release);
+    DIAGNOSTIC.reached_phase_bitmap.store(0, Ordering::Release);
+    DIAGNOSTIC.last_phase.store(u32::MAX, Ordering::Release);
+    DIAGNOSTIC.phase_sequence.store(0, Ordering::Release);
+    for elapsed in &DIAGNOSTIC.phase_elapsed_ns {
+        elapsed.store(0, Ordering::Relaxed);
+    }
     FORCED_STALE_MASK.store(0, Ordering::Release);
     unsafe {
         apply_programming_sequence(base, &watchdog_programming_sequence());
@@ -172,6 +189,42 @@ pub fn arm_watchdog(online_mask: u64, boot_epoch: u64) -> bool {
     }
     WATCHDOG_ARMED.store(true, Ordering::Release);
     true
+}
+
+/// Records one stable early-boot phase before its serial marker is emitted.
+///
+/// The single boot CPU publishes the phases in exact numeric order.  A caller
+/// that duplicates or skips a phase gets no record and must not emit a marker.
+pub fn record_boot_phase(phase: u32, now_ns: u64) -> Option<(u64, u64)> {
+    record_boot_phase_in(
+        &DIAGNOSTIC,
+        WATCHDOG_ARMED.load(Ordering::Acquire),
+        phase,
+        now_ns,
+    )
+}
+
+fn record_boot_phase_in(
+    diagnostic: &DiagnosticPage,
+    watchdog_armed: bool,
+    phase: u32,
+    now_ns: u64,
+) -> Option<(u64, u64)> {
+    if !watchdog_armed
+        || usize::try_from(phase).ok()? >= BOOT_PHASE_COUNT
+        || diagnostic.phase_sequence.load(Ordering::Acquire) != u64::from(phase)
+    {
+        return None;
+    }
+    let elapsed_ns = now_ns.saturating_sub(diagnostic.boot_epoch.load(Ordering::Acquire));
+    diagnostic.phase_elapsed_ns[phase as usize].store(elapsed_ns, Ordering::Relaxed);
+    diagnostic
+        .reached_phase_bitmap
+        .fetch_or(1u64 << phase, Ordering::Release);
+    diagnostic.last_phase.store(phase, Ordering::Release);
+    let sequence = u64::from(phase) + 1;
+    diagnostic.phase_sequence.store(sequence, Ordering::Release);
+    Some((sequence, elapsed_ns))
 }
 
 /// Updates the diagnostic page for the completed SMP handoff.
@@ -485,7 +538,42 @@ mod tests {
     fn diagnostic_layout_fits_one_qmp_memsave_page() {
         assert!(size_of::<DiagnosticPage>() <= DIAGNOSTIC_PAGE_BYTES);
         assert_eq!(DIAGNOSTIC.magic, DIAGNOSTIC_MAGIC);
-        assert_eq!(DIAGNOSTIC.version, 1);
+        assert_eq!(DIAGNOSTIC.version, 2);
+        assert_eq!(size_of::<DiagnosticPage>(), 4096);
+        assert_eq!(
+            core::mem::offset_of!(DiagnosticPage, reached_phase_bitmap),
+            1576
+        );
+        assert_eq!(
+            core::mem::offset_of!(DiagnosticPage, phase_elapsed_ns),
+            1600
+        );
+    }
+
+    #[test]
+    fn boot_phase_records_are_ordered_and_published() {
+        let diagnostic = DiagnosticPage::new();
+        diagnostic.boot_epoch.store(100, Ordering::Release);
+
+        assert_eq!(record_boot_phase_in(&diagnostic, true, 1, 120), None);
+        assert_eq!(
+            record_boot_phase_in(&diagnostic, true, 0, 125),
+            Some((1, 25))
+        );
+        assert_eq!(record_boot_phase_in(&diagnostic, true, 0, 130), None);
+        assert_eq!(
+            record_boot_phase_in(&diagnostic, true, 1, 150),
+            Some((2, 50))
+        );
+        assert_eq!(
+            diagnostic.reached_phase_bitmap.load(Ordering::Acquire),
+            0b11
+        );
+        assert_eq!(diagnostic.last_phase.load(Ordering::Acquire), 1);
+        assert_eq!(diagnostic.phase_sequence.load(Ordering::Acquire), 2);
+        assert_eq!(diagnostic.phase_elapsed_ns[0].load(Ordering::Acquire), 25);
+        assert_eq!(diagnostic.phase_elapsed_ns[1].load(Ordering::Acquire), 50);
+        assert_eq!(record_boot_phase_in(&diagnostic, false, 2, 175), None);
     }
 
     #[test]

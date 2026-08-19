@@ -73,6 +73,74 @@ mod wifi_glue;
 
 pub use ax_hal as hal;
 
+/// Stable phases exported by the opt-in KernDiff early-boot observer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum KernDiffBootPhase {
+    WatchdogArmed       = 0,
+    FilesystemInitStart = 1,
+    FilesystemInitReady = 2,
+    SecondaryStartupStart = 3,
+    SecondaryStartupReady = 4,
+    AllCpusInitialized  = 5,
+    IpiReady            = 6,
+    SmpFilesystemOnline = 7,
+    WatchdogHandoff     = 8,
+    KernelMain          = 9,
+    UserspaceInit       = 10,
+    ShellReady          = 11,
+}
+
+impl KernDiffBootPhase {
+    pub const ALL: [Self; 12] = [
+        Self::WatchdogArmed,
+        Self::FilesystemInitStart,
+        Self::FilesystemInitReady,
+        Self::SecondaryStartupStart,
+        Self::SecondaryStartupReady,
+        Self::AllCpusInitialized,
+        Self::IpiReady,
+        Self::SmpFilesystemOnline,
+        Self::WatchdogHandoff,
+        Self::KernelMain,
+        Self::UserspaceInit,
+        Self::ShellReady,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::WatchdogArmed => "watchdog-armed",
+            Self::FilesystemInitStart => "filesystem-init-start",
+            Self::FilesystemInitReady => "filesystem-init-ready",
+            Self::SecondaryStartupStart => "secondary-startup-start",
+            Self::SecondaryStartupReady => "secondary-startup-ready",
+            Self::AllCpusInitialized => "all-cpus-initialized",
+            Self::IpiReady => "ipi-ready",
+            Self::SmpFilesystemOnline => "smp-filesystem-online",
+            Self::WatchdogHandoff => "watchdog-handoff",
+            Self::KernelMain => "kernel-main",
+            Self::UserspaceInit => "userspace-init",
+            Self::ShellReady => "shell-ready",
+        }
+    }
+}
+
+/// Records the phase in the diagnostic page, then emits its serial marker.
+pub fn publish_kerndiff_boot_phase(phase: KernDiffBootPhase) {
+    #[cfg(feature = "kerndiff-fault-observer")]
+    kerndiff_fault::publish_boot_phase(phase);
+
+    #[cfg(not(feature = "kerndiff-fault-observer"))]
+    if matches!(
+        phase,
+        KernDiffBootPhase::KernelMain
+            | KernDiffBootPhase::UserspaceInit
+            | KernDiffBootPhase::ShellReady
+    ) {
+        ax_println!("STARRY_BOOT_STAGE version=1 stage={}", phase.as_str());
+    }
+}
+
 pub(crate) mod build_info {
     include!(concat!(env!("OUT_DIR"), "/build_info.rs"));
 }
@@ -331,7 +399,11 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
         chrono::DateTime::from_timestamp_nanos(ax_hal::time::wall_time_nanos() as _),
     );
 
+    #[cfg(feature = "kerndiff-fault-observer")]
+    kerndiff_fault::publish_boot_phase(KernDiffBootPhase::FilesystemInitStart);
     fs::init(ax_hal::boot::bootargs());
+    #[cfg(feature = "kerndiff-fault-observer")]
+    kerndiff_fault::publish_boot_phase(KernDiffBootPhase::FilesystemInitReady);
 
     #[cfg(feature = "display")]
     devices::init_display();
@@ -346,7 +418,13 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     devices::init_vsock();
 
     #[cfg(feature = "smp")]
-    self::mp::start_secondary_cpus(cpu_id);
+    {
+        #[cfg(feature = "kerndiff-fault-observer")]
+        kerndiff_fault::publish_boot_phase(KernDiffBootPhase::SecondaryStartupStart);
+        self::mp::start_secondary_cpus(cpu_id);
+        #[cfg(feature = "kerndiff-fault-observer")]
+        kerndiff_fault::publish_boot_phase(KernDiffBootPhase::SecondaryStartupReady);
+    }
 
     #[cfg(all(feature = "tls", not(feature = "multitask")))]
     {
@@ -362,12 +440,22 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     while !is_init_ok() {
         core::hint::spin_loop();
     }
+    #[cfg(feature = "kerndiff-fault-observer")]
+    kerndiff_fault::publish_boot_phase(KernDiffBootPhase::AllCpusInitialized);
 
     #[cfg(all(feature = "irq", feature = "ipi"))]
-    ax_ipi::wait_for_all_cpus_ready();
+    {
+        ax_ipi::wait_for_all_cpus_ready();
+        #[cfg(feature = "kerndiff-fault-observer")]
+        kerndiff_fault::publish_boot_phase(KernDiffBootPhase::IpiReady);
+    }
 
     #[cfg(all(feature = "smp", feature = "ipi"))]
-    fs::online_smp();
+    {
+        fs::online_smp();
+        #[cfg(feature = "kerndiff-fault-observer")]
+        kerndiff_fault::publish_boot_phase(KernDiffBootPhase::SmpFilesystemOnline);
+    }
 
     // All CPUs and SMP filesystem state are now online.  Replace the bootstrap
     // feeder with the full pinned per-CPU liveness policy before entering the

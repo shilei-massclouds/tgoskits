@@ -202,6 +202,19 @@ fn qemu_case_rootfs_defaults_without_drive_file_arg() {
 }
 
 #[test]
+fn frozen_rootfs_requires_probe_profile_and_exact_regular_path() {
+    let root = tempdir().unwrap();
+    let image = root.path().join("frozen.img");
+    fs::write(&image, b"rootfs").unwrap();
+
+    assert!(Starry::validate_frozen_rootfs(&image, true, true).is_ok());
+    assert!(Starry::validate_frozen_rootfs(&image, false, true).is_err());
+    assert!(Starry::validate_frozen_rootfs(&image, true, false).is_err());
+    assert!(Starry::validate_frozen_rootfs(Path::new("relative.img"), true, true).is_err());
+    assert!(Starry::validate_frozen_rootfs(root.path(), true, true).is_err());
+}
+
+#[test]
 fn qemu_cases_are_grouped_by_build_config() {
     let default_build_config = PathBuf::from("/tmp/default/build-x86_64-unknown-none.toml");
     let qemu_build_config = PathBuf::from("/tmp/qemu/build-x86_64-unknown-none.toml");
