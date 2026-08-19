@@ -329,6 +329,16 @@ Important details:
 
 ## QEMU Debugging Patterns
 
+For the opt-in Starry KernDiff profile, use the ordered
+`STARRY_BOOT_STAGE version=2` protocol instead of adding temporary prints. Its
+stable order is watchdog armed, filesystem init start/ready, secondary startup
+start/ready, all CPUs initialized, IPI ready, SMP filesystem online, watchdog
+handoff, kernel main, userspace init, and shell ready. The i6300ESB diagnostic
+page records each phase before its serial marker. A pre-guest-start hang is
+authoritative only when the armed marker and matching QMP `WATCHDOG`
+`action=pause` are both present; a missing or corrupt diagnostic payload does
+not cancel that event. See `book/design/starry-early-boot-progress-v1.md`.
+
 - Add `-S -s` to stop at reset and attach GDB when the failure is before the first reliable print.
 - Add `-d int,cpu_reset,guest_errors` to capture traps, resets, and invalid guest accesses.
 - Use short serial markers for phase isolation. Example phases: `E` for UEFI entry, `M` for memory map, `X` before exit boot services, `x` after exit, `P` before paging, `p` after paging, `T` after trap vectors, `S` before secondary release.

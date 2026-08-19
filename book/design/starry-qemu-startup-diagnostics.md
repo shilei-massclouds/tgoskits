@@ -42,6 +42,10 @@ change case selection, timeout, success regex, or guest execution.
 
 ## Guest boot stages
 
+The three v1 markers below remain compatibility aliases. The expanded,
+diagnostic-page-backed v2 protocol is defined by
+[Starry early boot progress and watchdog diagnostics v1](starry-early-boot-progress-v1.md).
+
 Starry emits three ordered raw-console lines:
 
 1. `kernel-main` at the Starry binary entry before calling the kernel init path;
