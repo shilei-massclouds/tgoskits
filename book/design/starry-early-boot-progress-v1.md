@@ -147,6 +147,8 @@ asset-preparation case was deliberately stopped for operator handoff.
 No QEMU process was started for this validation. The operator acceptance is the
 controlled KernDiff Phase 2.14 `kernel-watchdog` run documented in the matching
 KernDiff validation record. That run invokes this exact Starry QEMU profile and
-must prove both sides of the boundary: the injected boot stops after the armed
-marker with a QMP WATCHDOG pause and no guest-start marker, while two clean
-follow-up boots publish all twelve v2 phases and then `KERNDIFF_GUEST_START`.
+must prove the injected boot stops after the armed marker with a QMP WATCHDOG
+pause and no guest-start marker. Its two frozen-ELF follow-up executions inherit
+the compile-time validation fault and must reproduce that observation. A
+separate fault-free run proves the other side of the boundary by publishing all
+twelve v2 phases and then `KERNDIFF_GUEST_START`.
