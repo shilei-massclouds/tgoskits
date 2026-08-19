@@ -1,6 +1,6 @@
 # Starry early boot progress and watchdog diagnostics v1
 
-Status: approved for implementation, 2026-08-19.
+Status: implemented; operator QEMU acceptance pending, 2026-08-19.
 
 The consumer contract is
 [KernDiff phase 2.14 early boot historical statistical diff v1](https://github.com/shilei-massclouds/KernDiff/blob/dev/docs/design/early-boot-historical-diff-v1.md).
@@ -134,3 +134,19 @@ axruntime, Starry kernel, and axbuild tests plus fmt/clippy are required. The
 `qemu/kerndiff` integration run must observe all v2 phases in order, then
 `KERNDIFF_GUEST_START`; the existing `kernel-watchdog` validation fault must
 stop before guest start and still produce armed + QMP WATCHDOG evidence.
+
+The non-QEMU implementation gate passed on 2026-08-19: workspace formatting,
+7 ax-driver observer tests, 6 axbuild QMP diagnostic tests, the ax-runtime
+observer check, a release Starry x86_64 KernDiff-profile build, and focused
+clippy with warnings denied for axbuild, ax-driver, and ax-runtime. Ax-runtime
+clippy used `--no-deps` because dependency-inclusive clippy reaches an unrelated
+pre-existing needless-return warning in `ax-task/src/run_queue.rs`. A full
+axbuild library run completed 876 tests before the remaining QEMU
+asset-preparation case was deliberately stopped for operator handoff.
+
+No QEMU process was started for this validation. The operator acceptance is the
+controlled KernDiff Phase 2.14 `kernel-watchdog` run documented in the matching
+KernDiff validation record. That run invokes this exact Starry QEMU profile and
+must prove both sides of the boundary: the injected boot stops after the armed
+marker with a QMP WATCHDOG pause and no guest-start marker, while two clean
+follow-up boots publish all twelve v2 phases and then `KERNDIFF_GUEST_START`.
