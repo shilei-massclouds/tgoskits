@@ -1,6 +1,6 @@
 # Starry early boot progress and watchdog diagnostics v1
 
-Status: implemented; operator QEMU acceptance pending, 2026-08-19.
+Status: complete, 2026-08-19.
 
 The consumer contract is
 [KernDiff phase 2.14 early boot historical statistical diff v1](https://github.com/shilei-massclouds/KernDiff/blob/dev/docs/design/early-boot-historical-diff-v1.md).
@@ -152,11 +152,13 @@ pre-existing needless-return warning in `ax-task/src/run_queue.rs`. A full
 axbuild library run completed 876 tests before the remaining QEMU
 asset-preparation case was deliberately stopped for operator handoff.
 
-No QEMU process was started for this validation. The operator acceptance is the
-controlled KernDiff Phase 2.14 `kernel-watchdog` run documented in the matching
-KernDiff validation record. That run invokes this exact Starry QEMU profile and
-must prove the injected boot stops after the armed marker with a QMP WATCHDOG
-pause and no guest-start marker. Its two frozen-ELF follow-up executions inherit
-the compile-time validation fault and must reproduce that observation. A
-separate fault-free run proves the other side of the boundary by publishing all
-twelve v2 phases and then `KERNDIFF_GUEST_START`.
+No QEMU process was started for the non-QEMU validation. Operator-controlled
+KernDiff Phase 2.14 acceptance then passed against this exact Starry QEMU
+profile. The injected `kernel-watchdog` trigger and both frozen-ELF follow-up
+boots stopped after `watchdog-handoff` with an armed marker, matching QMP
+WATCHDOG pause, and no guest-start marker. The resulting strict cohort contained
+three hangs and exactly two additional executions. A fault-free run published
+all twelve v2 phases in order and then `KERNDIFF_GUEST_START`. Finally, the same
+fault with early-boot history disabled started exactly one execution and
+published no cohort. Exact commands, cohort identity, statistics, and storage
+checks are recorded in the matching KernDiff validation record.
