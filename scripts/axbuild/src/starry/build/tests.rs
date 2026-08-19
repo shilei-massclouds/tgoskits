@@ -784,6 +784,61 @@ fn pinned_kallsyms_rejects_changed_executable_sections() {
 }
 
 #[test]
+fn frozen_boot_elf_requires_the_pinned_qmp_probe_boundary() {
+    let source = Path::new("/frozen/starryos");
+
+    validate_frozen_boot_elf_request(source, Some(source), true, true).unwrap();
+    assert!(
+        validate_frozen_boot_elf_request(source, Some(source), false, true)
+            .unwrap_err()
+            .to_string()
+            .contains("KERNDIFF_QMP_FAULTS")
+    );
+    assert!(
+        validate_frozen_boot_elf_request(source, Some(source), true, false)
+            .unwrap_err()
+            .to_string()
+            .contains("KERNDIFF_BOOT_PROBE")
+    );
+    assert!(
+        validate_frozen_boot_elf_request(
+            source,
+            Some(Path::new("/different/starryos")),
+            true,
+            true,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("must match")
+    );
+    assert!(
+        validate_frozen_boot_elf_request(
+            Path::new("relative/starryos"),
+            Some(Path::new("relative/starryos")),
+            true,
+            true,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("absolute")
+    );
+}
+
+#[test]
+fn frozen_boot_elf_restore_is_byte_exact() {
+    let root = tempdir().unwrap();
+    let active = root.path().join("active");
+    let frozen = root.path().join("frozen");
+    fs::write(&active, b"rebuilt").unwrap();
+    fs::write(&frozen, b"frozen-elf").unwrap();
+
+    restore_exact_elf(&active, &frozen).unwrap();
+
+    assert_eq!(fs::read(&active).unwrap(), b"frozen-elf");
+    assert_eq!(fs::read(&frozen).unwrap(), b"frozen-elf");
+}
+
+#[test]
 fn riscv_image_header_accepts_compact_entry_and_fixed_offsets() {
     let image = riscv_image_fixture(0x0032_2297, 0x4982_8067);
 

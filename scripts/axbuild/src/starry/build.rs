@@ -21,6 +21,7 @@ use crate::{
 };
 
 const STARRY_KALLSYMS_SOURCE_ELF_ENV: &str = "AXBUILD_STARRY_KALLSYMS_SOURCE_ELF";
+const STARRY_FROZEN_BOOT_ELF_ENV: &str = "AXBUILD_STARRY_FROZEN_BOOT_ELF";
 
 pub(crate) fn default_starry_build_info() -> StarryBuildInfo {
     // The package and board configuration own feature selection; a generated
@@ -175,6 +176,7 @@ pub(crate) fn postprocess_starry_artifact(
 ) -> anyhow::Result<()> {
     let elf = build_output.elf_path();
     println!("[axbuild] starry artifact elf={}", elf.display());
+    restore_frozen_boot_elf(elf)?;
     generate_kallsyms(elf)?;
     refresh_bin_if_present(elf)?;
 
@@ -189,6 +191,77 @@ pub(crate) fn postprocess_starry_artifact(
 
     validate_riscv_image_artifact(&request.arch, elf)?;
 
+    Ok(())
+}
+
+fn restore_frozen_boot_elf(kernel_elf: &Path) -> anyhow::Result<()> {
+    let Some(source) = env::var_os(STARRY_FROZEN_BOOT_ELF_ENV).map(PathBuf::from) else {
+        return Ok(());
+    };
+    let pinned = env::var_os(STARRY_KALLSYMS_SOURCE_ELF_ENV).map(PathBuf::from);
+    validate_frozen_boot_elf_request(
+        &source,
+        pinned.as_deref(),
+        crate::support::qemu_fault::enabled(),
+        crate::support::qemu_fault::boot_probe_enabled(),
+    )?;
+    restore_exact_elf(kernel_elf, &source)?;
+    println!(
+        "[axbuild] starry frozen boot elf restored source={}",
+        source.display()
+    );
+    Ok(())
+}
+
+fn validate_frozen_boot_elf_request(
+    source: &Path,
+    pinned: Option<&Path>,
+    qmp_faults: bool,
+    boot_probe: bool,
+) -> anyhow::Result<()> {
+    if !qmp_faults || !boot_probe {
+        bail!(
+            "{STARRY_FROZEN_BOOT_ELF_ENV} requires KERNDIFF_QMP_FAULTS=1 and KERNDIFF_BOOT_PROBE=1"
+        );
+    }
+    if !source.is_absolute() {
+        bail!("{STARRY_FROZEN_BOOT_ELF_ENV} must name an absolute ELF path");
+    }
+    if pinned != Some(source) {
+        bail!("{STARRY_FROZEN_BOOT_ELF_ENV} must match {STARRY_KALLSYMS_SOURCE_ELF_ENV}");
+    }
+    Ok(())
+}
+
+fn restore_exact_elf(kernel_elf: &Path, source: &Path) -> anyhow::Result<()> {
+    let source_metadata = fs::symlink_metadata(source)
+        .with_context(|| format!("failed to inspect frozen ELF {}", source.display()))?;
+    if source_metadata.file_type().is_symlink() || !source_metadata.is_file() {
+        bail!(
+            "frozen Starry ELF is not a regular file: {}",
+            source.display()
+        );
+    }
+    let active_metadata = fs::symlink_metadata(kernel_elf)
+        .with_context(|| format!("failed to inspect active ELF {}", kernel_elf.display()))?;
+    if active_metadata.file_type().is_symlink() || !active_metadata.is_file() {
+        bail!(
+            "active Starry ELF is not a regular file: {}",
+            kernel_elf.display()
+        );
+    }
+    if source == kernel_elf {
+        bail!("frozen and active Starry ELF paths must differ");
+    }
+    let frozen = fs::read(source)
+        .with_context(|| format!("failed to read frozen ELF {}", source.display()))?;
+    fs::write(kernel_elf, &frozen)
+        .with_context(|| format!("failed to restore active ELF {}", kernel_elf.display()))?;
+    let restored = fs::read(kernel_elf)
+        .with_context(|| format!("failed to verify restored ELF {}", kernel_elf.display()))?;
+    if restored != frozen {
+        bail!("failed to restore the byte-identical frozen Starry ELF");
+    }
     Ok(())
 }
 

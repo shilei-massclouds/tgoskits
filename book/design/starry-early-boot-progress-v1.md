@@ -104,6 +104,14 @@ opt-in environment inputs supplied by the Target Driver:
 - boot-probe mode, which asks the QMP capture to quit cleanly after the matching
   `KERNDIFF_GUEST_START` line.
 
+Boot-probe mode restores the validated frozen ELF byte-for-byte after Cargo's
+build boundary and before kallsyms/bin generation. This is distinct from normal
+pinned replay: ordinary replay continues to reject executable or coverage
+section drift, while a boot cohort must execute the original frozen artifact
+even when a repeated instrumented link is not byte-reproducible. The restore is
+accepted only when QMP fault capture and boot-probe mode are both explicit and
+the frozen path exactly matches the existing pinned-kallsyms source boundary.
+
 The existing per-run rootfs copy plus disk snapshot semantics remain in force.
 The Target Driver supplies a frozen OVMF directory through the existing
 `TGOS_OVMF_DIR` boundary and a pinned target ELF through the existing kallsyms
