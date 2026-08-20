@@ -1,6 +1,6 @@
 # Starry post-spawn bootstrap diagnostics v4
 
-Status: implemented; operator QEMU acceptance pending, 2026-08-20.
+Status: accepted, 2026-08-20.
 
 This compatibly extends
 [Starry bootstrap feeder diagnostics v3](starry-bootstrap-feeder-diagnostics-v3.md).
@@ -123,8 +123,13 @@ Lowest-layer tests cover the v4 offsets and page size, independent concurrent
 chains, dependency rejection, reset, v1/v2/v3 compatibility, valid v4 JSON, and
 damaged v4 rejection. Targeted ax-driver, axruntime, axbuild, and Starry kernel
 build checks, rustfmt, warnings-as-errors clippy, and a non-QEMU release Starry
-build form the implementation gate. Operator QEMU acceptance should observe both
-bitmaps as `0x3f`, all twelve boot phases, and `KERNDIFF_GUEST_START`.
+build form the implementation gate. Operator QEMU acceptance on TGOSKits commit
+`e01b2772cd2ad265cab835d722599544a19a39c1` completed in two runs. The normal
+boot reached all twelve boot phases and `KERNDIFF_GUEST_START`. A deliberate
+kernel-watchdog injection then produced a complete v4 QMP diagnostic with both
+checkpoint bitmaps equal to `0x3f`, all twelve elapsed fields present, and no
+decode error. The injected `early-boot-hang` and exit status 2 are the expected
+fault classification rather than a natural defect occurrence.
 
 Rollback may restore the v3 writer while current axbuild continues to decode
 versions 1 through 3. Older axbuild rejects v4 diagnostics but preserves the raw
