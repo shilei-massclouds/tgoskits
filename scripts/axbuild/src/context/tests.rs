@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn boot_probe_precedes_coverage_and_uses_an_independent_success_contract() {
+fn boot_probe_precedes_coverage_and_installs_the_guest_start_stop_contract() {
     assert_eq!(
         resolve_qemu_run_contract(true, true, true).unwrap(),
         QemuRunContract::BootProbe
@@ -15,7 +15,7 @@ fn boot_probe_precedes_coverage_and_uses_an_independent_success_contract() {
     };
     let host_success = apply_boot_probe_success_contract(&mut qemu);
 
-    assert!(qemu.success_regex.is_empty());
+    assert_eq!(qemu.success_regex, host_success);
     assert_eq!(qemu.fail_regex, failures);
     assert_eq!(
         host_success,

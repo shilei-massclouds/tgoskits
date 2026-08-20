@@ -546,10 +546,12 @@ fn resolve_qemu_run_contract(
 }
 
 fn apply_boot_probe_success_contract(qemu: &mut QemuConfig) -> [String; 1] {
-    // QMP owns the clean stop after observing guest start. The host matcher
-    // independently proves that the stop crossed the boot-domain boundary.
-    qemu.success_regex.clear();
-    [crate::support::qemu_fault::BOOT_PROBE_SUCCESS_REGEX.to_string()]
+    let success_regex = [crate::support::qemu_fault::BOOT_PROBE_SUCCESS_REGEX.to_string()];
+    // The runner observes QEMU's child stream directly and guarantees a stop.
+    // The output tee independently verifies the same marker and gives QMP the
+    // drain window in which to issue a clean quit.
+    qemu.success_regex = success_regex.to_vec();
+    success_regex
 }
 
 pub(crate) fn board_run_request(

@@ -114,10 +114,14 @@ the frozen path exactly matches the existing pinned-kallsyms source boundary.
 
 The frozen ELF remains coverage-instrumented, but boot-probe execution has an
 independent host success contract: the complete line must match
-`KERNDIFF_GUEST_START version=1 run_id=[0-9a-f]+`. Axbuild observes that marker
-through the general streaming QEMU-output capture, including when it spans host
-output chunks, and notifies QMP to issue the clean `quit`. In this mode axbuild
-does not install the axtest coverage monitor, export profraw, wait for
+`KERNDIFF_GUEST_START version=1 run_id=[0-9a-f]+`. Axbuild installs that exact
+marker as the QEMU runner's direct child-stream stop contract. The general
+streaming QEMU-output capture independently verifies it, including when it
+spans host output chunks, and notifies QMP to issue the clean `quit` during the
+runner's output-drain window. The direct runner contract prevents a valid
+guest-start from falling through to the case timeout if an indirect host tee
+cannot drive termination. In this mode axbuild does not install the axtest
+coverage monitor, export profraw, wait for
 `AXTEST_COVERAGE_DONE`, or require a fresh profile at completion. A stop before
 the exact guest-start marker remains a failure, and QEMU startup, timeout,
 WATCHDOG, pvpanic, and other real errors retain their existing precedence.
