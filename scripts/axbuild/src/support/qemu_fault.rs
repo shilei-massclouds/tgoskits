@@ -23,9 +23,11 @@ const DIAGNOSTIC_PAGE_BYTES: usize = 4096;
 const DIAGNOSTIC_MAGIC: u32 = 0x4b44_5744;
 const DIAGNOSTIC_VERSION_V1: u32 = 1;
 const DIAGNOSTIC_VERSION_V2: u32 = 2;
+const DIAGNOSTIC_VERSION_V3: u32 = 3;
 const MAX_DIAGNOSTIC_CPUS: usize = 64;
 const V1_DIAGNOSTIC_BYTES: usize = 1576;
 const V2_DIAGNOSTIC_BYTES: usize = 1696;
+const V3_DIAGNOSTIC_BYTES: usize = 1752;
 const BOOT_PHASE_NAMES: [&str; 12] = [
     "watchdog-armed",
     "filesystem-init-start",
@@ -40,6 +42,16 @@ const BOOT_PHASE_NAMES: [&str; 12] = [
     "userspace-init",
     "shell-ready",
 ];
+const BOOTSTRAP_CHECKPOINT_NAMES: [&str; 6] = [
+    "feeder-spawn-requested",
+    "feeder-task-initialized",
+    "feeder-spawn-returned",
+    "feeder-entered",
+    "feeder-affinity-ready",
+    "feeder-first-poll-complete",
+];
+const BOOTSTRAP_CHECKPOINT_REQUIRED_BITMAPS: [u64; 6] =
+    [0, 0b00_0001, 0b00_0011, 0b00_0011, 0b00_1011, 0b01_1011];
 const WATCHDOG_MARKER_PREFIX: &str = "STARRY_KERNEL_WATCHDOG version=1 state=armed ";
 const GUEST_START_MARKER_PREFIX: &str = "KERNDIFF_GUEST_START version=1 run_id=";
 pub(crate) const BOOT_PROBE_SUCCESS_REGEX: &str =
@@ -443,6 +455,7 @@ fn decode_diagnostic_page(encoded: &[u8]) -> anyhow::Result<serde_json::Value> {
     let minimum_size = match version {
         DIAGNOSTIC_VERSION_V1 => V1_DIAGNOSTIC_BYTES,
         DIAGNOSTIC_VERSION_V2 => V2_DIAGNOSTIC_BYTES,
+        DIAGNOSTIC_VERSION_V3 => V3_DIAGNOSTIC_BYTES,
         _ => usize::MAX,
     };
     if magic != DIAGNOSTIC_MAGIC
@@ -481,7 +494,7 @@ fn decode_diagnostic_page(encoded: &[u8]) -> anyhow::Result<serde_json::Value> {
         "stuck_cpu_mask": format!("{stale_mask:#x}"),
         "cpus": cpus,
     });
-    if version == DIAGNOSTIC_VERSION_V2 {
+    if matches!(version, DIAGNOSTIC_VERSION_V2 | DIAGNOSTIC_VERSION_V3) {
         let reached = read_u64(encoded, V1_DIAGNOSTIC_BYTES)?;
         let last_phase = read_u32(encoded, V1_DIAGNOSTIC_BYTES + 8)?;
         let sequence = read_u64(encoded, V1_DIAGNOSTIC_BYTES + 16)?;
@@ -513,6 +526,30 @@ fn decode_diagnostic_page(encoded: &[u8]) -> anyhow::Result<serde_json::Value> {
             },
         );
     }
+    if version == DIAGNOSTIC_VERSION_V3 {
+        let reached = read_u64(encoded, V2_DIAGNOSTIC_BYTES)?;
+        validate_bootstrap_checkpoints(reached)?;
+        let mut elapsed = serde_json::Map::new();
+        for (checkpoint, name) in BOOTSTRAP_CHECKPOINT_NAMES.iter().enumerate() {
+            if reached & (1u64 << checkpoint) != 0 {
+                elapsed.insert(
+                    (*name).to_string(),
+                    read_u64(encoded, V2_DIAGNOSTIC_BYTES + 8 + checkpoint * 8)?.into(),
+                );
+            }
+        }
+        let object = diagnostic
+            .as_object_mut()
+            .expect("diagnostic JSON must be an object");
+        object.insert(
+            "bootstrap_checkpoint_bitmap".to_string(),
+            format!("{reached:#x}").into(),
+        );
+        object.insert(
+            "bootstrap_checkpoint_elapsed_ns".to_string(),
+            elapsed.into(),
+        );
+    }
     Ok(diagnostic)
 }
 
@@ -535,6 +572,28 @@ fn validate_boot_phases(reached: u64, last_phase: u32, sequence: u64) -> anyhow:
             "watchdog diagnostic phase prefix is invalid: bitmap={reached:#x} \
              last_phase={last_phase} sequence={sequence}"
         )
+    }
+    Ok(())
+}
+
+fn validate_bootstrap_checkpoints(reached: u64) -> anyhow::Result<()> {
+    let valid_bitmap = (1u64 << BOOTSTRAP_CHECKPOINT_NAMES.len()) - 1;
+    if reached & !valid_bitmap != 0 {
+        bail!("watchdog diagnostic bootstrap checkpoint bitmap is invalid: {reached:#x}")
+    }
+    for (checkpoint, required) in BOOTSTRAP_CHECKPOINT_REQUIRED_BITMAPS
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        let bit = 1u64 << checkpoint;
+        if reached & bit != 0 && reached & required != required {
+            bail!(
+                "watchdog diagnostic bootstrap checkpoint dependencies are invalid: \
+                 bitmap={reached:#x} checkpoint={}",
+                BOOTSTRAP_CHECKPOINT_NAMES[checkpoint]
+            )
+        }
     }
     Ok(())
 }
@@ -648,11 +707,8 @@ mod tests {
         );
         assert_eq!(DIAGNOSTIC_PAGE_PA.load(Ordering::Acquire), 0x1234_5000);
 
-        let mut page = vec![0u8; DIAGNOSTIC_PAGE_BYTES];
-        page[0..4].copy_from_slice(&DIAGNOSTIC_MAGIC.to_le_bytes());
-        page[4..8].copy_from_slice(&DIAGNOSTIC_VERSION_V1.to_le_bytes());
+        let mut page = diagnostic_page(DIAGNOSTIC_VERSION_V1);
         page[8..12].copy_from_slice(&(1576u32).to_le_bytes());
-        page[12..16].copy_from_slice(&(64u32).to_le_bytes());
         page[16..24].copy_from_slice(&(99u64).to_le_bytes());
         page[24..32].copy_from_slice(&(0b101u64).to_le_bytes());
         page[32..40].copy_from_slice(&(0b100u64).to_le_bytes());
@@ -668,11 +724,7 @@ mod tests {
 
     #[test]
     fn decodes_v2_phase_prefix_and_rejects_gaps() {
-        let mut page = vec![0u8; DIAGNOSTIC_PAGE_BYTES];
-        page[0..4].copy_from_slice(&DIAGNOSTIC_MAGIC.to_le_bytes());
-        page[4..8].copy_from_slice(&DIAGNOSTIC_VERSION_V2.to_le_bytes());
-        page[8..12].copy_from_slice(&(DIAGNOSTIC_PAGE_BYTES as u32).to_le_bytes());
-        page[12..16].copy_from_slice(&(MAX_DIAGNOSTIC_CPUS as u32).to_le_bytes());
+        let mut page = diagnostic_page(DIAGNOSTIC_VERSION_V2);
         page[V1_DIAGNOSTIC_BYTES..V1_DIAGNOSTIC_BYTES + 8]
             .copy_from_slice(&(0b111u64).to_le_bytes());
         page[V1_DIAGNOSTIC_BYTES + 8..V1_DIAGNOSTIC_BYTES + 12]
@@ -697,6 +749,35 @@ mod tests {
     }
 
     #[test]
+    fn decodes_v3_bootstrap_checkpoints_and_rejects_broken_dependencies() {
+        let mut page = diagnostic_page(DIAGNOSTIC_VERSION_V3);
+        page[V1_DIAGNOSTIC_BYTES + 8..V1_DIAGNOSTIC_BYTES + 12]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        page[V2_DIAGNOSTIC_BYTES..V2_DIAGNOSTIC_BYTES + 8]
+            .copy_from_slice(&(0b11_1111u64).to_le_bytes());
+        for (checkpoint, elapsed_ns) in [101u64, 202, 303, 404, 505, 606].into_iter().enumerate() {
+            let offset = V2_DIAGNOSTIC_BYTES + 8 + checkpoint * 8;
+            page[offset..offset + 8].copy_from_slice(&elapsed_ns.to_le_bytes());
+        }
+
+        let diagnostic = decode_diagnostic_page(&page).unwrap();
+        assert_eq!(diagnostic["schema_version"], 3);
+        assert_eq!(diagnostic["bootstrap_checkpoint_bitmap"], "0x3f");
+        assert_eq!(
+            diagnostic["bootstrap_checkpoint_elapsed_ns"]["feeder-spawn-requested"],
+            101
+        );
+        assert_eq!(
+            diagnostic["bootstrap_checkpoint_elapsed_ns"]["feeder-first-poll-complete"],
+            606
+        );
+
+        page[V2_DIAGNOSTIC_BYTES..V2_DIAGNOSTIC_BYTES + 8]
+            .copy_from_slice(&(0b00_1001u64).to_le_bytes());
+        assert!(decode_diagnostic_page(&page).is_err());
+    }
+
+    #[test]
     fn guest_start_enables_only_an_explicit_boot_probe_quit() {
         GUEST_STARTED.store(false, Ordering::Release);
         observe_guest_output_line("KERNDIFF_GUEST_START version=1 run_id=not-hex");
@@ -706,5 +787,14 @@ mod tests {
         assert!(should_quit_boot_probe(true, true));
         assert!(!should_quit_boot_probe(false, true));
         assert!(!should_quit_boot_probe(true, false));
+    }
+
+    fn diagnostic_page(version: u32) -> Vec<u8> {
+        let mut page = vec![0u8; DIAGNOSTIC_PAGE_BYTES];
+        page[0..4].copy_from_slice(&DIAGNOSTIC_MAGIC.to_le_bytes());
+        page[4..8].copy_from_slice(&version.to_le_bytes());
+        page[8..12].copy_from_slice(&(DIAGNOSTIC_PAGE_BYTES as u32).to_le_bytes());
+        page[12..16].copy_from_slice(&(MAX_DIAGNOSTIC_CPUS as u32).to_le_bytes());
+        page
     }
 }

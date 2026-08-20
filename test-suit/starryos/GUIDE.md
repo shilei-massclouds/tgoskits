@@ -210,6 +210,11 @@ guest armed marker 中的物理地址执行 QMP `pmemsave`，附带 4 KiB per-CP
 诊断提取失败保留原始 WATCHDOG 事件并写入 `raw_error`。这些事件只描述观测到的故障
 域，不代替 KernDiff 对 finding/基础设施错误的最终分类。
 
+诊断页 v3 在保持 v1/v2 前缀的基础上，追加 bootstrap feeder 创建与首次运行的六个
+checkpoint；axbuild 在原始 fault event 中输出 `bootstrap_checkpoint_bitmap` 和
+`bootstrap_checkpoint_elapsed_ns`。字段与并发依赖见
+[Starry bootstrap feeder diagnostics v3](../../book/design/starry-bootstrap-feeder-diagnostics-v3.md)。
+
 所有 QEMU case 在 host stdout 输出一对单行 JSON 事件，前缀为
 `[axbuild] qemu-case-event `，schema 为 `axbuild-qemu-case` v1。start 事件记录
 case 和缩放后的有效 timeout；end 事件追加 elapsed milliseconds、`passed`/`failed`

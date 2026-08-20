@@ -10,6 +10,8 @@ use core::{
     time::Duration,
 };
 
+use ax_driver::kerndiff_fault::BootstrapCheckpoint;
+
 use crate::KernDiffBootPhase;
 
 const PERIOD: Duration = Duration::from_secs(5);
@@ -131,11 +133,16 @@ pub(super) fn start_bootstrap() {
         diagnostic_page,
         boot_epoch,
     );
-    ax_task::spawn_raw(
+    record_bootstrap_checkpoint(BootstrapCheckpoint::FeederSpawnRequested);
+    let task = ax_task::TaskInner::new(
         bootstrap_loop,
         String::from("kerndiff-watchdog-bootstrap"),
         ax_task::default_task_stack_size(),
     );
+    ax_task::spawn_task_with(task, |_| {
+        record_bootstrap_checkpoint(BootstrapCheckpoint::FeederTaskInitialized);
+    });
+    record_bootstrap_checkpoint(BootstrapCheckpoint::FeederSpawnReturned);
 }
 
 pub(super) fn publish_boot_phase(phase: KernDiffBootPhase) {
@@ -215,16 +222,31 @@ pub(super) fn handoff_to_percpu() {
 }
 
 fn bootstrap_loop() {
-    if !ax_task::set_current_affinity(ax_task::AxCpuMask::one_shot(0)) {
+    record_bootstrap_checkpoint(BootstrapCheckpoint::FeederEntered);
+    let affinity_ready = ax_task::set_current_affinity(ax_task::AxCpuMask::one_shot(0));
+    record_bootstrap_checkpoint(BootstrapCheckpoint::FeederAffinityReady);
+    if !affinity_ready {
         warn!("KernDiff bootstrap feeder could not pin itself to CPU0");
         return;
     }
     let mut epoch = 0u64;
+    let mut first_poll_complete = false;
     while PHASE.load(Ordering::Acquire) == PHASE_BOOTSTRAP {
         epoch = epoch.wrapping_add(1);
         ax_driver::kerndiff_fault::bootstrap_poll(epoch, ax_hal::time::monotonic_time_nanos());
+        if !first_poll_complete {
+            record_bootstrap_checkpoint(BootstrapCheckpoint::FeederFirstPollComplete);
+            first_poll_complete = true;
+        }
         ax_task::sleep(PERIOD);
     }
+}
+
+fn record_bootstrap_checkpoint(checkpoint: BootstrapCheckpoint) {
+    let _ = ax_driver::kerndiff_fault::record_bootstrap_checkpoint(
+        checkpoint,
+        ax_hal::time::monotonic_time_nanos(),
+    );
 }
 
 fn liveness_loop(cpu: usize) {

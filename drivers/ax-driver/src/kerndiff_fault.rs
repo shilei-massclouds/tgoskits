@@ -40,8 +40,9 @@ pub const DIAGNOSTIC_PAGE_BYTES: usize = 4096;
 const TIMER_TICKS: u32 = (WATCHDOG_TIMEOUT_SECONDS as u32) << 9;
 const MAX_CPUS: usize = 64;
 const DIAGNOSTIC_MAGIC: u32 = 0x4b44_5744;
-const DIAGNOSTIC_VERSION: u32 = 2;
+const DIAGNOSTIC_VERSION: u32 = 3;
 pub const BOOT_PHASE_COUNT: usize = 12;
+const BOOTSTRAP_CHECKPOINT_COUNT: usize = 6;
 
 static WATCHDOG_MMIO: AtomicUsize = AtomicUsize::new(0);
 static WATCHDOG_CONFIG_ADDRESS: AtomicU32 = AtomicU32::new(0);
@@ -67,6 +68,8 @@ struct DiagnosticPage {
     reserved: u32,
     phase_sequence: AtomicU64,
     phase_elapsed_ns: [AtomicU64; BOOT_PHASE_COUNT],
+    bootstrap_checkpoint_bitmap: AtomicU64,
+    bootstrap_checkpoint_elapsed_ns: [AtomicU64; BOOTSTRAP_CHECKPOINT_COUNT],
 }
 
 impl DiagnosticPage {
@@ -87,11 +90,44 @@ impl DiagnosticPage {
             reserved: 0,
             phase_sequence: AtomicU64::new(0),
             phase_elapsed_ns: [const { AtomicU64::new(0) }; BOOT_PHASE_COUNT],
+            bootstrap_checkpoint_bitmap: AtomicU64::new(0),
+            bootstrap_checkpoint_elapsed_ns: [const { AtomicU64::new(0) };
+                BOOTSTRAP_CHECKPOINT_COUNT],
         }
     }
 }
 
 static DIAGNOSTIC: DiagnosticPage = DiagnosticPage::new();
+
+/// A persistent boundary in bootstrap watchdog-feeder creation or first execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum BootstrapCheckpoint {
+    /// The armed marker was emitted and task construction is about to start.
+    FeederSpawnRequested = 0,
+    /// The task has a stable reference but is not registered or runnable yet.
+    FeederTaskInitialized = 1,
+    /// Task registration and runqueue insertion returned to the spawning task.
+    FeederSpawnReturned  = 2,
+    /// The feeder task began executing its entry closure.
+    FeederEntered        = 3,
+    /// The feeder's CPU0 affinity operation returned.
+    FeederAffinityReady  = 4,
+    /// The feeder completed its first watchdog poll.
+    FeederFirstPollComplete = 5,
+}
+
+impl BootstrapCheckpoint {
+    const fn required_bitmap(self) -> u64 {
+        match self {
+            Self::FeederSpawnRequested => 0,
+            Self::FeederTaskInitialized => 0b00_0001,
+            Self::FeederSpawnReturned | Self::FeederEntered => 0b00_0011,
+            Self::FeederAffinityReady => 0b00_1011,
+            Self::FeederFirstPollComplete => 0b01_1011,
+        }
+    }
+}
 
 mod i6300_driver {
     use super::*;
@@ -171,15 +207,7 @@ pub fn arm_watchdog(online_mask: u64, boot_epoch: u64) -> bool {
     if base == 0 || online_mask == 0 || !configure_watchdog() {
         return false;
     }
-    DIAGNOSTIC.boot_epoch.store(boot_epoch, Ordering::Release);
-    DIAGNOSTIC.online_mask.store(online_mask, Ordering::Release);
-    DIAGNOSTIC.stale_mask.store(0, Ordering::Release);
-    DIAGNOSTIC.reached_phase_bitmap.store(0, Ordering::Release);
-    DIAGNOSTIC.last_phase.store(u32::MAX, Ordering::Release);
-    DIAGNOSTIC.phase_sequence.store(0, Ordering::Release);
-    for elapsed in &DIAGNOSTIC.phase_elapsed_ns {
-        elapsed.store(0, Ordering::Relaxed);
-    }
+    reset_diagnostic_page(&DIAGNOSTIC, boot_epoch, online_mask);
     FORCED_STALE_MASK.store(0, Ordering::Release);
     unsafe {
         apply_programming_sequence(base, &watchdog_programming_sequence());
@@ -225,6 +253,70 @@ fn record_boot_phase_in(
     let sequence = u64::from(phase) + 1;
     diagnostic.phase_sequence.store(sequence, Ordering::Release);
     Some((sequence, elapsed_ns))
+}
+
+/// Records one bootstrap feeder checkpoint without allocating, locking, or logging.
+///
+/// Each checkpoint has one producer. The elapsed value is stored before its bit
+/// is published with release ordering. Task-entry checkpoints deliberately do
+/// not depend on `FeederSpawnReturned` because the new task may run before the
+/// spawning task returns from runqueue insertion.
+pub fn record_bootstrap_checkpoint(checkpoint: BootstrapCheckpoint, now_ns: u64) -> Option<u64> {
+    record_bootstrap_checkpoint_in(
+        &DIAGNOSTIC,
+        WATCHDOG_ARMED.load(Ordering::Acquire),
+        checkpoint,
+        now_ns,
+    )
+}
+
+fn record_bootstrap_checkpoint_in(
+    diagnostic: &DiagnosticPage,
+    watchdog_armed: bool,
+    checkpoint: BootstrapCheckpoint,
+    now_ns: u64,
+) -> Option<u64> {
+    if !watchdog_armed {
+        return None;
+    }
+    let bit = 1u64 << checkpoint as usize;
+    let observed = diagnostic
+        .bootstrap_checkpoint_bitmap
+        .load(Ordering::Acquire);
+    let required = checkpoint.required_bitmap();
+    if observed & bit != 0 || observed & required != required {
+        return None;
+    }
+    let elapsed_ns = now_ns.saturating_sub(diagnostic.boot_epoch.load(Ordering::Acquire));
+    diagnostic.bootstrap_checkpoint_elapsed_ns[checkpoint as usize]
+        .store(elapsed_ns, Ordering::Relaxed);
+    diagnostic
+        .bootstrap_checkpoint_bitmap
+        .fetch_or(bit, Ordering::Release);
+    Some(elapsed_ns)
+}
+
+fn reset_diagnostic_page(diagnostic: &DiagnosticPage, boot_epoch: u64, online_mask: u64) {
+    diagnostic.boot_epoch.store(boot_epoch, Ordering::Release);
+    diagnostic.online_mask.store(online_mask, Ordering::Release);
+    diagnostic.stale_mask.store(0, Ordering::Release);
+    for cpu in 0..MAX_CPUS {
+        diagnostic.scheduler_epoch[cpu].store(0, Ordering::Relaxed);
+        diagnostic.irq_epoch[cpu].store(0, Ordering::Relaxed);
+        diagnostic.last_progress_ns[cpu].store(0, Ordering::Relaxed);
+    }
+    diagnostic.reached_phase_bitmap.store(0, Ordering::Release);
+    diagnostic.last_phase.store(u32::MAX, Ordering::Release);
+    diagnostic.phase_sequence.store(0, Ordering::Release);
+    for elapsed in &diagnostic.phase_elapsed_ns {
+        elapsed.store(0, Ordering::Relaxed);
+    }
+    diagnostic
+        .bootstrap_checkpoint_bitmap
+        .store(0, Ordering::Release);
+    for elapsed in &diagnostic.bootstrap_checkpoint_elapsed_ns {
+        elapsed.store(0, Ordering::Relaxed);
+    }
 }
 
 /// Updates the diagnostic page for the completed SMP handoff.
@@ -538,7 +630,7 @@ mod tests {
     fn diagnostic_layout_fits_one_qmp_memsave_page() {
         assert!(size_of::<DiagnosticPage>() <= DIAGNOSTIC_PAGE_BYTES);
         assert_eq!(DIAGNOSTIC.magic, DIAGNOSTIC_MAGIC);
-        assert_eq!(DIAGNOSTIC.version, 2);
+        assert_eq!(DIAGNOSTIC.version, 3);
         assert_eq!(size_of::<DiagnosticPage>(), 4096);
         assert_eq!(
             core::mem::offset_of!(DiagnosticPage, reached_phase_bitmap),
@@ -547,6 +639,14 @@ mod tests {
         assert_eq!(
             core::mem::offset_of!(DiagnosticPage, phase_elapsed_ns),
             1600
+        );
+        assert_eq!(
+            core::mem::offset_of!(DiagnosticPage, bootstrap_checkpoint_bitmap),
+            1696
+        );
+        assert_eq!(
+            core::mem::offset_of!(DiagnosticPage, bootstrap_checkpoint_elapsed_ns),
+            1704
         );
     }
 
@@ -574,6 +674,110 @@ mod tests {
         assert_eq!(diagnostic.phase_elapsed_ns[0].load(Ordering::Acquire), 25);
         assert_eq!(diagnostic.phase_elapsed_ns[1].load(Ordering::Acquire), 50);
         assert_eq!(record_boot_phase_in(&diagnostic, false, 2, 175), None);
+    }
+
+    #[test]
+    fn bootstrap_checkpoints_publish_elapsed_time_before_their_bits() {
+        let diagnostic = DiagnosticPage::new();
+        diagnostic.boot_epoch.store(100, Ordering::Release);
+
+        assert_eq!(
+            record_bootstrap_checkpoint_in(
+                &diagnostic,
+                true,
+                BootstrapCheckpoint::FeederSpawnRequested,
+                125,
+            ),
+            Some(25)
+        );
+        assert_eq!(
+            diagnostic
+                .bootstrap_checkpoint_bitmap
+                .load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(
+            diagnostic.bootstrap_checkpoint_elapsed_ns[0].load(Ordering::Acquire),
+            25
+        );
+        assert_eq!(
+            record_bootstrap_checkpoint_in(
+                &diagnostic,
+                true,
+                BootstrapCheckpoint::FeederSpawnRequested,
+                150,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn bootstrap_checkpoint_dependencies_allow_task_entry_before_spawn_returns() {
+        let diagnostic = DiagnosticPage::new();
+        diagnostic.boot_epoch.store(100, Ordering::Release);
+
+        assert_eq!(
+            record_bootstrap_checkpoint_in(
+                &diagnostic,
+                true,
+                BootstrapCheckpoint::FeederEntered,
+                101,
+            ),
+            None
+        );
+        for (checkpoint, now_ns) in [
+            (BootstrapCheckpoint::FeederSpawnRequested, 110),
+            (BootstrapCheckpoint::FeederTaskInitialized, 120),
+            (BootstrapCheckpoint::FeederEntered, 130),
+            (BootstrapCheckpoint::FeederAffinityReady, 140),
+            (BootstrapCheckpoint::FeederFirstPollComplete, 150),
+            (BootstrapCheckpoint::FeederSpawnReturned, 160),
+        ] {
+            assert_eq!(
+                record_bootstrap_checkpoint_in(&diagnostic, true, checkpoint, now_ns),
+                Some(now_ns - 100)
+            );
+        }
+        assert_eq!(
+            diagnostic
+                .bootstrap_checkpoint_bitmap
+                .load(Ordering::Acquire),
+            0b11_1111
+        );
+    }
+
+    #[test]
+    fn watchdog_reset_clears_boot_phases_and_bootstrap_checkpoints() {
+        let diagnostic = DiagnosticPage::new();
+        diagnostic.boot_epoch.store(100, Ordering::Release);
+        assert!(record_boot_phase_in(&diagnostic, true, 0, 110).is_some());
+        assert!(
+            record_bootstrap_checkpoint_in(
+                &diagnostic,
+                true,
+                BootstrapCheckpoint::FeederSpawnRequested,
+                120,
+            )
+            .is_some()
+        );
+
+        reset_diagnostic_page(&diagnostic, 500, 1);
+
+        assert_eq!(diagnostic.boot_epoch.load(Ordering::Acquire), 500);
+        assert_eq!(diagnostic.online_mask.load(Ordering::Acquire), 1);
+        assert_eq!(diagnostic.phase_sequence.load(Ordering::Acquire), 0);
+        assert_eq!(
+            diagnostic
+                .bootstrap_checkpoint_bitmap
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(
+            diagnostic
+                .bootstrap_checkpoint_elapsed_ns
+                .iter()
+                .all(|elapsed| elapsed.load(Ordering::Acquire) == 0)
+        );
     }
 
     #[test]
