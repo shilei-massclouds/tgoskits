@@ -389,15 +389,39 @@ pub fn rust_main(cpu_id: usize, arg: usize) -> ! {
     // online, so a temporary CPU0 feeder covers the rest of runtime bring-up.
     #[cfg(feature = "kerndiff-fault-observer")]
     kerndiff_fault::start_bootstrap();
+    #[cfg(feature = "kerndiff-fault-observer")]
+    kerndiff_fault::record_bootstrap_followup_checkpoint(
+        ax_driver::kerndiff_fault::BootstrapFollowupCheckpoint::MainBootstrapReturned,
+    );
 
     #[cfg(feature = "serial")]
-    serial::init(cpu_id);
+    {
+        #[cfg(feature = "kerndiff-fault-observer")]
+        kerndiff_fault::record_bootstrap_followup_checkpoint(
+            ax_driver::kerndiff_fault::BootstrapFollowupCheckpoint::SerialInitEntered,
+        );
+        serial::init(cpu_id);
+        #[cfg(feature = "kerndiff-fault-observer")]
+        kerndiff_fault::record_bootstrap_followup_checkpoint(
+            ax_driver::kerndiff_fault::BootstrapFollowupCheckpoint::SerialInitReturned,
+        );
+    }
 
     #[cfg(feature = "rtc")]
-    ax_println!(
-        "Boot at {}\n",
-        chrono::DateTime::from_timestamp_nanos(ax_hal::time::wall_time_nanos() as _),
-    );
+    {
+        #[cfg(feature = "kerndiff-fault-observer")]
+        kerndiff_fault::record_bootstrap_followup_checkpoint(
+            ax_driver::kerndiff_fault::BootstrapFollowupCheckpoint::RtcOutputEntered,
+        );
+        ax_println!(
+            "Boot at {}\n",
+            chrono::DateTime::from_timestamp_nanos(ax_hal::time::wall_time_nanos() as _),
+        );
+        #[cfg(feature = "kerndiff-fault-observer")]
+        kerndiff_fault::record_bootstrap_followup_checkpoint(
+            ax_driver::kerndiff_fault::BootstrapFollowupCheckpoint::RtcOutputReturned,
+        );
+    }
 
     #[cfg(feature = "kerndiff-fault-observer")]
     kerndiff_fault::publish_boot_phase(KernDiffBootPhase::FilesystemInitStart);

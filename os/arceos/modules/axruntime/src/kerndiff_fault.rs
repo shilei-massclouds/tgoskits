@@ -10,7 +10,7 @@ use core::{
     time::Duration,
 };
 
-use ax_driver::kerndiff_fault::BootstrapCheckpoint;
+use ax_driver::kerndiff_fault::{BootstrapCheckpoint, BootstrapFollowupCheckpoint};
 
 use crate::KernDiffBootPhase;
 
@@ -139,8 +139,9 @@ pub(super) fn start_bootstrap() {
         String::from("kerndiff-watchdog-bootstrap"),
         ax_task::default_task_stack_size(),
     );
-    ax_task::spawn_task_with(task, |_| {
+    ax_task::spawn_task_with(task, |task| {
         record_bootstrap_checkpoint(BootstrapCheckpoint::FeederTaskInitialized);
+        let _ = ax_driver::kerndiff_fault::register_bootstrap_feeder_task(task.id().as_u64());
     });
     record_bootstrap_checkpoint(BootstrapCheckpoint::FeederSpawnReturned);
 }
@@ -244,6 +245,13 @@ fn bootstrap_loop() {
 
 fn record_bootstrap_checkpoint(checkpoint: BootstrapCheckpoint) {
     let _ = ax_driver::kerndiff_fault::record_bootstrap_checkpoint(
+        checkpoint,
+        ax_hal::time::monotonic_time_nanos(),
+    );
+}
+
+pub(super) fn record_bootstrap_followup_checkpoint(checkpoint: BootstrapFollowupCheckpoint) {
+    let _ = ax_driver::kerndiff_fault::record_bootstrap_followup_checkpoint(
         checkpoint,
         ax_hal::time::monotonic_time_nanos(),
     );

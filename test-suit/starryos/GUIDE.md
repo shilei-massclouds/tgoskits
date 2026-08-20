@@ -214,6 +214,9 @@ guest armed marker 中的物理地址执行 QMP `pmemsave`，附带 4 KiB per-CP
 checkpoint；axbuild 在原始 fault event 中输出 `bootstrap_checkpoint_bitmap` 和
 `bootstrap_checkpoint_elapsed_ns`。字段与并发依赖见
 [Starry bootstrap feeder diagnostics v3](../../book/design/starry-bootstrap-feeder-diagnostics-v3.md)。
+v3 选中的启动后续区间由
+[Starry post-spawn bootstrap diagnostics v4](../../book/design/starry-post-spawn-bootstrap-diagnostics-v4.md)
+继续细分。
 
 所有 QEMU case 在 host stdout 输出一对单行 JSON 事件，前缀为
 `[axbuild] qemu-case-event `，schema 为 `axbuild-qemu-case` v1。start 事件记录

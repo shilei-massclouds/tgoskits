@@ -4,6 +4,8 @@ Status: complete, 2026-08-19. Boot-probe host contract clarified 2026-08-20.
 
 The bootstrap task creation and first-run extension is defined by
 [Starry bootstrap feeder diagnostics v3](starry-bootstrap-feeder-diagnostics-v3.md).
+The selected post-spawn interval is further split by
+[Starry post-spawn bootstrap diagnostics v4](starry-post-spawn-bootstrap-diagnostics-v4.md).
 
 The consumer contract is
 [KernDiff phase 2.14 early boot historical statistical diff v1](https://github.com/shilei-massclouds/KernDiff/blob/dev/docs/design/early-boot-historical-diff-v1.md).

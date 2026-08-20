@@ -1,6 +1,8 @@
 # Starry bootstrap feeder diagnostics v3
 
-Status: implemented; operator QEMU acceptance pending, 2026-08-20.
+Status: accepted and superseded by
+[Starry post-spawn bootstrap diagnostics v4](starry-post-spawn-bootstrap-diagnostics-v4.md),
+2026-08-20.
 
 This extends
 [Starry early boot progress and watchdog diagnostics v1](starry-early-boot-progress-v1.md).
@@ -102,15 +104,19 @@ event.
   conversion to the stable reference.
 - Through `feeder-task-initialized`: inspect task registration, runqueue
   selection, and insertion.
-- Through `feeder-spawn-returned`: inspect the small window after the spawning
-  thread returns.
+- Through `feeder-spawn-returned`: inspect the caller path before
+  `filesystem-init-start`. In the current runtime this includes serial runtime
+  initialization and RTC output; it is not merely a function-return epilogue.
 - Through `feeder-entered` or `feeder-affinity-ready`: inspect feeder entry,
   affinity handling, or the first poll.
 - Through `feeder-first-poll-complete` while scheduler epoch remains abnormal:
   inspect inconsistency between checkpoint and liveness publication.
 
-Only after a recurrence selects an interval should that interval gain finer
-registry, runqueue, or lock-boundary checkpoints.
+Occurrence A4 selected this interval with bitmap `0x7`: task registration and
+runqueue insertion returned, but the feeder entry closure did not begin. Version
+4 therefore adds one scheduler-selection checkpoint and a separate main-thread
+chain across serial initialization and RTC output. Registry and runqueue
+insertion do not receive finer checkpoints because A4 proves both calls returned.
 
 ## Verification and rollback
 
@@ -118,9 +124,10 @@ Lowest-layer tests cover the v3 offsets and 4 KiB size, watchdog reset,
 elapsed-before-bit publication, the two dependency chains and their allowed
 concurrency, v1/v2 compatibility, valid v3 JSON, and damaged v3 rejection.
 Targeted ax-driver, axruntime, and axbuild tests, formatting, clippy with warnings
-denied, and a non-QEMU Starry build are the implementation gate. Operator-run
-QEMU acceptance must observe all six checkpoints, all twelve boot phases, and
-`KERNDIFF_GUEST_START`.
+denied, and a non-QEMU Starry build formed the implementation gate. An
+operator-run normal boot observed all twelve boot phases and
+`KERNDIFF_GUEST_START`; a deliberate kernel-watchdog injection confirmed all six
+checkpoints and strict v3 QMP decode with bitmap `0x3f`.
 
 Rollback can restore the v2 writer while current axbuild continues to decode v1
 and v2. Old axbuild versions reject v3 diagnostics but preserve the raw WATCHDOG

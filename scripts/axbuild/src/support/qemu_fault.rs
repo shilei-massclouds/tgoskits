@@ -24,10 +24,12 @@ const DIAGNOSTIC_MAGIC: u32 = 0x4b44_5744;
 const DIAGNOSTIC_VERSION_V1: u32 = 1;
 const DIAGNOSTIC_VERSION_V2: u32 = 2;
 const DIAGNOSTIC_VERSION_V3: u32 = 3;
+const DIAGNOSTIC_VERSION_V4: u32 = 4;
 const MAX_DIAGNOSTIC_CPUS: usize = 64;
 const V1_DIAGNOSTIC_BYTES: usize = 1576;
 const V2_DIAGNOSTIC_BYTES: usize = 1696;
 const V3_DIAGNOSTIC_BYTES: usize = 1752;
+const V4_DIAGNOSTIC_BYTES: usize = 1808;
 const BOOT_PHASE_NAMES: [&str; 12] = [
     "watchdog-armed",
     "filesystem-init-start",
@@ -52,6 +54,19 @@ const BOOTSTRAP_CHECKPOINT_NAMES: [&str; 6] = [
 ];
 const BOOTSTRAP_CHECKPOINT_REQUIRED_BITMAPS: [u64; 6] =
     [0, 0b00_0001, 0b00_0011, 0b00_0011, 0b00_1011, 0b01_1011];
+const BOOTSTRAP_FOLLOWUP_CHECKPOINT_NAMES: [&str; 6] = [
+    "feeder-scheduler-selected",
+    "main-bootstrap-returned",
+    "serial-init-entered",
+    "serial-init-returned",
+    "rtc-output-entered",
+    "rtc-output-returned",
+];
+const BOOTSTRAP_FOLLOWUP_REQUIRED_BOOTSTRAP_BITMAPS: [u64; 6] = [
+    0b00_0010, 0b00_0100, 0b00_0100, 0b00_0100, 0b00_0100, 0b00_0100,
+];
+const BOOTSTRAP_FOLLOWUP_REQUIRED_BITMAPS: [u64; 6] =
+    [0, 0, 0b00_0010, 0b00_0110, 0b00_1110, 0b01_1110];
 const WATCHDOG_MARKER_PREFIX: &str = "STARRY_KERNEL_WATCHDOG version=1 state=armed ";
 const GUEST_START_MARKER_PREFIX: &str = "KERNDIFF_GUEST_START version=1 run_id=";
 pub(crate) const BOOT_PROBE_SUCCESS_REGEX: &str =
@@ -456,6 +471,7 @@ fn decode_diagnostic_page(encoded: &[u8]) -> anyhow::Result<serde_json::Value> {
         DIAGNOSTIC_VERSION_V1 => V1_DIAGNOSTIC_BYTES,
         DIAGNOSTIC_VERSION_V2 => V2_DIAGNOSTIC_BYTES,
         DIAGNOSTIC_VERSION_V3 => V3_DIAGNOSTIC_BYTES,
+        DIAGNOSTIC_VERSION_V4 => V4_DIAGNOSTIC_BYTES,
         _ => usize::MAX,
     };
     if magic != DIAGNOSTIC_MAGIC
@@ -494,7 +510,10 @@ fn decode_diagnostic_page(encoded: &[u8]) -> anyhow::Result<serde_json::Value> {
         "stuck_cpu_mask": format!("{stale_mask:#x}"),
         "cpus": cpus,
     });
-    if matches!(version, DIAGNOSTIC_VERSION_V2 | DIAGNOSTIC_VERSION_V3) {
+    if matches!(
+        version,
+        DIAGNOSTIC_VERSION_V2 | DIAGNOSTIC_VERSION_V3 | DIAGNOSTIC_VERSION_V4
+    ) {
         let reached = read_u64(encoded, V1_DIAGNOSTIC_BYTES)?;
         let last_phase = read_u32(encoded, V1_DIAGNOSTIC_BYTES + 8)?;
         let sequence = read_u64(encoded, V1_DIAGNOSTIC_BYTES + 16)?;
@@ -526,8 +545,10 @@ fn decode_diagnostic_page(encoded: &[u8]) -> anyhow::Result<serde_json::Value> {
             },
         );
     }
-    if version == DIAGNOSTIC_VERSION_V3 {
+    let mut bootstrap_checkpoints = 0;
+    if matches!(version, DIAGNOSTIC_VERSION_V3 | DIAGNOSTIC_VERSION_V4) {
         let reached = read_u64(encoded, V2_DIAGNOSTIC_BYTES)?;
+        bootstrap_checkpoints = reached;
         validate_bootstrap_checkpoints(reached)?;
         let mut elapsed = serde_json::Map::new();
         for (checkpoint, name) in BOOTSTRAP_CHECKPOINT_NAMES.iter().enumerate() {
@@ -547,6 +568,30 @@ fn decode_diagnostic_page(encoded: &[u8]) -> anyhow::Result<serde_json::Value> {
         );
         object.insert(
             "bootstrap_checkpoint_elapsed_ns".to_string(),
+            elapsed.into(),
+        );
+    }
+    if version == DIAGNOSTIC_VERSION_V4 {
+        let reached = read_u64(encoded, V3_DIAGNOSTIC_BYTES)?;
+        validate_bootstrap_followup_checkpoints(bootstrap_checkpoints, reached)?;
+        let mut elapsed = serde_json::Map::new();
+        for (checkpoint, name) in BOOTSTRAP_FOLLOWUP_CHECKPOINT_NAMES.iter().enumerate() {
+            if reached & (1u64 << checkpoint) != 0 {
+                elapsed.insert(
+                    (*name).to_string(),
+                    read_u64(encoded, V3_DIAGNOSTIC_BYTES + 8 + checkpoint * 8)?.into(),
+                );
+            }
+        }
+        let object = diagnostic
+            .as_object_mut()
+            .expect("diagnostic JSON must be an object");
+        object.insert(
+            "bootstrap_followup_checkpoint_bitmap".to_string(),
+            format!("{reached:#x}").into(),
+        );
+        object.insert(
+            "bootstrap_followup_checkpoint_elapsed_ns".to_string(),
             elapsed.into(),
         );
     }
@@ -592,6 +637,31 @@ fn validate_bootstrap_checkpoints(reached: u64) -> anyhow::Result<()> {
                 "watchdog diagnostic bootstrap checkpoint dependencies are invalid: \
                  bitmap={reached:#x} checkpoint={}",
                 BOOTSTRAP_CHECKPOINT_NAMES[checkpoint]
+            )
+        }
+    }
+    Ok(())
+}
+
+fn validate_bootstrap_followup_checkpoints(bootstrap: u64, reached: u64) -> anyhow::Result<()> {
+    let valid_bitmap = (1u64 << BOOTSTRAP_FOLLOWUP_CHECKPOINT_NAMES.len()) - 1;
+    if reached & !valid_bitmap != 0 {
+        bail!("watchdog diagnostic bootstrap follow-up bitmap is invalid: {reached:#x}")
+    }
+    for checkpoint in 0..BOOTSTRAP_FOLLOWUP_CHECKPOINT_NAMES.len() {
+        let bit = 1u64 << checkpoint;
+        if reached & bit == 0 {
+            continue;
+        }
+        let required_bootstrap = BOOTSTRAP_FOLLOWUP_REQUIRED_BOOTSTRAP_BITMAPS[checkpoint];
+        let required_followup = BOOTSTRAP_FOLLOWUP_REQUIRED_BITMAPS[checkpoint];
+        if bootstrap & required_bootstrap != required_bootstrap
+            || reached & required_followup != required_followup
+        {
+            bail!(
+                "watchdog diagnostic bootstrap follow-up dependencies are invalid: \
+                 bootstrap={bootstrap:#x} followup={reached:#x} checkpoint={}",
+                BOOTSTRAP_FOLLOWUP_CHECKPOINT_NAMES[checkpoint]
             )
         }
     }
@@ -771,9 +841,45 @@ mod tests {
             diagnostic["bootstrap_checkpoint_elapsed_ns"]["feeder-first-poll-complete"],
             606
         );
+        assert!(
+            diagnostic
+                .get("bootstrap_followup_checkpoint_bitmap")
+                .is_none()
+        );
 
         page[V2_DIAGNOSTIC_BYTES..V2_DIAGNOSTIC_BYTES + 8]
             .copy_from_slice(&(0b00_1001u64).to_le_bytes());
+        assert!(decode_diagnostic_page(&page).is_err());
+    }
+
+    #[test]
+    fn decodes_v4_post_spawn_checkpoints_and_rejects_broken_dependencies() {
+        let mut page = diagnostic_page(DIAGNOSTIC_VERSION_V4);
+        page[V1_DIAGNOSTIC_BYTES + 8..V1_DIAGNOSTIC_BYTES + 12]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        page[V2_DIAGNOSTIC_BYTES..V2_DIAGNOSTIC_BYTES + 8]
+            .copy_from_slice(&(0b00_0111u64).to_le_bytes());
+        page[V3_DIAGNOSTIC_BYTES..V3_DIAGNOSTIC_BYTES + 8]
+            .copy_from_slice(&(0b11_1111u64).to_le_bytes());
+        for (checkpoint, elapsed_ns) in [701u64, 702, 703, 704, 705, 706].into_iter().enumerate() {
+            let offset = V3_DIAGNOSTIC_BYTES + 8 + checkpoint * 8;
+            page[offset..offset + 8].copy_from_slice(&elapsed_ns.to_le_bytes());
+        }
+
+        let diagnostic = decode_diagnostic_page(&page).unwrap();
+        assert_eq!(diagnostic["schema_version"], 4);
+        assert_eq!(diagnostic["bootstrap_followup_checkpoint_bitmap"], "0x3f");
+        assert_eq!(
+            diagnostic["bootstrap_followup_checkpoint_elapsed_ns"]["feeder-scheduler-selected"],
+            701
+        );
+        assert_eq!(
+            diagnostic["bootstrap_followup_checkpoint_elapsed_ns"]["rtc-output-returned"],
+            706
+        );
+
+        page[V3_DIAGNOSTIC_BYTES..V3_DIAGNOSTIC_BYTES + 8]
+            .copy_from_slice(&(0b10_0100u64).to_le_bytes());
         assert!(decode_diagnostic_page(&page).is_err());
     }
 

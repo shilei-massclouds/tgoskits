@@ -40,9 +40,10 @@ pub const DIAGNOSTIC_PAGE_BYTES: usize = 4096;
 const TIMER_TICKS: u32 = (WATCHDOG_TIMEOUT_SECONDS as u32) << 9;
 const MAX_CPUS: usize = 64;
 const DIAGNOSTIC_MAGIC: u32 = 0x4b44_5744;
-const DIAGNOSTIC_VERSION: u32 = 3;
+const DIAGNOSTIC_VERSION: u32 = 4;
 pub const BOOT_PHASE_COUNT: usize = 12;
 const BOOTSTRAP_CHECKPOINT_COUNT: usize = 6;
+const BOOTSTRAP_FOLLOWUP_CHECKPOINT_COUNT: usize = 6;
 
 static WATCHDOG_MMIO: AtomicUsize = AtomicUsize::new(0);
 static WATCHDOG_CONFIG_ADDRESS: AtomicU32 = AtomicU32::new(0);
@@ -50,6 +51,7 @@ static PVPANIC_MMIO: AtomicUsize = AtomicUsize::new(0);
 static WATCHDOG_ARMED: AtomicBool = AtomicBool::new(false);
 static PVPANIC_NOTIFIED: AtomicBool = AtomicBool::new(false);
 static FORCED_STALE_MASK: AtomicU64 = AtomicU64::new(0);
+static BOOTSTRAP_FEEDER_TASK_ID: AtomicU64 = AtomicU64::new(0);
 
 #[repr(C, align(4096))]
 struct DiagnosticPage {
@@ -70,6 +72,8 @@ struct DiagnosticPage {
     phase_elapsed_ns: [AtomicU64; BOOT_PHASE_COUNT],
     bootstrap_checkpoint_bitmap: AtomicU64,
     bootstrap_checkpoint_elapsed_ns: [AtomicU64; BOOTSTRAP_CHECKPOINT_COUNT],
+    bootstrap_followup_checkpoint_bitmap: AtomicU64,
+    bootstrap_followup_checkpoint_elapsed_ns: [AtomicU64; BOOTSTRAP_FOLLOWUP_CHECKPOINT_COUNT],
 }
 
 impl DiagnosticPage {
@@ -93,6 +97,9 @@ impl DiagnosticPage {
             bootstrap_checkpoint_bitmap: AtomicU64::new(0),
             bootstrap_checkpoint_elapsed_ns: [const { AtomicU64::new(0) };
                 BOOTSTRAP_CHECKPOINT_COUNT],
+            bootstrap_followup_checkpoint_bitmap: AtomicU64::new(0),
+            bootstrap_followup_checkpoint_elapsed_ns: [const { AtomicU64::new(0) };
+                BOOTSTRAP_FOLLOWUP_CHECKPOINT_COUNT],
         }
     }
 }
@@ -125,6 +132,47 @@ impl BootstrapCheckpoint {
             Self::FeederSpawnReturned | Self::FeederEntered => 0b00_0011,
             Self::FeederAffinityReady => 0b00_1011,
             Self::FeederFirstPollComplete => 0b01_1011,
+        }
+    }
+}
+
+/// A persistent boundary after bootstrap feeder creation has returned.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum BootstrapFollowupCheckpoint {
+    /// The scheduler selected the feeder for its first context switch.
+    FeederSchedulerSelected = 0,
+    /// The spawning function returned to the runtime boot sequence.
+    MainBootstrapReturned = 1,
+    /// Serial runtime initialization is about to begin.
+    SerialInitEntered  = 2,
+    /// Serial runtime initialization returned to the boot sequence.
+    SerialInitReturned = 3,
+    /// The RTC boot-time output call is about to begin.
+    RtcOutputEntered   = 4,
+    /// The RTC boot-time output call returned.
+    RtcOutputReturned  = 5,
+}
+
+impl BootstrapFollowupCheckpoint {
+    const fn required_bootstrap_bitmap(self) -> u64 {
+        match self {
+            Self::FeederSchedulerSelected => 0b00_0010,
+            Self::MainBootstrapReturned
+            | Self::SerialInitEntered
+            | Self::SerialInitReturned
+            | Self::RtcOutputEntered
+            | Self::RtcOutputReturned => 0b00_0100,
+        }
+    }
+
+    const fn required_followup_bitmap(self) -> u64 {
+        match self {
+            Self::FeederSchedulerSelected | Self::MainBootstrapReturned => 0,
+            Self::SerialInitEntered => 0b00_0010,
+            Self::SerialInitReturned => 0b00_0110,
+            Self::RtcOutputEntered => 0b00_1110,
+            Self::RtcOutputReturned => 0b01_1110,
         }
     }
 }
@@ -270,6 +318,66 @@ pub fn record_bootstrap_checkpoint(checkpoint: BootstrapCheckpoint, now_ns: u64)
     )
 }
 
+/// Publishes the feeder task identity before the task becomes runnable.
+pub fn register_bootstrap_feeder_task(task_id: u64) -> bool {
+    if task_id == 0
+        || !WATCHDOG_ARMED.load(Ordering::Acquire)
+        || DIAGNOSTIC
+            .bootstrap_checkpoint_bitmap
+            .load(Ordering::Acquire)
+            & (1u64 << BootstrapCheckpoint::FeederTaskInitialized as usize)
+            == 0
+    {
+        return false;
+    }
+    BOOTSTRAP_FEEDER_TASK_ID
+        .compare_exchange(0, task_id, Ordering::Release, Ordering::Acquire)
+        .is_ok()
+}
+
+/// Records the scheduler selecting the registered feeder for the first time.
+pub fn record_bootstrap_scheduler_selection(task_id: u64, now_ns: u64) -> Option<u64> {
+    let feeder_task_id = BOOTSTRAP_FEEDER_TASK_ID.load(Ordering::Acquire);
+    record_bootstrap_scheduler_selection_in(
+        &DIAGNOSTIC,
+        WATCHDOG_ARMED.load(Ordering::Acquire),
+        feeder_task_id,
+        task_id,
+        now_ns,
+    )
+}
+
+fn record_bootstrap_scheduler_selection_in(
+    diagnostic: &DiagnosticPage,
+    watchdog_armed: bool,
+    feeder_task_id: u64,
+    task_id: u64,
+    now_ns: u64,
+) -> Option<u64> {
+    if feeder_task_id == 0 || task_id != feeder_task_id {
+        return None;
+    }
+    record_bootstrap_followup_checkpoint_in(
+        diagnostic,
+        watchdog_armed,
+        BootstrapFollowupCheckpoint::FeederSchedulerSelected,
+        now_ns,
+    )
+}
+
+/// Records one post-spawn bootstrap boundary without allocating, locking, or logging.
+pub fn record_bootstrap_followup_checkpoint(
+    checkpoint: BootstrapFollowupCheckpoint,
+    now_ns: u64,
+) -> Option<u64> {
+    record_bootstrap_followup_checkpoint_in(
+        &DIAGNOSTIC,
+        WATCHDOG_ARMED.load(Ordering::Acquire),
+        checkpoint,
+        now_ns,
+    )
+}
+
 fn record_bootstrap_checkpoint_in(
     diagnostic: &DiagnosticPage,
     watchdog_armed: bool,
@@ -296,7 +404,41 @@ fn record_bootstrap_checkpoint_in(
     Some(elapsed_ns)
 }
 
+fn record_bootstrap_followup_checkpoint_in(
+    diagnostic: &DiagnosticPage,
+    watchdog_armed: bool,
+    checkpoint: BootstrapFollowupCheckpoint,
+    now_ns: u64,
+) -> Option<u64> {
+    if !watchdog_armed {
+        return None;
+    }
+    let bootstrap = diagnostic
+        .bootstrap_checkpoint_bitmap
+        .load(Ordering::Acquire);
+    let required_bootstrap = checkpoint.required_bootstrap_bitmap();
+    if bootstrap & required_bootstrap != required_bootstrap {
+        return None;
+    }
+    let bit = 1u64 << checkpoint as usize;
+    let observed = diagnostic
+        .bootstrap_followup_checkpoint_bitmap
+        .load(Ordering::Acquire);
+    let required_followup = checkpoint.required_followup_bitmap();
+    if observed & bit != 0 || observed & required_followup != required_followup {
+        return None;
+    }
+    let elapsed_ns = now_ns.saturating_sub(diagnostic.boot_epoch.load(Ordering::Acquire));
+    diagnostic.bootstrap_followup_checkpoint_elapsed_ns[checkpoint as usize]
+        .store(elapsed_ns, Ordering::Relaxed);
+    diagnostic
+        .bootstrap_followup_checkpoint_bitmap
+        .fetch_or(bit, Ordering::Release);
+    Some(elapsed_ns)
+}
+
 fn reset_diagnostic_page(diagnostic: &DiagnosticPage, boot_epoch: u64, online_mask: u64) {
+    BOOTSTRAP_FEEDER_TASK_ID.store(0, Ordering::Release);
     diagnostic.boot_epoch.store(boot_epoch, Ordering::Release);
     diagnostic.online_mask.store(online_mask, Ordering::Release);
     diagnostic.stale_mask.store(0, Ordering::Release);
@@ -315,6 +457,12 @@ fn reset_diagnostic_page(diagnostic: &DiagnosticPage, boot_epoch: u64, online_ma
         .bootstrap_checkpoint_bitmap
         .store(0, Ordering::Release);
     for elapsed in &diagnostic.bootstrap_checkpoint_elapsed_ns {
+        elapsed.store(0, Ordering::Relaxed);
+    }
+    diagnostic
+        .bootstrap_followup_checkpoint_bitmap
+        .store(0, Ordering::Release);
+    for elapsed in &diagnostic.bootstrap_followup_checkpoint_elapsed_ns {
         elapsed.store(0, Ordering::Relaxed);
     }
 }
@@ -630,7 +778,7 @@ mod tests {
     fn diagnostic_layout_fits_one_qmp_memsave_page() {
         assert!(size_of::<DiagnosticPage>() <= DIAGNOSTIC_PAGE_BYTES);
         assert_eq!(DIAGNOSTIC.magic, DIAGNOSTIC_MAGIC);
-        assert_eq!(DIAGNOSTIC.version, 3);
+        assert_eq!(DIAGNOSTIC.version, 4);
         assert_eq!(size_of::<DiagnosticPage>(), 4096);
         assert_eq!(
             core::mem::offset_of!(DiagnosticPage, reached_phase_bitmap),
@@ -647,6 +795,14 @@ mod tests {
         assert_eq!(
             core::mem::offset_of!(DiagnosticPage, bootstrap_checkpoint_elapsed_ns),
             1704
+        );
+        assert_eq!(
+            core::mem::offset_of!(DiagnosticPage, bootstrap_followup_checkpoint_bitmap),
+            1752
+        );
+        assert_eq!(
+            core::mem::offset_of!(DiagnosticPage, bootstrap_followup_checkpoint_elapsed_ns),
+            1760
         );
     }
 
@@ -747,6 +903,112 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_followup_checkpoints_split_scheduler_and_main_thread_progress() {
+        let diagnostic = DiagnosticPage::new();
+        diagnostic.boot_epoch.store(100, Ordering::Release);
+
+        for (checkpoint, now_ns) in [
+            (BootstrapCheckpoint::FeederSpawnRequested, 110),
+            (BootstrapCheckpoint::FeederTaskInitialized, 120),
+            (BootstrapCheckpoint::FeederSpawnReturned, 130),
+        ] {
+            assert_eq!(
+                record_bootstrap_checkpoint_in(&diagnostic, true, checkpoint, now_ns),
+                Some(now_ns - 100)
+            );
+        }
+        for (checkpoint, now_ns) in [
+            (BootstrapFollowupCheckpoint::MainBootstrapReturned, 140),
+            (BootstrapFollowupCheckpoint::SerialInitEntered, 150),
+            (BootstrapFollowupCheckpoint::FeederSchedulerSelected, 160),
+            (BootstrapFollowupCheckpoint::SerialInitReturned, 170),
+            (BootstrapFollowupCheckpoint::RtcOutputEntered, 180),
+            (BootstrapFollowupCheckpoint::RtcOutputReturned, 190),
+        ] {
+            assert_eq!(
+                record_bootstrap_followup_checkpoint_in(&diagnostic, true, checkpoint, now_ns,),
+                Some(now_ns - 100)
+            );
+        }
+        assert_eq!(
+            diagnostic
+                .bootstrap_followup_checkpoint_bitmap
+                .load(Ordering::Acquire),
+            0b11_1111
+        );
+    }
+
+    #[test]
+    fn scheduler_selection_records_only_the_registered_feeder() {
+        let diagnostic = DiagnosticPage::new();
+        diagnostic.boot_epoch.store(100, Ordering::Release);
+        for (checkpoint, now_ns) in [
+            (BootstrapCheckpoint::FeederSpawnRequested, 110),
+            (BootstrapCheckpoint::FeederTaskInitialized, 120),
+        ] {
+            assert!(
+                record_bootstrap_checkpoint_in(&diagnostic, true, checkpoint, now_ns).is_some()
+            );
+        }
+
+        assert_eq!(
+            record_bootstrap_scheduler_selection_in(&diagnostic, true, 41, 40, 130),
+            None
+        );
+        assert_eq!(
+            record_bootstrap_scheduler_selection_in(&diagnostic, true, 41, 41, 140),
+            Some(40)
+        );
+        assert_eq!(
+            diagnostic
+                .bootstrap_followup_checkpoint_bitmap
+                .load(Ordering::Acquire),
+            1
+        );
+    }
+
+    #[test]
+    fn bootstrap_followup_rejects_missing_main_thread_boundaries() {
+        let diagnostic = DiagnosticPage::new();
+        diagnostic.boot_epoch.store(100, Ordering::Release);
+        for (checkpoint, now_ns) in [
+            (BootstrapCheckpoint::FeederSpawnRequested, 110),
+            (BootstrapCheckpoint::FeederTaskInitialized, 120),
+        ] {
+            assert!(
+                record_bootstrap_checkpoint_in(&diagnostic, true, checkpoint, now_ns).is_some()
+            );
+        }
+        assert_eq!(
+            record_bootstrap_followup_checkpoint_in(
+                &diagnostic,
+                true,
+                BootstrapFollowupCheckpoint::MainBootstrapReturned,
+                130,
+            ),
+            None
+        );
+        assert!(
+            record_bootstrap_checkpoint_in(
+                &diagnostic,
+                true,
+                BootstrapCheckpoint::FeederSpawnReturned,
+                140,
+            )
+            .is_some()
+        );
+        assert_eq!(
+            record_bootstrap_followup_checkpoint_in(
+                &diagnostic,
+                true,
+                BootstrapFollowupCheckpoint::SerialInitReturned,
+                150,
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn watchdog_reset_clears_boot_phases_and_bootstrap_checkpoints() {
         let diagnostic = DiagnosticPage::new();
         diagnostic.boot_epoch.store(100, Ordering::Release);
@@ -760,6 +1022,10 @@ mod tests {
             )
             .is_some()
         );
+        diagnostic
+            .bootstrap_followup_checkpoint_bitmap
+            .store(1, Ordering::Release);
+        diagnostic.bootstrap_followup_checkpoint_elapsed_ns[0].store(30, Ordering::Release);
 
         reset_diagnostic_page(&diagnostic, 500, 1);
 
@@ -775,6 +1041,18 @@ mod tests {
         assert!(
             diagnostic
                 .bootstrap_checkpoint_elapsed_ns
+                .iter()
+                .all(|elapsed| elapsed.load(Ordering::Acquire) == 0)
+        );
+        assert_eq!(
+            diagnostic
+                .bootstrap_followup_checkpoint_bitmap
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(
+            diagnostic
+                .bootstrap_followup_checkpoint_elapsed_ns
                 .iter()
                 .all(|elapsed| elapsed.load(Ordering::Acquire) == 0)
         );
