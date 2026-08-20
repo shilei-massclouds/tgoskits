@@ -1,6 +1,6 @@
 # Starry early boot progress and watchdog diagnostics v1
 
-Status: complete, 2026-08-19.
+Status: complete, 2026-08-19. Boot-probe host contract clarified 2026-08-20.
 
 The consumer contract is
 [KernDiff phase 2.14 early boot historical statistical diff v1](https://github.com/shilei-massclouds/KernDiff/blob/dev/docs/design/early-boot-historical-diff-v1.md).
@@ -112,6 +112,23 @@ even when a repeated instrumented link is not byte-reproducible. The restore is
 accepted only when QMP fault capture and boot-probe mode are both explicit and
 the frozen path exactly matches the existing pinned-kallsyms source boundary.
 
+The frozen ELF remains coverage-instrumented, but boot-probe execution has an
+independent host success contract: the complete line must match
+`KERNDIFF_GUEST_START version=1 run_id=[0-9a-f]+`. Axbuild observes that marker
+through the general streaming QEMU-output capture, including when it spans host
+output chunks, and notifies QMP to issue the clean `quit`. In this mode axbuild
+does not install the axtest coverage monitor, export profraw, wait for
+`AXTEST_COVERAGE_DONE`, or require a fresh profile at completion. A stop before
+the exact guest-start marker remains a failure, and QEMU startup, timeout,
+WATCHDOG, pvpanic, and other real errors retain their existing precedence.
+`KERNDIFF_BOOT_PROBE=1` without `KERNDIFF_QMP_FAULTS=1` fails before QEMU starts.
+
+This exception is limited to the boot-only probe. Ordinary syscall/test runs
+with coverage enabled retain the existing strict contract: the guest result and
+coverage trigger must lead to a newly exported profraw, and a missing profile is
+still a coverage failure. No CLI, configuration, marker, QMP event, or persisted
+JSON schema changes.
+
 The existing per-run rootfs copy plus disk snapshot semantics remain in force.
 The Target Driver supplies a frozen OVMF directory through the existing
 `TGOS_OVMF_DIR` boundary and a pinned target ELF through the existing kallsyms
@@ -137,7 +154,10 @@ the observer feature or ignores v2; watchdog v1/QMP behavior remains readable.
 
 Lowest-layer tests cover stable phase ids/order, record-before-marker state,
 v1/v2 page decode, malformed v2 rejection, frozen-rootfs validation, boot-probe
-QMP quit, and corrupt-diagnostic WATCHDOG retention. Targeted ax-driver,
+contract priority over coverage, exact streaming guest-start matching,
+guest-start-driven QMP quit, missing-marker and real-QEMU-error precedence,
+ordinary missing-profraw failure, and corrupt-diagnostic WATCHDOG retention.
+Targeted ax-driver,
 axruntime, Starry kernel, and axbuild tests plus fmt/clippy are required. The
 `qemu/kerndiff` integration run must observe all v2 phases in order, then
 `KERNDIFF_GUEST_START`; the existing `kernel-watchdog` validation fault must

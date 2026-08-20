@@ -20,6 +20,7 @@ impl QemuSuccessOutput {
             state: Arc::new(Mutex::new(QemuSuccessOutputState {
                 matcher: StreamingMatcher::new(success_regex),
                 tail: Vec::with_capacity(TRANSCRIPT_TAIL_BYTES),
+                guest_output_observer: crate::support::qemu_fault::GuestOutputObserver::default(),
             })),
         }
     }
@@ -48,10 +49,12 @@ impl QemuSuccessOutput {
 struct QemuSuccessOutputState {
     matcher: std::result::Result<StreamingMatcher, String>,
     tail: Vec<u8>,
+    guest_output_observer: crate::support::qemu_fault::GuestOutputObserver,
 }
 
 impl QemuSuccessOutputState {
     fn append(&mut self, chunk: &[u8]) {
+        self.guest_output_observer.append(chunk);
         if let Ok(matcher) = &mut self.matcher {
             matcher.append(chunk);
         }
@@ -444,6 +447,47 @@ mod tests {
             &[b"STARRY_GROUPED_", b"TESTS_PASSED\n"],
         );
         verify_qemu_success_contract(Ok(()), Some(&output)).unwrap();
+    }
+
+    #[test]
+    fn qmp_clean_stop_after_cross_chunk_guest_start_is_success() {
+        crate::support::qemu_fault::reset_guest_started_for_test();
+        let output = captured_output(
+            &[crate::support::qemu_fault::BOOT_PROBE_SUCCESS_REGEX],
+            &[b"KERNDIFF_GUEST_START version=1 run_id=abc", b"123\n"],
+        );
+
+        verify_qemu_success_contract(
+            Err(anyhow::anyhow!(super::BENIGN_QEMU_STOP_ERROR)),
+            Some(&output),
+        )
+        .unwrap();
+        assert!(crate::support::qemu_fault::guest_started_for_test());
+    }
+
+    #[test]
+    fn boot_probe_requires_guest_start_and_preserves_real_qemu_errors() {
+        let missing = captured_output(
+            &[crate::support::qemu_fault::BOOT_PROBE_SUCCESS_REGEX],
+            &[b"STARRY_BOOT_STAGE version=2 sequence=12 stage=shell-ready\n"],
+        );
+        let error = verify_qemu_success_contract(Ok(()), Some(&missing)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("without matching a configured success regex")
+        );
+
+        let matched = captured_output(
+            &[crate::support::qemu_fault::BOOT_PROBE_SUCCESS_REGEX],
+            &[b"KERNDIFF_GUEST_START version=1 run_id=abc123\n"],
+        );
+        let error = verify_qemu_success_contract(
+            Err(anyhow::anyhow!("QEMU timed out after 300 seconds")),
+            Some(&matched),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "QEMU timed out after 300 seconds");
     }
 
     #[test]

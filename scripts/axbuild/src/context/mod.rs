@@ -58,6 +58,13 @@ pub(crate) enum SnapshotPersistence {
     Store,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QemuRunContract {
+    Standard,
+    AxtestCoverage,
+    BootProbe,
+}
+
 const NO_SNAPSHOT_ENV: &str = "AXBUILD_NO_SNAPSHOT";
 
 impl SnapshotPersistence {
@@ -244,8 +251,21 @@ impl AppContext {
         mut qemu: QemuConfig,
         capture_backtrace: Option<crate::backtrace::BacktraceQemuCapture>,
     ) -> anyhow::Result<()> {
-        if !crate::support::axtest_coverage::enabled(cargo) {
-            return self.run_qemu(cargo, qemu, capture_backtrace).await;
+        match resolve_qemu_run_contract(
+            crate::support::qemu_fault::boot_probe_enabled(),
+            crate::support::qemu_fault::enabled(),
+            crate::support::axtest_coverage::enabled(cargo),
+        )? {
+            QemuRunContract::Standard => {
+                return self.run_qemu(cargo, qemu, capture_backtrace).await;
+            }
+            QemuRunContract::BootProbe => {
+                let success_regex = apply_boot_probe_success_contract(&mut qemu);
+                return self
+                    .run_qemu_with_success_contract(cargo, qemu, capture_backtrace, &success_regex)
+                    .await;
+            }
+            QemuRunContract::AxtestCoverage => {}
         }
 
         let paths = crate::support::axtest_coverage::AxtestCoveragePaths::new(
@@ -506,6 +526,30 @@ impl AppContext {
         }
         Ok(guard)
     }
+}
+
+fn resolve_qemu_run_contract(
+    boot_probe_enabled: bool,
+    qmp_faults_enabled: bool,
+    coverage_enabled: bool,
+) -> anyhow::Result<QemuRunContract> {
+    if boot_probe_enabled && !qmp_faults_enabled {
+        anyhow::bail!("KERNDIFF_BOOT_PROBE=1 requires KERNDIFF_QMP_FAULTS=1");
+    }
+    if boot_probe_enabled {
+        return Ok(QemuRunContract::BootProbe);
+    }
+    if coverage_enabled {
+        return Ok(QemuRunContract::AxtestCoverage);
+    }
+    Ok(QemuRunContract::Standard)
+}
+
+fn apply_boot_probe_success_contract(qemu: &mut QemuConfig) -> [String; 1] {
+    // QMP owns the clean stop after observing guest start. The host matcher
+    // independently proves that the stop crossed the boot-domain boundary.
+    qemu.success_regex.clear();
+    [crate::support::qemu_fault::BOOT_PROBE_SUCCESS_REGEX.to_string()]
 }
 
 pub(crate) fn board_run_request(

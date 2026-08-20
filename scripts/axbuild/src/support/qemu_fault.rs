@@ -18,6 +18,7 @@ use ostool::run::qemu::QemuConfig;
 
 const QMP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const QMP_IO_POLL: Duration = Duration::from_millis(250);
+const MAX_GUEST_OUTPUT_LINE_BYTES: usize = 4096;
 const DIAGNOSTIC_PAGE_BYTES: usize = 4096;
 const DIAGNOSTIC_MAGIC: u32 = 0x4b44_5744;
 const DIAGNOSTIC_VERSION_V1: u32 = 1;
@@ -40,7 +41,9 @@ const BOOT_PHASE_NAMES: [&str; 12] = [
     "shell-ready",
 ];
 const WATCHDOG_MARKER_PREFIX: &str = "STARRY_KERNEL_WATCHDOG version=1 state=armed ";
-const GUEST_START_MARKER: &str = "KERNDIFF_GUEST_START version=1 ";
+const GUEST_START_MARKER_PREFIX: &str = "KERNDIFF_GUEST_START version=1 run_id=";
+pub(crate) const BOOT_PROBE_SUCCESS_REGEX: &str =
+    r"(?m)^KERNDIFF_GUEST_START version=1 run_id=[0-9a-f]+\r?$";
 const WATCHDOG_PMEMSAVE_REQUEST_ID: &str = "kerndiff-watchdog-pmemsave";
 static SOCKET_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static DIAGNOSTIC_PAGE_PA: AtomicU64 = AtomicU64::new(0);
@@ -64,10 +67,29 @@ impl QemuFaultPaths {
     }
 }
 
-/// Observes one complete guest output line from the existing coverage tee.
-pub(crate) fn observe_guest_output_line(line: &str) {
+#[derive(Default)]
+pub(crate) struct GuestOutputObserver {
+    line_buf: Vec<u8>,
+}
+
+impl GuestOutputObserver {
+    pub(crate) fn append(&mut self, chunk: &[u8]) {
+        self.line_buf.extend_from_slice(chunk);
+        while let Some(newline) = self.line_buf.iter().position(|byte| *byte == b'\n') {
+            let line = String::from_utf8_lossy(&self.line_buf[..newline]);
+            observe_guest_output_line(line.trim_end_matches('\r'));
+            self.line_buf.drain(..=newline);
+        }
+        if self.line_buf.len() > MAX_GUEST_OUTPUT_LINE_BYTES {
+            let overflow = self.line_buf.len() - MAX_GUEST_OUTPUT_LINE_BYTES;
+            self.line_buf.drain(..overflow);
+        }
+    }
+}
+
+fn observe_guest_output_line(line: &str) {
     let normalized = line.trim_start_matches(['\u{1b}', '[']);
-    if normalized.contains(GUEST_START_MARKER) {
+    if is_guest_start_marker(normalized) {
         GUEST_STARTED.store(true, Ordering::Release);
     }
     let Some(marker) = normalized.find(WATCHDOG_MARKER_PREFIX) else {
@@ -90,6 +112,17 @@ pub(crate) fn observe_guest_output_line(line: &str) {
     }
 }
 
+fn is_guest_start_marker(line: &str) -> bool {
+    let Some(prefix) = line.find(GUEST_START_MARKER_PREFIX) else {
+        return false;
+    };
+    let run_id = &line[prefix + GUEST_START_MARKER_PREFIX.len()..];
+    !run_id.is_empty()
+        && run_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 pub(crate) fn enabled() -> bool {
     std::env::var("KERNDIFF_QMP_FAULTS")
         .ok()
@@ -100,6 +133,16 @@ pub(crate) fn boot_probe_enabled() -> bool {
     std::env::var("KERNDIFF_BOOT_PROBE")
         .ok()
         .is_some_and(|value| matches!(value.as_str(), "1" | "y" | "yes" | "true" | "on"))
+}
+
+#[cfg(test)]
+pub(crate) fn reset_guest_started_for_test() {
+    GUEST_STARTED.store(false, Ordering::Release);
+}
+
+#[cfg(test)]
+pub(crate) fn guest_started_for_test() -> bool {
+    GUEST_STARTED.load(Ordering::Acquire)
 }
 
 pub(crate) fn apply_qmp(qemu: &mut QemuConfig, paths: &QemuFaultPaths) -> anyhow::Result<()> {
@@ -656,7 +699,9 @@ mod tests {
     #[test]
     fn guest_start_enables_only_an_explicit_boot_probe_quit() {
         GUEST_STARTED.store(false, Ordering::Release);
-        observe_guest_output_line("KERNDIFF_GUEST_START version=1 run_id=sample");
+        observe_guest_output_line("KERNDIFF_GUEST_START version=1 run_id=not-hex");
+        assert!(!GUEST_STARTED.load(Ordering::Acquire));
+        observe_guest_output_line("KERNDIFF_GUEST_START version=1 run_id=abc123");
         assert!(GUEST_STARTED.load(Ordering::Acquire));
         assert!(should_quit_boot_probe(true, true));
         assert!(!should_quit_boot_probe(false, true));
