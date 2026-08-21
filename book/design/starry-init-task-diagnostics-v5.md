@@ -1,6 +1,7 @@
 # Starry init-task diagnostics v5
 
-Status: accepted for implementation, 2026-08-21.
+Status: implemented; normal QEMU regression accepted, 2026-08-21. End-to-end
+fault-page acceptance remains pending the next natural late recurrence.
 
 This compatibly extends
 [Starry post-spawn bootstrap diagnostics v4](starry-post-spawn-bootstrap-diagnostics-v4.md).
@@ -148,6 +149,20 @@ produce a complete v5 bitmap and is intentionally not moved by this diagnostic
 change. The first natural late recurrence supplies the end-to-end v5 page
 acceptance evidence; until then, the complete bitmap and damaged-page contracts
 are covered at the writer and decoder layers.
+
+Normal QEMU regression acceptance passed on TGOSKits commit
+`bbd466578a240350eea5e9179115ee5a4d58068d`, target ELF SHA-256
+`2830d64455b3411db913322e715e11957387004bc0cee36652f7cd22bf47af6a`, in
+KernDiff session `run-pipe-smoke-20260821T004204Z-56d437cd`. The single
+execution published all twelve phases, reached `shell-ready` at 2,548,056,306
+ns, published guest start for run `b364c7b0032ec9c0`, exited the application
+with status zero, and published both guest result and coverage-triggered before
+KernDiff reported `status=match` and `target_status=completed`. The successful
+run ended through the normal QMP `SHUTDOWN` path, so `diagnostic_complete=false`
+is expected: axbuild only saves and decodes the page for an authoritative QMP
+WATCHDOG event. This acceptance establishes absence of a normal-boot and
+coverage regression; it neither exercises the complete v5 fault-page bitmap nor
+estimates the natural hang rate.
 
 Rollback may restore the v4 writer while current axbuild continues to decode
 versions 1 through 4. Older axbuild rejects v5 diagnostics but preserves the raw
