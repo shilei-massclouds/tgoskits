@@ -1920,7 +1920,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             fs.clone(),
             RwFile::new(|operation| match operation {
                 SimpleFileOperation::Read => Ok(Some(Vec::new())),
-                SimpleFileOperation::Write(data) if data.is_empty() => Ok(None),
+                SimpleFileOperation::Write([]) => Ok(None),
                 SimpleFileOperation::Write(b"shell-ready") => {
                     ax_runtime::publish_kerndiff_boot_phase(
                         ax_runtime::KernDiffBootPhase::ShellReady,

@@ -216,7 +216,13 @@ checkpoint；axbuild 在原始 fault event 中输出 `bootstrap_checkpoint_bitma
 [Starry bootstrap feeder diagnostics v3](../../book/design/starry-bootstrap-feeder-diagnostics-v3.md)。
 v3 选中的启动后续区间由
 [Starry post-spawn bootstrap diagnostics v4](../../book/design/starry-post-spawn-bootstrap-diagnostics-v4.md)
-继续细分。
+继续细分；v4 在原始 fault event 中增加
+`bootstrap_followup_checkpoint_bitmap` 和
+`bootstrap_followup_checkpoint_elapsed_ns`。诊断页 v5 继续保留 v1--v4
+字节前缀，并增加 PID 1 构造、入队、task-extension 切换、首次调度和首次用户态往返的
+`init_task_checkpoint_bitmap` 与 `init_task_checkpoint_elapsed_ns`。固定字段、依赖关系和
+解释规则见
+[Starry init-task diagnostics v5](../../book/design/starry-init-task-diagnostics-v5.md)。
 
 所有 QEMU case 在 host stdout 输出一对单行 JSON 事件，前缀为
 `[axbuild] qemu-case-event `，schema 为 `axbuild-qemu-case` v1。start 事件记录

@@ -58,9 +58,32 @@ fn handle_user_page_fault(
 }
 
 /// Create a new user task.
-pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) -> TaskInner {
+pub fn new_user_task(name: &str, uctx: UserContext, set_child_tid: usize) -> TaskInner {
+    new_user_task_with_kind(name, uctx, set_child_tid, UserTaskKind::Regular)
+}
+
+/// Create the initial PID 1 user task.
+pub fn new_init_user_task(name: &str, uctx: UserContext) -> TaskInner {
+    new_user_task_with_kind(name, uctx, 0, UserTaskKind::Init)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UserTaskKind {
+    Regular,
+    Init,
+}
+
+fn new_user_task_with_kind(
+    name: &str,
+    mut uctx: UserContext,
+    set_child_tid: usize,
+    task_kind: UserTaskKind,
+) -> TaskInner {
     TaskInner::new(
         move || {
+            if task_kind == UserTaskKind::Init {
+                record_init_task_checkpoint(InitTaskExecutionCheckpoint::TaskEntered);
+            }
             let curr = ax_task::current();
 
             if let Some(tid) = (set_child_tid as *mut Pid).nullable() {
@@ -89,6 +112,7 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
                 // `_exit(0)`.
                 while check_signals(thr, &mut uctx, None, None) {}
             }
+            let mut first_user_run = true;
             while !thr.pending_exit() {
                 let tid = thr.tid();
                 let is_ptraced =
@@ -117,7 +141,18 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
                     crate::syscall::ptrace_setup_singlestep(&thr.proc_data, tid, &mut uctx);
                 }
 
+                if first_user_run && task_kind == UserTaskKind::Init {
+                    record_init_task_checkpoint(InitTaskExecutionCheckpoint::FirstUserRunEntered);
+                }
                 let reason = uctx.run();
+                if first_user_run {
+                    if task_kind == UserTaskKind::Init {
+                        record_init_task_checkpoint(
+                            InitTaskExecutionCheckpoint::FirstUserRunReturned,
+                        );
+                    }
+                    first_user_run = false;
+                }
 
                 set_timer_state(&curr, TimerState::Kernel);
 
@@ -381,6 +416,37 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
         name.into(),
         crate::config::KERNEL_STACK_SIZE,
     )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InitTaskExecutionCheckpoint {
+    TaskEntered,
+    FirstUserRunEntered,
+    FirstUserRunReturned,
+}
+
+fn record_init_task_checkpoint(checkpoint: InitTaskExecutionCheckpoint) {
+    #[cfg(feature = "kerndiff-fault-observer")]
+    let checkpoint = match checkpoint {
+        InitTaskExecutionCheckpoint::TaskEntered => {
+            ax_driver::kerndiff_fault::InitTaskCheckpoint::TaskEntered
+        }
+        InitTaskExecutionCheckpoint::FirstUserRunEntered => {
+            ax_driver::kerndiff_fault::InitTaskCheckpoint::FirstUserRunEntered
+        }
+        InitTaskExecutionCheckpoint::FirstUserRunReturned => {
+            ax_driver::kerndiff_fault::InitTaskCheckpoint::FirstUserRunReturned
+        }
+    };
+
+    #[cfg(feature = "kerndiff-fault-observer")]
+    let _ = ax_driver::kerndiff_fault::record_init_task_checkpoint(
+        checkpoint,
+        ax_hal::time::monotonic_time_nanos(),
+    );
+
+    #[cfg(not(feature = "kerndiff-fault-observer"))]
+    let _ = checkpoint;
 }
 
 fn ptrace_exit_event_code(sysno: usize, arg0: usize) -> Option<i32> {

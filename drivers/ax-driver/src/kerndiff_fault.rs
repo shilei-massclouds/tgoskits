@@ -40,10 +40,12 @@ pub const DIAGNOSTIC_PAGE_BYTES: usize = 4096;
 const TIMER_TICKS: u32 = (WATCHDOG_TIMEOUT_SECONDS as u32) << 9;
 const MAX_CPUS: usize = 64;
 const DIAGNOSTIC_MAGIC: u32 = 0x4b44_5744;
-const DIAGNOSTIC_VERSION: u32 = 4;
+const DIAGNOSTIC_VERSION: u32 = 5;
 pub const BOOT_PHASE_COUNT: usize = 12;
 const BOOTSTRAP_CHECKPOINT_COUNT: usize = 6;
 const BOOTSTRAP_FOLLOWUP_CHECKPOINT_COUNT: usize = 6;
+const INIT_TASK_CHECKPOINT_COUNT: usize = 14;
+const INIT_TASK_REQUIRED_PHASE_SEQUENCE: u64 = 11;
 
 static WATCHDOG_MMIO: AtomicUsize = AtomicUsize::new(0);
 static WATCHDOG_CONFIG_ADDRESS: AtomicU32 = AtomicU32::new(0);
@@ -52,6 +54,7 @@ static WATCHDOG_ARMED: AtomicBool = AtomicBool::new(false);
 static PVPANIC_NOTIFIED: AtomicBool = AtomicBool::new(false);
 static FORCED_STALE_MASK: AtomicU64 = AtomicU64::new(0);
 static BOOTSTRAP_FEEDER_TASK_ID: AtomicU64 = AtomicU64::new(0);
+static INIT_TASK_ID: AtomicU64 = AtomicU64::new(0);
 
 #[repr(C, align(4096))]
 struct DiagnosticPage {
@@ -74,6 +77,8 @@ struct DiagnosticPage {
     bootstrap_checkpoint_elapsed_ns: [AtomicU64; BOOTSTRAP_CHECKPOINT_COUNT],
     bootstrap_followup_checkpoint_bitmap: AtomicU64,
     bootstrap_followup_checkpoint_elapsed_ns: [AtomicU64; BOOTSTRAP_FOLLOWUP_CHECKPOINT_COUNT],
+    init_task_checkpoint_bitmap: AtomicU64,
+    init_task_checkpoint_elapsed_ns: [AtomicU64; INIT_TASK_CHECKPOINT_COUNT],
 }
 
 impl DiagnosticPage {
@@ -100,6 +105,9 @@ impl DiagnosticPage {
             bootstrap_followup_checkpoint_bitmap: AtomicU64::new(0),
             bootstrap_followup_checkpoint_elapsed_ns: [const { AtomicU64::new(0) };
                 BOOTSTRAP_FOLLOWUP_CHECKPOINT_COUNT],
+            init_task_checkpoint_bitmap: AtomicU64::new(0),
+            init_task_checkpoint_elapsed_ns: [const { AtomicU64::new(0) };
+                INIT_TASK_CHECKPOINT_COUNT],
         }
     }
 }
@@ -173,6 +181,61 @@ impl BootstrapFollowupCheckpoint {
             Self::SerialInitReturned => 0b00_0110,
             Self::RtcOutputEntered => 0b00_1110,
             Self::RtcOutputReturned => 0b01_1110,
+        }
+    }
+}
+
+/// A persistent boundary in PID 1 task setup or first execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum InitTaskCheckpoint {
+    /// Init task construction is about to begin after its image was loaded.
+    TaskCreateRequested  = 0,
+    /// Task construction and page-table-root assignment returned.
+    TaskConstructed      = 1,
+    /// Process, stdio, thread, and task-extension setup completed.
+    ProcessReady         = 2,
+    /// The main task is about to call `spawn_task_with`.
+    SpawnRequested       = 3,
+    /// The init task has a stable reference but is not runnable yet.
+    TaskInitialized      = 4,
+    /// Registry and runqueue insertion returned to the main task.
+    SpawnReturned        = 5,
+    /// Console IRQ arming returned to the main task.
+    ConsoleIrqArmed      = 6,
+    /// The main task is about to join the init task.
+    JoinEntered          = 7,
+    /// PID 1's task-extension switch hook began before scope acquisition.
+    TaskExtEntered       = 8,
+    /// PID 1's task-extension switch hook completed scope installation.
+    TaskExtReturned      = 9,
+    /// The scheduler tracepoint selected the registered init task.
+    SchedulerSelected    = 10,
+    /// The init task began executing its user-task closure.
+    TaskEntered          = 11,
+    /// The init task is about to enter user mode for the first time.
+    FirstUserRunEntered  = 12,
+    /// The init task returned from its first user-mode interval.
+    FirstUserRunReturned = 13,
+}
+
+impl InitTaskCheckpoint {
+    const fn required_bitmap(self) -> u64 {
+        match self {
+            Self::TaskCreateRequested => 0,
+            Self::TaskConstructed => 0x0001,
+            Self::ProcessReady => 0x0003,
+            Self::SpawnRequested => 0x0007,
+            Self::TaskInitialized => 0x000f,
+            Self::SpawnReturned => 0x001f,
+            Self::ConsoleIrqArmed => 0x003f,
+            Self::JoinEntered => 0x007f,
+            Self::TaskExtEntered => 0x001f,
+            Self::TaskExtReturned => 0x011f,
+            Self::SchedulerSelected => 0x031f,
+            Self::TaskEntered => 0x071f,
+            Self::FirstUserRunEntered => 0x0f1f,
+            Self::FirstUserRunReturned => 0x1f1f,
         }
     }
 }
@@ -437,8 +500,94 @@ fn record_bootstrap_followup_checkpoint_in(
     Some(elapsed_ns)
 }
 
+/// Records one init-task boundary without allocating, locking, or logging.
+pub fn record_init_task_checkpoint(checkpoint: InitTaskCheckpoint, now_ns: u64) -> Option<u64> {
+    record_init_task_checkpoint_in(
+        &DIAGNOSTIC,
+        WATCHDOG_ARMED.load(Ordering::Acquire),
+        checkpoint,
+        now_ns,
+    )
+}
+
+/// Publishes the init task identity before the task becomes runnable.
+pub fn register_init_task(task_id: u64) -> bool {
+    if task_id == 0
+        || !WATCHDOG_ARMED.load(Ordering::Acquire)
+        || DIAGNOSTIC
+            .init_task_checkpoint_bitmap
+            .load(Ordering::Acquire)
+            & (1u64 << InitTaskCheckpoint::TaskInitialized as usize)
+            == 0
+    {
+        return false;
+    }
+    INIT_TASK_ID
+        .compare_exchange(0, task_id, Ordering::Release, Ordering::Acquire)
+        .is_ok()
+}
+
+/// Records the scheduler selecting the registered init task for the first time.
+pub fn record_init_scheduler_selection(task_id: u64, now_ns: u64) -> Option<u64> {
+    let init_task_id = INIT_TASK_ID.load(Ordering::Acquire);
+    record_init_scheduler_selection_in(
+        &DIAGNOSTIC,
+        WATCHDOG_ARMED.load(Ordering::Acquire),
+        init_task_id,
+        task_id,
+        now_ns,
+    )
+}
+
+fn record_init_scheduler_selection_in(
+    diagnostic: &DiagnosticPage,
+    watchdog_armed: bool,
+    init_task_id: u64,
+    task_id: u64,
+    now_ns: u64,
+) -> Option<u64> {
+    if init_task_id == 0 || task_id != init_task_id {
+        return None;
+    }
+    record_init_task_checkpoint_in(
+        diagnostic,
+        watchdog_armed,
+        InitTaskCheckpoint::SchedulerSelected,
+        now_ns,
+    )
+}
+
+fn record_init_task_checkpoint_in(
+    diagnostic: &DiagnosticPage,
+    watchdog_armed: bool,
+    checkpoint: InitTaskCheckpoint,
+    now_ns: u64,
+) -> Option<u64> {
+    if !watchdog_armed
+        || diagnostic.phase_sequence.load(Ordering::Acquire) < INIT_TASK_REQUIRED_PHASE_SEQUENCE
+    {
+        return None;
+    }
+    let bit = 1u64 << checkpoint as usize;
+    let observed = diagnostic
+        .init_task_checkpoint_bitmap
+        .load(Ordering::Acquire);
+    let required = checkpoint.required_bitmap();
+    if observed & bit != 0 || observed & required != required {
+        return None;
+    }
+    let elapsed_ns = now_ns.saturating_sub(diagnostic.boot_epoch.load(Ordering::Acquire));
+    diagnostic.init_task_checkpoint_elapsed_ns[checkpoint as usize]
+        .store(elapsed_ns, Ordering::Relaxed);
+    diagnostic
+        .init_task_checkpoint_bitmap
+        .fetch_or(bit, Ordering::Release);
+    Some(elapsed_ns)
+}
+
 fn reset_diagnostic_page(diagnostic: &DiagnosticPage, boot_epoch: u64, online_mask: u64) {
     BOOTSTRAP_FEEDER_TASK_ID.store(0, Ordering::Release);
+    INIT_TASK_ID.store(0, Ordering::Release);
     diagnostic.boot_epoch.store(boot_epoch, Ordering::Release);
     diagnostic.online_mask.store(online_mask, Ordering::Release);
     diagnostic.stale_mask.store(0, Ordering::Release);
@@ -463,6 +612,12 @@ fn reset_diagnostic_page(diagnostic: &DiagnosticPage, boot_epoch: u64, online_ma
         .bootstrap_followup_checkpoint_bitmap
         .store(0, Ordering::Release);
     for elapsed in &diagnostic.bootstrap_followup_checkpoint_elapsed_ns {
+        elapsed.store(0, Ordering::Relaxed);
+    }
+    diagnostic
+        .init_task_checkpoint_bitmap
+        .store(0, Ordering::Release);
+    for elapsed in &diagnostic.init_task_checkpoint_elapsed_ns {
         elapsed.store(0, Ordering::Relaxed);
     }
 }
@@ -778,7 +933,7 @@ mod tests {
     fn diagnostic_layout_fits_one_qmp_memsave_page() {
         assert!(size_of::<DiagnosticPage>() <= DIAGNOSTIC_PAGE_BYTES);
         assert_eq!(DIAGNOSTIC.magic, DIAGNOSTIC_MAGIC);
-        assert_eq!(DIAGNOSTIC.version, 4);
+        assert_eq!(DIAGNOSTIC.version, 5);
         assert_eq!(size_of::<DiagnosticPage>(), 4096);
         assert_eq!(
             core::mem::offset_of!(DiagnosticPage, reached_phase_bitmap),
@@ -803,6 +958,14 @@ mod tests {
         assert_eq!(
             core::mem::offset_of!(DiagnosticPage, bootstrap_followup_checkpoint_elapsed_ns),
             1760
+        );
+        assert_eq!(
+            core::mem::offset_of!(DiagnosticPage, init_task_checkpoint_bitmap),
+            1808
+        );
+        assert_eq!(
+            core::mem::offset_of!(DiagnosticPage, init_task_checkpoint_elapsed_ns),
+            1816
         );
     }
 
@@ -1009,7 +1172,84 @@ mod tests {
     }
 
     #[test]
-    fn watchdog_reset_clears_boot_phases_and_bootstrap_checkpoints() {
+    fn init_task_checkpoints_allow_the_scheduled_chain_before_spawn_returns() {
+        let diagnostic = DiagnosticPage::new();
+        diagnostic.boot_epoch.store(100, Ordering::Release);
+        assert_eq!(
+            record_init_task_checkpoint_in(
+                &diagnostic,
+                true,
+                InitTaskCheckpoint::TaskCreateRequested,
+                105,
+            ),
+            None
+        );
+        diagnostic
+            .phase_sequence
+            .store(INIT_TASK_REQUIRED_PHASE_SEQUENCE, Ordering::Release);
+
+        for (checkpoint, now_ns) in [
+            (InitTaskCheckpoint::TaskCreateRequested, 110),
+            (InitTaskCheckpoint::TaskConstructed, 120),
+            (InitTaskCheckpoint::ProcessReady, 130),
+            (InitTaskCheckpoint::SpawnRequested, 140),
+            (InitTaskCheckpoint::TaskInitialized, 150),
+            (InitTaskCheckpoint::TaskExtEntered, 160),
+            (InitTaskCheckpoint::TaskExtReturned, 170),
+            (InitTaskCheckpoint::SchedulerSelected, 180),
+            (InitTaskCheckpoint::TaskEntered, 190),
+            (InitTaskCheckpoint::FirstUserRunEntered, 200),
+            (InitTaskCheckpoint::FirstUserRunReturned, 210),
+            (InitTaskCheckpoint::SpawnReturned, 220),
+            (InitTaskCheckpoint::ConsoleIrqArmed, 230),
+            (InitTaskCheckpoint::JoinEntered, 240),
+        ] {
+            assert_eq!(
+                record_init_task_checkpoint_in(&diagnostic, true, checkpoint, now_ns),
+                Some(now_ns - 100)
+            );
+        }
+        assert_eq!(
+            diagnostic
+                .init_task_checkpoint_bitmap
+                .load(Ordering::Acquire),
+            0x3fff
+        );
+    }
+
+    #[test]
+    fn init_scheduler_selection_records_only_the_registered_task() {
+        let diagnostic = DiagnosticPage::new();
+        diagnostic.boot_epoch.store(100, Ordering::Release);
+        diagnostic
+            .phase_sequence
+            .store(INIT_TASK_REQUIRED_PHASE_SEQUENCE, Ordering::Release);
+        for (checkpoint, now_ns) in [
+            (InitTaskCheckpoint::TaskCreateRequested, 110),
+            (InitTaskCheckpoint::TaskConstructed, 120),
+            (InitTaskCheckpoint::ProcessReady, 130),
+            (InitTaskCheckpoint::SpawnRequested, 140),
+            (InitTaskCheckpoint::TaskInitialized, 150),
+            (InitTaskCheckpoint::TaskExtEntered, 160),
+            (InitTaskCheckpoint::TaskExtReturned, 170),
+        ] {
+            assert!(
+                record_init_task_checkpoint_in(&diagnostic, true, checkpoint, now_ns).is_some()
+            );
+        }
+
+        assert_eq!(
+            record_init_scheduler_selection_in(&diagnostic, true, 41, 40, 180),
+            None
+        );
+        assert_eq!(
+            record_init_scheduler_selection_in(&diagnostic, true, 41, 41, 190),
+            Some(90)
+        );
+    }
+
+    #[test]
+    fn watchdog_reset_clears_boot_phases_and_all_checkpoints() {
         let diagnostic = DiagnosticPage::new();
         diagnostic.boot_epoch.store(100, Ordering::Release);
         assert!(record_boot_phase_in(&diagnostic, true, 0, 110).is_some());
@@ -1026,6 +1266,10 @@ mod tests {
             .bootstrap_followup_checkpoint_bitmap
             .store(1, Ordering::Release);
         diagnostic.bootstrap_followup_checkpoint_elapsed_ns[0].store(30, Ordering::Release);
+        diagnostic
+            .init_task_checkpoint_bitmap
+            .store(1, Ordering::Release);
+        diagnostic.init_task_checkpoint_elapsed_ns[0].store(40, Ordering::Release);
 
         reset_diagnostic_page(&diagnostic, 500, 1);
 
@@ -1053,6 +1297,18 @@ mod tests {
         assert!(
             diagnostic
                 .bootstrap_followup_checkpoint_elapsed_ns
+                .iter()
+                .all(|elapsed| elapsed.load(Ordering::Acquire) == 0)
+        );
+        assert_eq!(
+            diagnostic
+                .init_task_checkpoint_bitmap
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(
+            diagnostic
+                .init_task_checkpoint_elapsed_ns
                 .iter()
                 .all(|elapsed| elapsed.load(Ordering::Acquire) == 0)
         );

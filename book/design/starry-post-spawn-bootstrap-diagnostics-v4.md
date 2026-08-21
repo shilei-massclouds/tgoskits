@@ -1,6 +1,8 @@
 # Starry post-spawn bootstrap diagnostics v4
 
-Status: accepted, 2026-08-20.
+Status: accepted and superseded by
+[Starry init-task diagnostics v5](starry-init-task-diagnostics-v5.md),
+2026-08-21.
 
 This compatibly extends
 [Starry bootstrap feeder diagnostics v3](starry-bootstrap-feeder-diagnostics-v3.md).
