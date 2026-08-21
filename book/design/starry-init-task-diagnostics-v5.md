@@ -136,6 +136,43 @@ Only the interval selected by the next natural recurrence receives finer
 instrumentation. Version 5 is diagnostic and does not claim a root cause or
 change scheduling behavior.
 
+## Observer-effect amendment
+
+The accepted v5 scheduler tracepoint originally evaluated two monotonic-clock
+reads on every context switch and then called the bootstrap-feeder and init-task
+recorders. Almost every call was rejected by task identity, so the clock reads
+were unconditional observer overhead in a scheduler-sensitive path. The 156/156
+successful executions at TGOSKits `542c2b60826d5363fbff387322a7b03003937dcf`
+and target ELF SHA-256
+`928b7ac6431b88cbfa7ef1efaefb4d3bcf927ac0baf002f4f47a5b16311953a3`
+remain an engineering baseline only; they were not a prospective A/B sample and
+cannot exclude a timing-sensitive observer effect.
+
+Version 5 therefore adds a compatible lazy recorder while retaining both eager
+recorders for existing callers. A normal switch reads at most the registered
+bootstrap-feeder and init task IDs. The clock callback is evaluated exactly once
+only when an ID matches, the watchdog is armed, the existing Acquire-observed
+checkpoint dependencies are complete, and the selection bit is still clear.
+Elapsed time is still stored before the bit is published with Release ordering.
+The trace event remains after diagnostic recording, and this amendment adds no
+lock, allocation, serial output, task getter, global state, page field, or
+decoder change.
+
+Removing the scheduler checkpoints entirely would lose the narrow v4/v5 fault
+interval. Caching or reusing a scheduler timestamp would add a second time source
+and change elapsed semantics. Gating the whole tracepoint would alter unrelated
+`sched_switch` observation. The lazy ax-driver boundary removes the identified
+overhead while preserving those contracts and both compatibility entry points.
+
+The change must be rolled back for investigation if a pinned, randomized cold-
+boot A/B comparison finds the lazy arm has a higher authoritative hang rate with
+a one-sided Fisher exact `p < 0.05`, if any ready sample misses a boot phase,
+guest start, or coverage, or if its `shell-ready` median or p95 exceeds the eager
+arm by more than 10%. Identity drift, build/configuration failure, or
+indeterminate samples do not justify a performance conclusion. A rollback
+restores only the eager tracepoint calls; diagnostic page v5 and its decoder stay
+compatible.
+
 ## Verification and rollback
 
 Lowest-layer tests cover v5 offsets and page size, concurrent dependency chains,

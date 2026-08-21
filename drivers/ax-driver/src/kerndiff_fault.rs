@@ -56,6 +56,25 @@ static FORCED_STALE_MASK: AtomicU64 = AtomicU64::new(0);
 static BOOTSTRAP_FEEDER_TASK_ID: AtomicU64 = AtomicU64::new(0);
 static INIT_TASK_ID: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone, Copy)]
+struct SchedulerTaskIds {
+    bootstrap_feeder: u64,
+    init: u64,
+}
+
+impl SchedulerTaskIds {
+    const fn new(bootstrap_feeder: u64, init: u64) -> Self {
+        Self {
+            bootstrap_feeder,
+            init,
+        }
+    }
+
+    const fn contains(self, task_id: u64) -> bool {
+        task_id != 0 && (task_id == self.bootstrap_feeder || task_id == self.init)
+    }
+}
+
 #[repr(C, align(4096))]
 struct DiagnosticPage {
     magic: u32,
@@ -398,6 +417,55 @@ pub fn register_bootstrap_feeder_task(task_id: u64) -> bool {
         .is_ok()
 }
 
+/// Records the first eligible diagnostic task selected by the scheduler.
+///
+/// The clock callback is evaluated only after the task identity, watchdog state,
+/// checkpoint dependencies, and unpublished selection bit have been verified.
+/// Ordinary context switches therefore perform at most the two registered-task
+/// identity loads and do not read the clock.
+pub fn record_scheduler_selection(task_id: u64, read_now_ns: impl FnOnce() -> u64) -> Option<u64> {
+    let task_ids = SchedulerTaskIds::new(
+        BOOTSTRAP_FEEDER_TASK_ID.load(Ordering::Acquire),
+        INIT_TASK_ID.load(Ordering::Acquire),
+    );
+    if !task_ids.contains(task_id) {
+        return None;
+    }
+    record_scheduler_selection_in(
+        &DIAGNOSTIC,
+        WATCHDOG_ARMED.load(Ordering::Acquire),
+        task_ids,
+        task_id,
+        read_now_ns,
+    )
+}
+
+fn record_scheduler_selection_in(
+    diagnostic: &DiagnosticPage,
+    watchdog_armed: bool,
+    task_ids: SchedulerTaskIds,
+    task_id: u64,
+    read_now_ns: impl FnOnce() -> u64,
+) -> Option<u64> {
+    if task_id != 0 && task_id == task_ids.bootstrap_feeder {
+        return record_bootstrap_followup_checkpoint_with_clock_in(
+            diagnostic,
+            watchdog_armed,
+            BootstrapFollowupCheckpoint::FeederSchedulerSelected,
+            read_now_ns,
+        );
+    }
+    if task_id != 0 && task_id == task_ids.init {
+        return record_init_task_checkpoint_with_clock_in(
+            diagnostic,
+            watchdog_armed,
+            InitTaskCheckpoint::SchedulerSelected,
+            read_now_ns,
+        );
+    }
+    None
+}
+
 /// Records the scheduler selecting the registered feeder for the first time.
 pub fn record_bootstrap_scheduler_selection(task_id: u64, now_ns: u64) -> Option<u64> {
     let feeder_task_id = BOOTSTRAP_FEEDER_TASK_ID.load(Ordering::Acquire);
@@ -473,6 +541,20 @@ fn record_bootstrap_followup_checkpoint_in(
     checkpoint: BootstrapFollowupCheckpoint,
     now_ns: u64,
 ) -> Option<u64> {
+    record_bootstrap_followup_checkpoint_with_clock_in(
+        diagnostic,
+        watchdog_armed,
+        checkpoint,
+        || now_ns,
+    )
+}
+
+fn record_bootstrap_followup_checkpoint_with_clock_in(
+    diagnostic: &DiagnosticPage,
+    watchdog_armed: bool,
+    checkpoint: BootstrapFollowupCheckpoint,
+    read_now_ns: impl FnOnce() -> u64,
+) -> Option<u64> {
     if !watchdog_armed {
         return None;
     }
@@ -491,6 +573,7 @@ fn record_bootstrap_followup_checkpoint_in(
     if observed & bit != 0 || observed & required_followup != required_followup {
         return None;
     }
+    let now_ns = read_now_ns();
     let elapsed_ns = now_ns.saturating_sub(diagnostic.boot_epoch.load(Ordering::Acquire));
     diagnostic.bootstrap_followup_checkpoint_elapsed_ns[checkpoint as usize]
         .store(elapsed_ns, Ordering::Relaxed);
@@ -563,6 +646,15 @@ fn record_init_task_checkpoint_in(
     checkpoint: InitTaskCheckpoint,
     now_ns: u64,
 ) -> Option<u64> {
+    record_init_task_checkpoint_with_clock_in(diagnostic, watchdog_armed, checkpoint, || now_ns)
+}
+
+fn record_init_task_checkpoint_with_clock_in(
+    diagnostic: &DiagnosticPage,
+    watchdog_armed: bool,
+    checkpoint: InitTaskCheckpoint,
+    read_now_ns: impl FnOnce() -> u64,
+) -> Option<u64> {
     if !watchdog_armed
         || diagnostic.phase_sequence.load(Ordering::Acquire) < INIT_TASK_REQUIRED_PHASE_SEQUENCE
     {
@@ -576,6 +668,7 @@ fn record_init_task_checkpoint_in(
     if observed & bit != 0 || observed & required != required {
         return None;
     }
+    let now_ns = read_now_ns();
     let elapsed_ns = now_ns.saturating_sub(diagnostic.boot_epoch.load(Ordering::Acquire));
     diagnostic.init_task_checkpoint_elapsed_ns[checkpoint as usize]
         .store(elapsed_ns, Ordering::Relaxed);
@@ -1131,6 +1224,104 @@ mod tests {
     }
 
     #[test]
+    fn lazy_scheduler_selection_skips_clock_until_a_checkpoint_is_eligible() {
+        let missing_dependencies = DiagnosticPage::new();
+        let eligible = DiagnosticPage::new();
+        eligible.boot_epoch.store(100, Ordering::Release);
+        for (checkpoint, now_ns) in [
+            (BootstrapCheckpoint::FeederSpawnRequested, 110),
+            (BootstrapCheckpoint::FeederTaskInitialized, 120),
+        ] {
+            assert!(record_bootstrap_checkpoint_in(&eligible, true, checkpoint, now_ns).is_some());
+        }
+        let clock_reads = core::cell::Cell::new(0);
+
+        for (diagnostic, watchdog_armed, task_ids, task_id) in [
+            (&missing_dependencies, true, SchedulerTaskIds::new(0, 0), 41),
+            (
+                &missing_dependencies,
+                true,
+                SchedulerTaskIds::new(41, 42),
+                43,
+            ),
+            (
+                &missing_dependencies,
+                true,
+                SchedulerTaskIds::new(41, 0),
+                41,
+            ),
+            (
+                &missing_dependencies,
+                true,
+                SchedulerTaskIds::new(0, 42),
+                42,
+            ),
+            (&eligible, false, SchedulerTaskIds::new(41, 0), 41),
+        ] {
+            assert_eq!(
+                record_scheduler_selection_in(
+                    diagnostic,
+                    watchdog_armed,
+                    task_ids,
+                    task_id,
+                    || {
+                        clock_reads.set(clock_reads.get() + 1);
+                        999
+                    },
+                ),
+                None
+            );
+        }
+        assert_eq!(clock_reads.get(), 0);
+    }
+
+    #[test]
+    fn lazy_scheduler_selection_reads_clock_once_for_the_bootstrap_feeder() {
+        let diagnostic = DiagnosticPage::new();
+        diagnostic.boot_epoch.store(100, Ordering::Release);
+        for (checkpoint, now_ns) in [
+            (BootstrapCheckpoint::FeederSpawnRequested, 110),
+            (BootstrapCheckpoint::FeederTaskInitialized, 120),
+        ] {
+            assert!(
+                record_bootstrap_checkpoint_in(&diagnostic, true, checkpoint, now_ns).is_some()
+            );
+        }
+        let clock_reads = core::cell::Cell::new(0);
+        let task_ids = SchedulerTaskIds::new(41, 0);
+
+        assert_eq!(
+            record_scheduler_selection_in(&diagnostic, true, task_ids, 41, || {
+                clock_reads.set(clock_reads.get() + 1);
+                140
+            }),
+            Some(40)
+        );
+        assert_eq!(clock_reads.get(), 1);
+        assert_eq!(
+            diagnostic.bootstrap_followup_checkpoint_elapsed_ns
+                [BootstrapFollowupCheckpoint::FeederSchedulerSelected as usize]
+                .load(Ordering::Acquire),
+            40
+        );
+        assert_eq!(
+            diagnostic
+                .bootstrap_followup_checkpoint_bitmap
+                .load(Ordering::Acquire),
+            1
+        );
+
+        assert_eq!(
+            record_scheduler_selection_in(&diagnostic, true, task_ids, 41, || {
+                clock_reads.set(clock_reads.get() + 1);
+                150
+            }),
+            None
+        );
+        assert_eq!(clock_reads.get(), 1);
+    }
+
+    #[test]
     fn bootstrap_followup_rejects_missing_main_thread_boundaries() {
         let diagnostic = DiagnosticPage::new();
         diagnostic.boot_epoch.store(100, Ordering::Release);
@@ -1246,6 +1437,60 @@ mod tests {
             record_init_scheduler_selection_in(&diagnostic, true, 41, 41, 190),
             Some(90)
         );
+    }
+
+    #[test]
+    fn lazy_scheduler_selection_reads_clock_once_for_the_init_task() {
+        let diagnostic = DiagnosticPage::new();
+        diagnostic.boot_epoch.store(100, Ordering::Release);
+        diagnostic
+            .phase_sequence
+            .store(INIT_TASK_REQUIRED_PHASE_SEQUENCE, Ordering::Release);
+        for (checkpoint, now_ns) in [
+            (InitTaskCheckpoint::TaskCreateRequested, 110),
+            (InitTaskCheckpoint::TaskConstructed, 120),
+            (InitTaskCheckpoint::ProcessReady, 130),
+            (InitTaskCheckpoint::SpawnRequested, 140),
+            (InitTaskCheckpoint::TaskInitialized, 150),
+            (InitTaskCheckpoint::TaskExtEntered, 160),
+            (InitTaskCheckpoint::TaskExtReturned, 170),
+        ] {
+            assert!(
+                record_init_task_checkpoint_in(&diagnostic, true, checkpoint, now_ns).is_some()
+            );
+        }
+        let clock_reads = core::cell::Cell::new(0);
+        let task_ids = SchedulerTaskIds::new(0, 42);
+
+        assert_eq!(
+            record_scheduler_selection_in(&diagnostic, true, task_ids, 42, || {
+                clock_reads.set(clock_reads.get() + 1);
+                190
+            }),
+            Some(90)
+        );
+        assert_eq!(clock_reads.get(), 1);
+        assert_eq!(
+            diagnostic.init_task_checkpoint_elapsed_ns
+                [InitTaskCheckpoint::SchedulerSelected as usize]
+                .load(Ordering::Acquire),
+            90
+        );
+        assert_eq!(
+            diagnostic
+                .init_task_checkpoint_bitmap
+                .load(Ordering::Acquire),
+            0x071f
+        );
+
+        assert_eq!(
+            record_scheduler_selection_in(&diagnostic, true, task_ids, 42, || {
+                clock_reads.set(clock_reads.get() + 1);
+                200
+            }),
+            None
+        );
+        assert_eq!(clock_reads.get(), 1);
     }
 
     #[test]
