@@ -1,7 +1,8 @@
 # Starry init-task diagnostics v5
 
-Status: implemented; normal QEMU regression accepted, 2026-08-21. End-to-end
-fault-page acceptance remains pending the next natural late recurrence.
+Status: implemented; normal QEMU regression and controlled observer A/B
+accepted, 2026-08-21. End-to-end init-task fault-page acceptance remains pending
+a natural late recurrence.
 
 This compatibly extends
 [Starry post-spawn bootstrap diagnostics v4](starry-post-spawn-bootstrap-diagnostics-v4.md).
@@ -200,6 +201,69 @@ is expected: axbuild only saves and decodes the page for an authoritative QMP
 WATCHDOG event. This acceptance establishes absence of a normal-boot and
 coverage regression; it neither exercises the complete v5 fault-page bitmap nor
 estimates the natural hang rate.
+
+### Controlled observer A/B acceptance
+
+The prospective observer comparison completed on 2026-08-21 with 200 paired
+cold boots per arm, 400 counted boots in total, after one excluded warmup per
+arm. Each pair ran serially. The low bit of byte zero from
+`SHA-256("defect-0001-observer-ab-v1:" + decimal_pair_index)` selected `AB` or
+`BA`, producing 98 `AB` and 102 `BA` pairs. No sample was replaced and no
+`kernel-watchdog` fault was injected.
+
+Arm A fixed the eager baseline at TGOSKits
+`542c2b60826d5363fbff387322a7b03003937dcf` and target ELF SHA-256
+`928b7ac6431b88cbfa7ef1efaefb4d3bcf927ac0baf002f4f47a5b16311953a3`.
+Arm B fixed the lazy implementation at TGOSKits
+`cf4785fbecc15ac72ba3f44248f38254b94c6cec` and target ELF SHA-256
+`6a062fbcf66482a474b2d42396e4cb6be32a542ba99c6d86d85c4a8871d7b9e9`.
+The common pipe-smoke scenario, guest bundle, input, rootfs, firmware, QEMU
+executable, and QEMU case identities matched in the preflight. A temporary
+harness-only Cargo wrapper restored the locked arm ELF after an inner Cargo
+build; its SHA-256 was
+`7ac62e0db834171c61ca071d247cad51781d1e9cde0aeab7311ba28d1772afde`.
+It did not enable the boot-probe contract or change the normal coverage and QMP
+paths.
+
+| arm | ready | hang | indeterminate | hang rate | Wilson 95% interval |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| A, eager | 199 | 1 | 0 | 0.5% | 0.0883%--2.7774% |
+| B, lazy | 198 | 2 | 0 | 1.0% | 0.2747%--3.5722% |
+
+The one-sided Fisher exact test for a higher B hang rate produced `p=0.5`.
+Although the observed B rate was numerically higher, it did not meet the
+predeclared `p < 0.05` rollback condition. Every ready sample reached all twelve
+ordered phases, guest start, fresh coverage, and normal QMP `SHUTDOWN`. Among
+ready samples, A's `shell-ready` median and p95 were 2,446,624,551 ns and
+2,590,336,550.9 ns; B's were 2,448,930,136 ns and 2,601,386,157.8 ns. B was
+0.0942% higher at the median and 0.4266% higher at p95, below both 10% limits.
+The performance rollback conditions therefore did not trigger.
+
+Three counted boots produced natural authoritative QMP `WATCHDOG action=pause`
+events with complete v5 diagnostics:
+
+- B pair 1, position 1 stopped after `watchdog-armed`. Its bootstrap bitmap was
+  `0x7`, follow-up bitmap `0x6`, init bitmap `0x0`, and CPU 0 recorded
+  `scheduler_epoch=0`, `irq_epoch=1`. The missing follow-up bit was
+  `feeder-scheduler-selected`; main bootstrap return and serial-init entry were
+  published. The QMP event arrived at 67,115 ms.
+- A pair 33, position 1 stopped at the same boundary with bootstrap `0x7`,
+  follow-up `0x6`, init `0x0`, CPU 0 `scheduler_epoch=0`, and `irq_epoch=1`.
+  The QMP event arrived at 67,062 ms. The later 300-second case timeout and
+  missing coverage were secondary to the already authoritative paused guest.
+- B pair 80, position 2 stopped after `filesystem-init-start`. Both bootstrap
+  bitmaps were complete at `0x3f`, the init bitmap was `0x0`, and CPU 0 recorded
+  `scheduler_epoch=1`, `irq_epoch=4`. The feeder was selected, entered, set its
+  affinity, and completed its first poll. The QMP event arrived at 67,139 ms.
+
+The first two are natural recurrences of the existing early Variant A window;
+the third is a natural recurrence of Variant B. They show that removing the
+unconditional clock reads does not by itself eliminate the defect. Conversely,
+one versus two observed hangs, the broad overlapping intervals, and `p=0.5` do
+not establish equivalence, a common root cause, or a changed natural failure
+rate. The defect remains open and unresolved. These early recurrences do not
+exercise the v5 init-task chain, whose bitmap correctly remained zero before
+`userspace-init`.
 
 Rollback may restore the v4 writer while current axbuild continues to decode
 versions 1 through 4. Older axbuild rejects v5 diagnostics but preserves the raw
