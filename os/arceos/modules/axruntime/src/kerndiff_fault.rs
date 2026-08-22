@@ -10,7 +10,9 @@ use core::{
     time::Duration,
 };
 
-use ax_driver::kerndiff_fault::{BootstrapCheckpoint, BootstrapFollowupCheckpoint};
+use ax_driver::kerndiff_fault::{
+    BootstrapCheckpoint, BootstrapFollowupCheckpoint, SerialInitCheckpoint,
+};
 
 use crate::KernDiffBootPhase;
 
@@ -255,6 +257,12 @@ pub(super) fn record_bootstrap_followup_checkpoint(checkpoint: BootstrapFollowup
         checkpoint,
         ax_hal::time::monotonic_time_nanos(),
     );
+}
+
+pub(super) fn record_serial_init_checkpoint(checkpoint: SerialInitCheckpoint) {
+    let _ = ax_driver::kerndiff_fault::record_serial_init_checkpoint(checkpoint, || {
+        ax_hal::time::monotonic_time_nanos()
+    });
 }
 
 fn liveness_loop(cpu: usize) {

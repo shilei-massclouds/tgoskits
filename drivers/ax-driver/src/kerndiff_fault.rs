@@ -40,11 +40,12 @@ pub const DIAGNOSTIC_PAGE_BYTES: usize = 4096;
 const TIMER_TICKS: u32 = (WATCHDOG_TIMEOUT_SECONDS as u32) << 9;
 const MAX_CPUS: usize = 64;
 const DIAGNOSTIC_MAGIC: u32 = 0x4b44_5744;
-const DIAGNOSTIC_VERSION: u32 = 5;
+const DIAGNOSTIC_VERSION: u32 = 6;
 pub const BOOT_PHASE_COUNT: usize = 12;
 const BOOTSTRAP_CHECKPOINT_COUNT: usize = 6;
 const BOOTSTRAP_FOLLOWUP_CHECKPOINT_COUNT: usize = 6;
 const INIT_TASK_CHECKPOINT_COUNT: usize = 14;
+const SERIAL_INIT_CHECKPOINT_COUNT: usize = 18;
 const INIT_TASK_REQUIRED_PHASE_SEQUENCE: u64 = 11;
 
 static WATCHDOG_MMIO: AtomicUsize = AtomicUsize::new(0);
@@ -98,6 +99,8 @@ struct DiagnosticPage {
     bootstrap_followup_checkpoint_elapsed_ns: [AtomicU64; BOOTSTRAP_FOLLOWUP_CHECKPOINT_COUNT],
     init_task_checkpoint_bitmap: AtomicU64,
     init_task_checkpoint_elapsed_ns: [AtomicU64; INIT_TASK_CHECKPOINT_COUNT],
+    serial_init_checkpoint_bitmap: AtomicU64,
+    serial_init_checkpoint_elapsed_ns: [AtomicU64; SERIAL_INIT_CHECKPOINT_COUNT],
 }
 
 impl DiagnosticPage {
@@ -127,6 +130,9 @@ impl DiagnosticPage {
             init_task_checkpoint_bitmap: AtomicU64::new(0),
             init_task_checkpoint_elapsed_ns: [const { AtomicU64::new(0) };
                 INIT_TASK_CHECKPOINT_COUNT],
+            serial_init_checkpoint_bitmap: AtomicU64::new(0),
+            serial_init_checkpoint_elapsed_ns: [const { AtomicU64::new(0) };
+                SERIAL_INIT_CHECKPOINT_COUNT],
         }
     }
 }
@@ -255,6 +261,72 @@ impl InitTaskCheckpoint {
             Self::TaskEntered => 0x071f,
             Self::FirstUserRunEntered => 0x0f1f,
             Self::FirstUserRunReturned => 0x1f1f,
+        }
+    }
+}
+
+/// A persistent boundary inside serial initialization or its first overlapping timer IRQ.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum SerialInitCheckpoint {
+    /// Serial device collection is about to begin.
+    DeviceDrainEntered   = 0,
+    /// Serial device collection returned.
+    DeviceDrainReturned  = 1,
+    /// The first enumerated serial runtime is about to be built.
+    FirstRuntimeBuildEntered = 2,
+    /// The first UART's interrupt mask operation is about to begin.
+    FirstPortMaskEntered = 3,
+    /// The first UART's interrupt mask operation returned.
+    FirstPortMaskReturned = 4,
+    /// Allocation and construction of the first runtime is about to begin.
+    FirstRuntimeAllocationEntered = 5,
+    /// Allocation and construction of the first runtime returned.
+    FirstRuntimeAllocationReturned = 6,
+    /// The first runtime's optional IRQ setup is about to begin.
+    FirstIrqSetupEntered = 7,
+    /// The first runtime's IRQ setup or no-IRQ branch returned.
+    FirstIrqSetupReturned = 8,
+    /// The first runtime's worker task is about to be inserted.
+    FirstWorkerSpawnEntered = 9,
+    /// The first runtime's worker task insertion returned.
+    FirstWorkerSpawnReturned = 10,
+    /// The first runtime build returned success or error to the device loop.
+    FirstRuntimeBuildReturned = 11,
+    /// The complete device loop returned and the runtime slice was published.
+    RuntimesPublished    = 12,
+    /// The first timer IRQ overlapping serial initialization began.
+    TimerIrqEntered      = 13,
+    /// Scheduler-clock publication in that timer IRQ returned.
+    SchedulerClockReturned = 14,
+    /// Periodic advancement returned and task-timer dispatch is about to begin.
+    TaskTimerEntered     = 15,
+    /// Task-timer dispatch returned.
+    TaskTimerReturned    = 16,
+    /// One-shot timer reprogramming returned.
+    NextTimerProgrammed  = 17,
+}
+
+impl SerialInitCheckpoint {
+    const fn required_bitmap(self) -> u64 {
+        match self {
+            Self::DeviceDrainEntered | Self::TimerIrqEntered => 0,
+            Self::DeviceDrainReturned => 0x00001,
+            Self::FirstRuntimeBuildEntered => 0x00003,
+            Self::FirstPortMaskEntered => 0x00007,
+            Self::FirstPortMaskReturned => 0x0000f,
+            Self::FirstRuntimeAllocationEntered => 0x0001f,
+            Self::FirstRuntimeAllocationReturned => 0x0003f,
+            Self::FirstIrqSetupEntered => 0x0007f,
+            Self::FirstIrqSetupReturned => 0x000ff,
+            Self::FirstWorkerSpawnEntered => 0x001ff,
+            Self::FirstWorkerSpawnReturned => 0x003ff,
+            Self::FirstRuntimeBuildReturned => 0x00004,
+            Self::RuntimesPublished => 0x00002,
+            Self::SchedulerClockReturned => 0x02000,
+            Self::TaskTimerEntered => 0x06000,
+            Self::TaskTimerReturned => 0x0e000,
+            Self::NextTimerProgrammed => 0x1e000,
         }
     }
 }
@@ -678,6 +750,58 @@ fn record_init_task_checkpoint_with_clock_in(
     Some(elapsed_ns)
 }
 
+/// Records one serial-init or overlapping timer boundary without allocation, locking, or logging.
+///
+/// The clock callback is evaluated only while the watchdog is armed, serial
+/// initialization is in progress, the checkpoint dependencies are complete,
+/// and the checkpoint has not already been published.
+pub fn record_serial_init_checkpoint(
+    checkpoint: SerialInitCheckpoint,
+    read_now_ns: impl FnOnce() -> u64,
+) -> Option<u64> {
+    record_serial_init_checkpoint_in(
+        &DIAGNOSTIC,
+        WATCHDOG_ARMED.load(Ordering::Acquire),
+        checkpoint,
+        read_now_ns,
+    )
+}
+
+fn record_serial_init_checkpoint_in(
+    diagnostic: &DiagnosticPage,
+    watchdog_armed: bool,
+    checkpoint: SerialInitCheckpoint,
+    read_now_ns: impl FnOnce() -> u64,
+) -> Option<u64> {
+    if !watchdog_armed {
+        return None;
+    }
+    let followup = diagnostic
+        .bootstrap_followup_checkpoint_bitmap
+        .load(Ordering::Acquire);
+    let serial_entered = 1u64 << BootstrapFollowupCheckpoint::SerialInitEntered as usize;
+    let serial_returned = 1u64 << BootstrapFollowupCheckpoint::SerialInitReturned as usize;
+    if followup & serial_entered == 0 || followup & serial_returned != 0 {
+        return None;
+    }
+    let bit = 1u64 << checkpoint as usize;
+    let observed = diagnostic
+        .serial_init_checkpoint_bitmap
+        .load(Ordering::Acquire);
+    let required = checkpoint.required_bitmap();
+    if observed & bit != 0 || observed & required != required {
+        return None;
+    }
+    let now_ns = read_now_ns();
+    let elapsed_ns = now_ns.saturating_sub(diagnostic.boot_epoch.load(Ordering::Acquire));
+    diagnostic.serial_init_checkpoint_elapsed_ns[checkpoint as usize]
+        .store(elapsed_ns, Ordering::Relaxed);
+    diagnostic
+        .serial_init_checkpoint_bitmap
+        .fetch_or(bit, Ordering::Release);
+    Some(elapsed_ns)
+}
+
 fn reset_diagnostic_page(diagnostic: &DiagnosticPage, boot_epoch: u64, online_mask: u64) {
     BOOTSTRAP_FEEDER_TASK_ID.store(0, Ordering::Release);
     INIT_TASK_ID.store(0, Ordering::Release);
@@ -711,6 +835,12 @@ fn reset_diagnostic_page(diagnostic: &DiagnosticPage, boot_epoch: u64, online_ma
         .init_task_checkpoint_bitmap
         .store(0, Ordering::Release);
     for elapsed in &diagnostic.init_task_checkpoint_elapsed_ns {
+        elapsed.store(0, Ordering::Relaxed);
+    }
+    diagnostic
+        .serial_init_checkpoint_bitmap
+        .store(0, Ordering::Release);
+    for elapsed in &diagnostic.serial_init_checkpoint_elapsed_ns {
         elapsed.store(0, Ordering::Relaxed);
     }
 }
@@ -1026,7 +1156,7 @@ mod tests {
     fn diagnostic_layout_fits_one_qmp_memsave_page() {
         assert!(size_of::<DiagnosticPage>() <= DIAGNOSTIC_PAGE_BYTES);
         assert_eq!(DIAGNOSTIC.magic, DIAGNOSTIC_MAGIC);
-        assert_eq!(DIAGNOSTIC.version, 5);
+        assert_eq!(DIAGNOSTIC.version, 6);
         assert_eq!(size_of::<DiagnosticPage>(), 4096);
         assert_eq!(
             core::mem::offset_of!(DiagnosticPage, reached_phase_bitmap),
@@ -1059,6 +1189,157 @@ mod tests {
         assert_eq!(
             core::mem::offset_of!(DiagnosticPage, init_task_checkpoint_elapsed_ns),
             1816
+        );
+        assert_eq!(
+            core::mem::offset_of!(DiagnosticPage, serial_init_checkpoint_bitmap),
+            1928
+        );
+        assert_eq!(
+            core::mem::offset_of!(DiagnosticPage, serial_init_checkpoint_elapsed_ns),
+            1936
+        );
+    }
+
+    #[test]
+    fn serial_init_checkpoints_are_lazy_and_preserve_both_dependency_chains() {
+        let diagnostic = DiagnosticPage::new();
+        diagnostic.boot_epoch.store(100, Ordering::Release);
+        let clock_reads = core::cell::Cell::new(0);
+        let read_clock = || {
+            clock_reads.set(clock_reads.get() + 1);
+            150
+        };
+
+        assert_eq!(
+            record_serial_init_checkpoint_in(
+                &diagnostic,
+                true,
+                SerialInitCheckpoint::DeviceDrainEntered,
+                read_clock,
+            ),
+            None
+        );
+        assert_eq!(clock_reads.get(), 0);
+
+        diagnostic.bootstrap_followup_checkpoint_bitmap.store(
+            1 << BootstrapFollowupCheckpoint::SerialInitEntered as usize,
+            Ordering::Release,
+        );
+
+        assert_eq!(
+            record_serial_init_checkpoint_in(
+                &diagnostic,
+                false,
+                SerialInitCheckpoint::DeviceDrainEntered,
+                read_clock,
+            ),
+            None
+        );
+        assert_eq!(clock_reads.get(), 0);
+
+        assert_eq!(
+            record_serial_init_checkpoint_in(
+                &diagnostic,
+                true,
+                SerialInitCheckpoint::FirstPortMaskEntered,
+                read_clock,
+            ),
+            None
+        );
+        assert_eq!(clock_reads.get(), 0);
+
+        for checkpoint in [
+            SerialInitCheckpoint::DeviceDrainEntered,
+            SerialInitCheckpoint::DeviceDrainReturned,
+            SerialInitCheckpoint::FirstRuntimeBuildEntered,
+            SerialInitCheckpoint::FirstPortMaskEntered,
+            SerialInitCheckpoint::FirstPortMaskReturned,
+            SerialInitCheckpoint::FirstRuntimeAllocationEntered,
+            SerialInitCheckpoint::FirstRuntimeAllocationReturned,
+            SerialInitCheckpoint::FirstIrqSetupEntered,
+            SerialInitCheckpoint::FirstIrqSetupReturned,
+            SerialInitCheckpoint::FirstWorkerSpawnEntered,
+            SerialInitCheckpoint::FirstWorkerSpawnReturned,
+            SerialInitCheckpoint::FirstRuntimeBuildReturned,
+            SerialInitCheckpoint::RuntimesPublished,
+        ] {
+            assert!(
+                record_serial_init_checkpoint_in(&diagnostic, true, checkpoint, read_clock)
+                    .is_some()
+            );
+        }
+        for checkpoint in [
+            SerialInitCheckpoint::TimerIrqEntered,
+            SerialInitCheckpoint::SchedulerClockReturned,
+            SerialInitCheckpoint::TaskTimerEntered,
+            SerialInitCheckpoint::TaskTimerReturned,
+            SerialInitCheckpoint::NextTimerProgrammed,
+        ] {
+            assert!(
+                record_serial_init_checkpoint_in(&diagnostic, true, checkpoint, read_clock)
+                    .is_some()
+            );
+        }
+        assert_eq!(clock_reads.get(), SERIAL_INIT_CHECKPOINT_COUNT);
+        assert_eq!(
+            diagnostic
+                .serial_init_checkpoint_bitmap
+                .load(Ordering::Acquire),
+            (1 << SERIAL_INIT_CHECKPOINT_COUNT) - 1
+        );
+        assert_eq!(
+            record_serial_init_checkpoint_in(
+                &diagnostic,
+                true,
+                SerialInitCheckpoint::TimerIrqEntered,
+                read_clock,
+            ),
+            None
+        );
+        assert_eq!(clock_reads.get(), SERIAL_INIT_CHECKPOINT_COUNT);
+
+        let returned = DiagnosticPage::new();
+        returned.bootstrap_followup_checkpoint_bitmap.store(
+            (1 << BootstrapFollowupCheckpoint::SerialInitEntered as usize)
+                | (1 << BootstrapFollowupCheckpoint::SerialInitReturned as usize),
+            Ordering::Release,
+        );
+        assert_eq!(
+            record_serial_init_checkpoint_in(
+                &returned,
+                true,
+                SerialInitCheckpoint::DeviceDrainEntered,
+                read_clock,
+            ),
+            None
+        );
+        assert_eq!(clock_reads.get(), SERIAL_INIT_CHECKPOINT_COUNT);
+    }
+
+    #[test]
+    fn serial_init_main_chain_allows_error_and_empty_device_branches() {
+        let diagnostic = DiagnosticPage::new();
+        diagnostic.bootstrap_followup_checkpoint_bitmap.store(
+            1 << BootstrapFollowupCheckpoint::SerialInitEntered as usize,
+            Ordering::Release,
+        );
+
+        for checkpoint in [
+            SerialInitCheckpoint::DeviceDrainEntered,
+            SerialInitCheckpoint::DeviceDrainReturned,
+            SerialInitCheckpoint::FirstRuntimeBuildEntered,
+            SerialInitCheckpoint::FirstRuntimeBuildReturned,
+            SerialInitCheckpoint::RuntimesPublished,
+        ] {
+            assert!(
+                record_serial_init_checkpoint_in(&diagnostic, true, checkpoint, || 1).is_some()
+            );
+        }
+        assert_eq!(
+            diagnostic
+                .serial_init_checkpoint_bitmap
+                .load(Ordering::Acquire),
+            0x01807
         );
     }
 
@@ -1515,6 +1796,10 @@ mod tests {
             .init_task_checkpoint_bitmap
             .store(1, Ordering::Release);
         diagnostic.init_task_checkpoint_elapsed_ns[0].store(40, Ordering::Release);
+        diagnostic
+            .serial_init_checkpoint_bitmap
+            .store(1, Ordering::Release);
+        diagnostic.serial_init_checkpoint_elapsed_ns[0].store(50, Ordering::Release);
 
         reset_diagnostic_page(&diagnostic, 500, 1);
 
@@ -1554,6 +1839,18 @@ mod tests {
         assert!(
             diagnostic
                 .init_task_checkpoint_elapsed_ns
+                .iter()
+                .all(|elapsed| elapsed.load(Ordering::Acquire) == 0)
+        );
+        assert_eq!(
+            diagnostic
+                .serial_init_checkpoint_bitmap
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(
+            diagnostic
+                .serial_init_checkpoint_elapsed_ns
                 .iter()
                 .all(|elapsed| elapsed.load(Ordering::Acquire) == 0)
         );
