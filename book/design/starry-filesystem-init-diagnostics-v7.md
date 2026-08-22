@@ -1,7 +1,6 @@
 # Starry filesystem-init diagnostics v7
 
-Status: implemented; static gates and the non-QEMU release build passed; normal
-QEMU acceptance pending.
+Status: implemented and accepted by one normal QEMU pipe-smoke run.
 
 This compatibly extends
 [Starry serial-init diagnostics v6](starry-serial-init-diagnostics-v6.md).
@@ -172,6 +171,26 @@ and `git diff --check` passed. A non-QEMU x86_64 release build using the
 `bf75d63401631c5c79e554aef6b980d12e5757bfeb937228bb06146117045f00`.
 This proves compilation and linkage only; it is not normal-boot or fault-path
 acceptance.
+
+Normal QEMU acceptance passed in KernDiff session
+`run-pipe-smoke-20260822T095117Z-9495a207` against the clean implementation
+commit `c9452b8505b1da110c1f58f6b530cf37f1a879c7`. The coverage-instrumented
+target ELF SHA-256 was
+`3bbc54ca4b5129ba08bd0edc1bd35dad73a9c3f6d95051ed66829c339e1b4d13`.
+The single execution published all twelve ordered phases, reached
+`filesystem-init-ready` at 693,122,736 ns and `shell-ready` at 2,553,303,335
+ns, published guest start, and exited both the application and guest with
+status zero. It produced a fresh 27,296,712-byte profraw with SHA-256
+`b343a0b8979bfda12c2d0e643f04935a1daa97c183d2261dc7580d454f130036`.
+QEMU reported normal `SHUTDOWN` at 19,282 ms; no validation fault was
+configured. KernDiff reported `status=match`, `exit=0`, and
+`target_status=completed`.
+
+`diagnostic_complete=false` is expected on this successful run because axbuild
+only saves and decodes the page for an authoritative WATCHDOG event. The
+acceptance establishes absence of a normal-boot, semantic, and coverage
+regression for one pipe-smoke execution. It does not exercise v7 fault-page
+capture or resolve `defect-0001`.
 
 Rollback removes v7 writers and call sites while current axbuild continues to
 decode versions 1 through 6. Older axbuild rejects v7 diagnostics but preserves
