@@ -40,7 +40,8 @@ use super::{
     waiters::TaskWaiters,
 };
 use crate::os::{
-    BlockIrqRegistration, BlockNotification, BlockThread, register_block_irq, runtime_ops,
+    BlockIrqRegistration, BlockNotification, BlockRuntimeOps, BlockThread,
+    FilesystemInitCheckpoint, record_filesystem_init_checkpoint, register_block_irq, runtime_ops,
     sync::IrqMutex, wall_time,
 };
 
@@ -127,15 +128,25 @@ pub struct BlockRuntime {
 
 impl BlockRuntime {
     pub fn from_rdif_devices(devices: impl IntoIterator<Item = RdifBlockDevice>) -> Self {
+        let ops = runtime_ops().expect("block runtime adapter is not installed");
+        Self::from_rdif_devices_with_ops(devices, ops)
+    }
+
+    fn from_rdif_devices_with_ops(
+        devices: impl IntoIterator<Item = RdifBlockDevice>,
+        ops: &dyn BlockRuntimeOps,
+    ) -> Self {
+        record_filesystem_init_checkpoint(ops, FilesystemInitCheckpoint::DirectDeviceLoopEntered);
         let mut registered = Vec::new();
         for device in devices {
-            match BlockDeviceHandle::start(device) {
+            match BlockDeviceHandle::start_with_ops(device, ops) {
                 Ok(handle) => registered.push(handle),
                 Err(error) => {
                     warn!("failed to start IRQ-driven block controller: {error:?}");
                 }
             }
         }
+        record_filesystem_init_checkpoint(ops, FilesystemInitCheckpoint::DirectDeviceLoopReturned);
         Self {
             devices: registered,
             groups: Vec::new(),
@@ -146,9 +157,18 @@ impl BlockRuntime {
         devices: impl IntoIterator<Item = RdifBlockDevice>,
         groups: impl IntoIterator<Item = RdifBlockGroup>,
     ) -> Self {
-        let mut runtime = Self::from_rdif_devices(devices);
+        let ops = runtime_ops().expect("block runtime adapter is not installed");
+        Self::from_rdif_sources_with_ops(devices, groups, ops)
+    }
+
+    fn from_rdif_sources_with_ops(
+        devices: impl IntoIterator<Item = RdifBlockDevice>,
+        groups: impl IntoIterator<Item = RdifBlockGroup>,
+        ops: &dyn BlockRuntimeOps,
+    ) -> Self {
+        let mut runtime = Self::from_rdif_devices_with_ops(devices, ops);
         for group in groups {
-            match BlockGroupHandle::start(group) {
+            match BlockGroupHandle::start(group, ops) {
                 Ok(group) => {
                     runtime.devices.extend(group.members.iter().cloned());
                     runtime.groups.push(group);
@@ -164,8 +184,18 @@ impl BlockRuntime {
     pub fn install_from_rdif_devices(
         devices: impl IntoIterator<Item = RdifBlockDevice>,
     ) -> Arc<Self> {
-        let runtime = Arc::new(Self::from_rdif_devices(devices));
+        let ops = runtime_ops().expect("block runtime adapter is not installed");
+        Self::install_from_rdif_devices_with_ops(devices, ops)
+    }
+
+    pub(crate) fn install_from_rdif_devices_with_ops(
+        devices: impl IntoIterator<Item = RdifBlockDevice>,
+        ops: &dyn BlockRuntimeOps,
+    ) -> Arc<Self> {
+        record_filesystem_init_checkpoint(ops, FilesystemInitCheckpoint::RuntimeInstallEntered);
+        let runtime = Arc::new(Self::from_rdif_devices_with_ops(devices, ops));
         BLOCK_RUNTIME.call_once(|| Arc::clone(&runtime));
+        record_filesystem_init_checkpoint(ops, FilesystemInitCheckpoint::RuntimePublished);
         runtime
     }
 
@@ -173,8 +203,19 @@ impl BlockRuntime {
         devices: impl IntoIterator<Item = RdifBlockDevice>,
         groups: impl IntoIterator<Item = RdifBlockGroup>,
     ) -> Arc<Self> {
-        let runtime = Arc::new(Self::from_rdif_sources(devices, groups));
+        let ops = runtime_ops().expect("block runtime adapter is not installed");
+        Self::install_from_rdif_sources_with_ops(devices, groups, ops)
+    }
+
+    pub(crate) fn install_from_rdif_sources_with_ops(
+        devices: impl IntoIterator<Item = RdifBlockDevice>,
+        groups: impl IntoIterator<Item = RdifBlockGroup>,
+        ops: &dyn BlockRuntimeOps,
+    ) -> Arc<Self> {
+        record_filesystem_init_checkpoint(ops, FilesystemInitCheckpoint::RuntimeInstallEntered);
+        let runtime = Arc::new(Self::from_rdif_sources_with_ops(devices, groups, ops));
         BLOCK_RUNTIME.call_once(|| Arc::clone(&runtime));
+        record_filesystem_init_checkpoint(ops, FilesystemInitCheckpoint::RuntimePublished);
         runtime
     }
 
@@ -214,29 +255,47 @@ struct StartedGroup {
 }
 
 impl BlockGroupHandle {
-    fn start(group: RdifBlockGroup) -> Result<Self, BlkError> {
+    fn start(group: RdifBlockGroup, ops: &dyn BlockRuntimeOps) -> Result<Self, BlkError> {
         let RdifBlockGroup {
             name,
             irqs,
             mut controller,
         } = group;
-        let StartedGroup { members, endpoints } =
-            match start_group_controller(&mut *controller, CONTROLLER_TRANSITION_TIMEOUT) {
-                Ok(started) => started,
-                Err(error) => {
-                    let _ = drive_group_transition(
-                        &mut *controller,
-                        GroupControllerEvent::Shutdown,
-                        CONTROLLER_TRANSITION_TIMEOUT,
-                    );
-                    return Err(error);
-                }
-            };
+        record_filesystem_init_checkpoint(
+            ops,
+            FilesystemInitCheckpoint::FirstGroupControllerEntered,
+        );
+        let group_start = start_group_controller(&mut *controller, CONTROLLER_TRANSITION_TIMEOUT);
+        record_filesystem_init_checkpoint(
+            ops,
+            FilesystemInitCheckpoint::FirstGroupControllerReturned,
+        );
+        let StartedGroup { members, endpoints } = match group_start {
+            Ok(started) => started,
+            Err(error) => {
+                let _ = drive_group_transition(
+                    &mut *controller,
+                    GroupControllerEvent::Shutdown,
+                    CONTROLLER_TRANSITION_TIMEOUT,
+                );
+                return Err(error);
+            }
+        };
         let mut bootstrapped = Vec::new();
         for member in members {
             let (member_id, member_controller) = member.into_parts();
             let member_name = member_controller.name().into();
-            match BlockDeviceHandle::bootstrap_group_member(member_name, member_controller) {
+            record_filesystem_init_checkpoint(
+                ops,
+                FilesystemInitCheckpoint::FirstGroupMemberBootstrapEntered,
+            );
+            let bootstrap =
+                BlockDeviceHandle::bootstrap_group_member(member_name, member_controller, ops);
+            record_filesystem_init_checkpoint(
+                ops,
+                FilesystemInitCheckpoint::FirstGroupMemberBootstrapReturned,
+            );
+            match bootstrap {
                 Ok(handle) => bootstrapped.push((member_id, handle)),
                 Err(error) => {
                     warn!("{name}: failed to bootstrap block member {member_id}: {error:?}");
@@ -254,6 +313,7 @@ impl BlockGroupHandle {
 
         let mut registrations = Vec::new();
         let mut endpoint_sources = Vec::new();
+        record_filesystem_init_checkpoint(ops, FilesystemInitCheckpoint::FirstGroupIrqSetupEntered);
         let setup_result = (|| {
             if endpoints.is_empty() {
                 return Err(BlkError::NotSupported);
@@ -303,6 +363,10 @@ impl BlockGroupHandle {
             }
             Ok(())
         })();
+        record_filesystem_init_checkpoint(
+            ops,
+            FilesystemInitCheckpoint::FirstGroupIrqSetupReturned,
+        );
         if let Err(error) = setup_result {
             abort_group_start(&mut *controller, &bootstrapped, registrations);
             return Err(error);
@@ -310,7 +374,16 @@ impl BlockGroupHandle {
 
         let mut ready = Vec::new();
         for (member_id, member) in bootstrapped {
-            match member.finish_group_start() {
+            record_filesystem_init_checkpoint(
+                ops,
+                FilesystemInitCheckpoint::FirstGroupMemberReadyEntered,
+            );
+            let member_ready = member.finish_group_start();
+            record_filesystem_init_checkpoint(
+                ops,
+                FilesystemInitCheckpoint::FirstGroupMemberReadyReturned,
+            );
+            match member_ready {
                 Ok(()) => ready.push(member),
                 Err(error) => {
                     warn!("{name}: block member {member_id} failed to become ready: {error:?}");
@@ -535,13 +608,22 @@ impl SubmissionAdmission {
 }
 
 impl BlockDeviceHandle {
+    #[cfg(test)]
     fn start(device: RdifBlockDevice) -> Result<Arc<Self>, BlkError> {
+        let ops = runtime_ops().expect("block runtime adapter is not installed");
+        Self::start_with_ops(device, ops)
+    }
+
+    fn start_with_ops(
+        device: RdifBlockDevice,
+        ops: &dyn BlockRuntimeOps,
+    ) -> Result<Arc<Self>, BlkError> {
         let RdifBlockDevice {
             name,
             irqs,
             controller,
         } = device;
-        let handle = Self::bootstrap(name, irqs, controller)?;
+        let handle = Self::bootstrap_with_ops(name, irqs, controller, ops)?;
         handle.finish_group_start()?;
         Ok(handle)
     }
@@ -549,22 +631,32 @@ impl BlockDeviceHandle {
     fn bootstrap_group_member(
         name: String,
         controller: Box<dyn BlockController>,
+        ops: &dyn BlockRuntimeOps,
     ) -> Result<Arc<Self>, BlkError> {
-        Self::bootstrap(name, Vec::new(), controller)
+        Self::bootstrap_with_ops(name, Vec::new(), controller, ops)
     }
 
+    #[cfg(test)]
     fn bootstrap(
         name: String,
         irqs: Vec<BlockIrqSource>,
         controller: Box<dyn BlockController>,
+    ) -> Result<Arc<Self>, BlkError> {
+        let ops = runtime_ops().expect("block runtime adapter is not installed");
+        Self::bootstrap_with_ops(name, irqs, controller, ops)
+    }
+
+    fn bootstrap_with_ops(
+        name: String,
+        irqs: Vec<BlockIrqSource>,
+        controller: Box<dyn BlockController>,
+        ops: &dyn BlockRuntimeOps,
     ) -> Result<Arc<Self>, BlkError> {
         let info = controller.device_info();
         let max_io_queues = controller.max_io_queues().min(MAX_RUNTIME_HCTX);
         if max_io_queues == 0 {
             return Err(BlkError::NotSupported);
         }
-        let ops =
-            runtime_ops().map_err(|_| BlkError::Other("block runtime adapter is not installed"))?;
         let controller_notification = ops.notification();
         let controller_port = Arc::new(ControllerPort {
             commands: BoundedChannel::with_item_notification(

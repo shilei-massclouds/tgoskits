@@ -46,6 +46,7 @@ kerndiff-fault-observer = [
   "multitask",
   "smp",
   "ax-driver/kerndiff-fault-observer",
+  "ax-fs-ng?/kerndiff-fault-observer",
 ]
 
 display = ["paging", "dep:ax-display", "ax-driver/display"]

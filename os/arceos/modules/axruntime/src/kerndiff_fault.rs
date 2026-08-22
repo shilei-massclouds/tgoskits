@@ -10,8 +10,12 @@ use core::{
     time::Duration,
 };
 
+#[cfg(feature = "fs")]
+use ax_driver::kerndiff_fault::FilesystemInitCheckpoint;
+#[cfg(feature = "serial")]
+use ax_driver::kerndiff_fault::SerialInitCheckpoint;
 use ax_driver::kerndiff_fault::{
-    BootstrapCheckpoint, BootstrapFollowupCheckpoint, SerialInitCheckpoint,
+    BootstrapCheckpoint, BootstrapFollowupCheckpoint, EarlyBootTimerCheckpoint,
 };
 
 use crate::KernDiffBootPhase;
@@ -259,8 +263,22 @@ pub(super) fn record_bootstrap_followup_checkpoint(checkpoint: BootstrapFollowup
     );
 }
 
+#[cfg(feature = "serial")]
 pub(super) fn record_serial_init_checkpoint(checkpoint: SerialInitCheckpoint) {
     let _ = ax_driver::kerndiff_fault::record_serial_init_checkpoint(checkpoint, || {
+        ax_hal::time::monotonic_time_nanos()
+    });
+}
+
+#[cfg(feature = "fs")]
+pub(super) fn record_filesystem_init_checkpoint(checkpoint: FilesystemInitCheckpoint) {
+    let _ = ax_driver::kerndiff_fault::record_filesystem_init_checkpoint(checkpoint, || {
+        ax_hal::time::monotonic_time_nanos()
+    });
+}
+
+pub(super) fn record_early_boot_timer_checkpoint(checkpoint: EarlyBootTimerCheckpoint) {
+    let _ = ax_driver::kerndiff_fault::record_early_boot_timer_checkpoint(checkpoint, || {
         ax_hal::time::monotonic_time_nanos()
     });
 }

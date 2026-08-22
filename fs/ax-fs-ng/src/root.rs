@@ -15,6 +15,9 @@ use crate::{
         runtime::{BlockRuntime, RdifBlockDevice, RdifBlockGroup},
     },
     detect_filesystem, fs, init_detected_filesystem, init_filesystem,
+    os::{
+        BlockRuntimeOps, FilesystemInitCheckpoint, record_filesystem_init_checkpoint, runtime_ops,
+    },
     volume::{
         BlockReader, BlockVolume, DiskId, Error as VolumeError,
         PartitionTableKind as VolumeTableKind, scan_volumes,
@@ -189,11 +192,23 @@ pub fn init_root(
     block_devs: impl IntoIterator<Item = Arc<BlockDeviceHandle>>,
     bootargs: Option<&str>,
 ) {
+    let ops = runtime_ops().expect("block runtime adapter is not installed");
+    init_root_with_ops(block_devs, bootargs, ops);
+}
+
+fn init_root_with_ops(
+    block_devs: impl IntoIterator<Item = Arc<BlockDeviceHandle>>,
+    bootargs: Option<&str>,
+    ops: &dyn BlockRuntimeOps,
+) {
+    record_filesystem_init_checkpoint(ops, FilesystemInitCheckpoint::RootInitEntered);
     let root_spec = RootSpec::parse_bootargs(bootargs);
-    let mut disks = collect_disks(block_devs);
+    record_filesystem_init_checkpoint(ops, FilesystemInitCheckpoint::DiskCollectionEntered);
+    let mut disks = collect_disks(block_devs, ops);
     let candidates = collect_root_candidates(&disks);
     let (selected_disk_index, selected_partition) = select_root_candidate(&candidates, &root_spec)
         .unwrap_or_else(|| panic!("failed to determine root device from available block devices"));
+    record_filesystem_init_checkpoint(ops, FilesystemInitCheckpoint::RootCandidateSelected);
     let selected_disk_pos = disks
         .iter()
         .position(|disk| disk.disk_index == selected_disk_index)
@@ -226,10 +241,13 @@ pub fn init_root(
     } else {
         init_filesystem(selected.handle.clone(), region, &description, source)
     };
+    record_filesystem_init_checkpoint(ops, FilesystemInitCheckpoint::RootMounted);
     mount_additional_partitions(&root, &selected, selected_partition);
     for disk in &disks {
         mount_additional_partitions(&root, disk, None);
     }
+    record_filesystem_init_checkpoint(ops, FilesystemInitCheckpoint::AdditionalMountsReturned);
+    record_filesystem_init_checkpoint(ops, FilesystemInitCheckpoint::RootInitReturned);
 }
 
 const SD_NAMES: [&str; 26] = [
@@ -282,8 +300,9 @@ pub fn init_root_from_rdif(
     block_devs: impl IntoIterator<Item = RdifBlockDevice>,
     bootargs: Option<&str>,
 ) {
-    let runtime = BlockRuntime::install_from_rdif_devices(block_devs);
-    init_root(runtime.devices().iter().cloned(), bootargs);
+    let ops = runtime_ops().expect("block runtime adapter is not installed");
+    let runtime = BlockRuntime::install_from_rdif_devices_with_ops(block_devs, ops);
+    init_root_with_ops(runtime.devices().iter().cloned(), bootargs, ops);
 }
 
 pub fn init_root_from_rdif_sources(
@@ -291,12 +310,14 @@ pub fn init_root_from_rdif_sources(
     block_groups: impl IntoIterator<Item = RdifBlockGroup>,
     bootargs: Option<&str>,
 ) {
-    let runtime = BlockRuntime::install_from_rdif_sources(block_devs, block_groups);
-    init_root(runtime.devices().iter().cloned(), bootargs);
+    let ops = runtime_ops().expect("block runtime adapter is not installed");
+    let runtime = BlockRuntime::install_from_rdif_sources_with_ops(block_devs, block_groups, ops);
+    init_root_with_ops(runtime.devices().iter().cloned(), bootargs, ops);
 }
 
 fn collect_disks(
     block_devs: impl IntoIterator<Item = Arc<BlockDeviceHandle>>,
+    ops: &dyn BlockRuntimeOps,
 ) -> Vec<DiscoveredDisk> {
     let mut disks = Vec::new();
 
@@ -305,7 +326,10 @@ fn collect_disks(
         let mut dev = boxed_native_handle_block_device(dev);
         let device_name = dev.name().to_string();
         let mut reader = VolumeReader::new(&mut *dev);
-        match scan_volumes(&mut reader, DiskId(disk_index as u64)) {
+        record_filesystem_init_checkpoint(ops, FilesystemInitCheckpoint::FirstVolumeScanEntered);
+        let volumes = scan_volumes(&mut reader, DiskId(disk_index as u64));
+        record_filesystem_init_checkpoint(ops, FilesystemInitCheckpoint::FirstVolumeScanReturned);
+        match volumes {
             Ok(volumes) => {
                 let (raw_filesystem, partitions) = collect_partitions(&mut *dev, volumes);
                 log_disk(disk_index, &device_name, &partitions);

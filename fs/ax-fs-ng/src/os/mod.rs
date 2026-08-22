@@ -13,8 +13,10 @@ pub use irq::{
 pub use memory::{
     FsPage, FsPageProvider, alloc_page, has_page_provider, install_page_provider, virt_to_phys,
 };
+pub(crate) use task::record_filesystem_init_checkpoint;
 pub use task::{
-    BlockNotification, BlockRuntimeOps, BlockThread, has_runtime_ops, runtime_ops, set_runtime_ops,
+    BlockNotification, BlockRuntimeOps, BlockThread, FilesystemInitCheckpoint, has_runtime_ops,
+    runtime_ops, set_runtime_ops,
 };
 pub use time::{BlockTimeProvider, has_time_provider, set_time_provider, wall_time};
 
@@ -36,4 +38,8 @@ pub fn install(
     if let Some(irq_registrar) = irq_registrar {
         irq::set_irq_registrar(irq_registrar);
     }
+    task::record_filesystem_init_checkpoint(
+        runtime_ops,
+        task::FilesystemInitCheckpoint::RuntimeAdapterInstalled,
+    );
 }

@@ -670,35 +670,35 @@ fn timer_irq_handler(ctx: ax_hal::irq::IrqContext) -> ax_hal::irq::IrqReturn {
     #[cfg(feature = "kerndiff-fault-observer")]
     ax_driver::kerndiff_fault::record_timer_irq(ax_hal::percpu::this_cpu_id());
     #[cfg(feature = "kerndiff-fault-observer")]
-    kerndiff_fault::record_serial_init_checkpoint(
-        ax_driver::kerndiff_fault::SerialInitCheckpoint::TimerIrqEntered,
+    kerndiff_fault::record_early_boot_timer_checkpoint(
+        ax_driver::kerndiff_fault::EarlyBootTimerCheckpoint::TimerIrqEntered,
     );
     // SAFETY: the local timer IRQ excludes migration and nested local
     // scheduler-clock publication for this complete stamp.
     unsafe { ax_hal::time::scheduler_clock_tick() }
         .expect("current CPU scheduler clock must be online before timer IRQs");
     #[cfg(feature = "kerndiff-fault-observer")]
-    kerndiff_fault::record_serial_init_checkpoint(
-        ax_driver::kerndiff_fault::SerialInitCheckpoint::SchedulerClockReturned,
+    kerndiff_fault::record_early_boot_timer_checkpoint(
+        ax_driver::kerndiff_fault::EarlyBootTimerCheckpoint::SchedulerClockReturned,
     );
     #[cfg(feature = "multitask")]
     let scheduler_tick = advance_periodic_timer(ax_hal::time::monotonic_time_nanos());
     #[cfg(not(feature = "multitask"))]
     let _ = advance_periodic_timer(ax_hal::time::monotonic_time_nanos());
     #[cfg(feature = "kerndiff-fault-observer")]
-    kerndiff_fault::record_serial_init_checkpoint(
-        ax_driver::kerndiff_fault::SerialInitCheckpoint::TaskTimerEntered,
+    kerndiff_fault::record_early_boot_timer_checkpoint(
+        ax_driver::kerndiff_fault::EarlyBootTimerCheckpoint::TaskTimerEntered,
     );
     #[cfg(feature = "multitask")]
     ax_task::on_timer_irq(scheduler_tick);
     #[cfg(feature = "kerndiff-fault-observer")]
-    kerndiff_fault::record_serial_init_checkpoint(
-        ax_driver::kerndiff_fault::SerialInitCheckpoint::TaskTimerReturned,
+    kerndiff_fault::record_early_boot_timer_checkpoint(
+        ax_driver::kerndiff_fault::EarlyBootTimerCheckpoint::TaskTimerReturned,
     );
     program_next_timer();
     #[cfg(feature = "kerndiff-fault-observer")]
-    kerndiff_fault::record_serial_init_checkpoint(
-        ax_driver::kerndiff_fault::SerialInitCheckpoint::NextTimerProgrammed,
+    kerndiff_fault::record_early_boot_timer_checkpoint(
+        ax_driver::kerndiff_fault::EarlyBootTimerCheckpoint::NextTimerProgrammed,
     );
     ax_hal::irq::IrqReturn::Handled
 }

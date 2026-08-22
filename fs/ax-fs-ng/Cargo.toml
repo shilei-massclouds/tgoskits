@@ -13,6 +13,7 @@ fat = ["dep:fatfs"]
 ext4 = ["dep:rsext4"]
 vfs = ["ax-sync/sleep"]
 lockdep = ["axfs-ng-vfs/lockdep"]
+kerndiff-fault-observer = []
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(axtest)'] }
@@ -45,3 +46,6 @@ version = "0.4.1-preview.2"
 default-features = false
 optional = true
 features = ["alloc", "lfn", "log_level_trace", "unicode"]
+
+[dev-dependencies]
+ax-sync = { workspace = true, features = ["host-test", "sleep"] }

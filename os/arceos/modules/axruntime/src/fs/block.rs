@@ -9,7 +9,8 @@ use ax_fs_ng::{
     block::runtime::{BlockIrqAction, BlockIrqSource, RdifBlockDevice, RdifBlockGroup},
     os::{
         BlockIrqOutcome, BlockIrqRegistrar, BlockIrqRegistration, BlockNotification,
-        BlockRuntimeOps, BlockThread, BlockTimeProvider, FsPage, FsPageProvider,
+        BlockRuntimeOps, BlockThread, BlockTimeProvider, FilesystemInitCheckpoint, FsPage,
+        FsPageProvider,
     },
 };
 
@@ -87,6 +88,84 @@ struct RuntimeTaskOps;
 static ONLINE_BLOCK_CPUS: AtomicUsize = AtomicUsize::new(1);
 
 impl BlockRuntimeOps for RuntimeTaskOps {
+    #[cfg(feature = "kerndiff-fault-observer")]
+    fn filesystem_init_checkpoint(&self, checkpoint: FilesystemInitCheckpoint) {
+        use ax_driver::kerndiff_fault::FilesystemInitCheckpoint as DriverCheckpoint;
+
+        let checkpoint = match checkpoint {
+            FilesystemInitCheckpoint::RuntimeAdapterInstalled => {
+                DriverCheckpoint::RuntimeAdapterInstalled
+            }
+            FilesystemInitCheckpoint::BlockDevicesDrained => DriverCheckpoint::BlockDevicesDrained,
+            FilesystemInitCheckpoint::BlockGroupsDrained => DriverCheckpoint::BlockGroupsDrained,
+            FilesystemInitCheckpoint::RuntimeInstallEntered => {
+                DriverCheckpoint::RuntimeInstallEntered
+            }
+            FilesystemInitCheckpoint::DirectDeviceLoopEntered => {
+                DriverCheckpoint::DirectDeviceLoopEntered
+            }
+            FilesystemInitCheckpoint::DirectDeviceLoopReturned => {
+                DriverCheckpoint::DirectDeviceLoopReturned
+            }
+            FilesystemInitCheckpoint::FirstGroupControllerEntered => {
+                DriverCheckpoint::FirstGroupControllerEntered
+            }
+            FilesystemInitCheckpoint::FirstGroupControllerReturned => {
+                DriverCheckpoint::FirstGroupControllerReturned
+            }
+            FilesystemInitCheckpoint::FirstGroupMemberBootstrapEntered => {
+                DriverCheckpoint::FirstGroupMemberBootstrapEntered
+            }
+            FilesystemInitCheckpoint::FirstGroupMemberBootstrapReturned => {
+                DriverCheckpoint::FirstGroupMemberBootstrapReturned
+            }
+            FilesystemInitCheckpoint::FirstGroupIrqSetupEntered => {
+                DriverCheckpoint::FirstGroupIrqSetupEntered
+            }
+            FilesystemInitCheckpoint::FirstGroupIrqSetupReturned => {
+                DriverCheckpoint::FirstGroupIrqSetupReturned
+            }
+            FilesystemInitCheckpoint::FirstGroupMemberReadyEntered => {
+                DriverCheckpoint::FirstGroupMemberReadyEntered
+            }
+            FilesystemInitCheckpoint::FirstGroupMemberReadyReturned => {
+                DriverCheckpoint::FirstGroupMemberReadyReturned
+            }
+            FilesystemInitCheckpoint::RuntimePublished => DriverCheckpoint::RuntimePublished,
+            FilesystemInitCheckpoint::RootInitEntered => DriverCheckpoint::RootInitEntered,
+            FilesystemInitCheckpoint::DiskCollectionEntered => {
+                DriverCheckpoint::DiskCollectionEntered
+            }
+            FilesystemInitCheckpoint::FirstVolumeScanEntered => {
+                DriverCheckpoint::FirstVolumeScanEntered
+            }
+            FilesystemInitCheckpoint::FirstVolumeScanReturned => {
+                DriverCheckpoint::FirstVolumeScanReturned
+            }
+            FilesystemInitCheckpoint::RootCandidateSelected => {
+                DriverCheckpoint::RootCandidateSelected
+            }
+            FilesystemInitCheckpoint::RootMounted => DriverCheckpoint::RootMounted,
+            FilesystemInitCheckpoint::AdditionalMountsReturned => {
+                DriverCheckpoint::AdditionalMountsReturned
+            }
+            FilesystemInitCheckpoint::RootInitReturned => DriverCheckpoint::RootInitReturned,
+            FilesystemInitCheckpoint::FirstBlockWorkerSpawnEntered => {
+                DriverCheckpoint::FirstBlockWorkerSpawnEntered
+            }
+            FilesystemInitCheckpoint::FirstBlockWorkerSpawnReturned => {
+                DriverCheckpoint::FirstBlockWorkerSpawnReturned
+            }
+            FilesystemInitCheckpoint::FirstBlockWorkerEntered => {
+                DriverCheckpoint::FirstBlockWorkerEntered
+            }
+            FilesystemInitCheckpoint::FirstBlockWorkerAffinityReturned => {
+                DriverCheckpoint::FirstBlockWorkerAffinityReturned
+            }
+        };
+        crate::kerndiff_fault::record_filesystem_init_checkpoint(checkpoint);
+    }
+
     fn current_cpu(&self) -> usize {
         ax_hal::percpu::this_cpu_id()
     }
@@ -112,10 +191,18 @@ impl BlockRuntimeOps for RuntimeTaskOps {
         if cpu >= ax_hal::cpu_num() {
             return Err(ax_errno::AxError::InvalidInput);
         }
+        record_filesystem_init_checkpoint(FilesystemInitCheckpoint::FirstBlockWorkerSpawnEntered);
         let task = ax_task::spawn_raw(
             move || {
+                record_filesystem_init_checkpoint(
+                    FilesystemInitCheckpoint::FirstBlockWorkerEntered,
+                );
                 let affinity = ax_task::AxCpuMask::one_shot(cpu);
-                if !ax_task::set_current_affinity(affinity) {
+                let affinity_ready = ax_task::set_current_affinity(affinity);
+                record_filesystem_init_checkpoint(
+                    FilesystemInitCheckpoint::FirstBlockWorkerAffinityReturned,
+                );
+                if !affinity_ready {
                     error!("failed to bind block maintenance task to CPU {cpu}");
                     return;
                 }
@@ -124,8 +211,17 @@ impl BlockRuntimeOps for RuntimeTaskOps {
             name,
             crate::runtime_default_task_stack_size(),
         );
+        record_filesystem_init_checkpoint(FilesystemInitCheckpoint::FirstBlockWorkerSpawnReturned);
         Ok(Box::new(RuntimeBlockThread { task }))
     }
+}
+
+#[inline]
+fn record_filesystem_init_checkpoint(checkpoint: FilesystemInitCheckpoint) {
+    #[cfg(feature = "kerndiff-fault-observer")]
+    TASK_OPS.filesystem_init_checkpoint(checkpoint);
+    #[cfg(not(feature = "kerndiff-fault-observer"))]
+    let _ = checkpoint;
 }
 
 #[cfg(feature = "irq")]
@@ -223,11 +319,11 @@ pub(super) fn init(bootargs: Option<&str>) {
         axklib::dma::op(),
         irq_registrar(),
     );
-    ax_fs_ng::root::init_root_from_rdif_sources(
-        take_rdif_block_devices(),
-        take_rdif_block_groups(),
-        bootargs,
-    );
+    let block_devices = take_rdif_block_devices();
+    record_filesystem_init_checkpoint(FilesystemInitCheckpoint::BlockDevicesDrained);
+    let block_groups = take_rdif_block_groups();
+    record_filesystem_init_checkpoint(FilesystemInitCheckpoint::BlockGroupsDrained);
+    ax_fs_ng::root::init_root_from_rdif_sources(block_devices, block_groups, bootargs);
 }
 
 #[cfg(all(feature = "smp", feature = "ipi"))]

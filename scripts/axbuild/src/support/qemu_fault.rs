@@ -27,6 +27,7 @@ const DIAGNOSTIC_VERSION_V3: u32 = 3;
 const DIAGNOSTIC_VERSION_V4: u32 = 4;
 const DIAGNOSTIC_VERSION_V5: u32 = 5;
 const DIAGNOSTIC_VERSION_V6: u32 = 6;
+const DIAGNOSTIC_VERSION_V7: u32 = 7;
 const MAX_DIAGNOSTIC_CPUS: usize = 64;
 const V1_DIAGNOSTIC_BYTES: usize = 1576;
 const V2_DIAGNOSTIC_BYTES: usize = 1696;
@@ -34,6 +35,7 @@ const V3_DIAGNOSTIC_BYTES: usize = 1752;
 const V4_DIAGNOSTIC_BYTES: usize = 1808;
 const V5_DIAGNOSTIC_BYTES: usize = 1928;
 const V6_DIAGNOSTIC_BYTES: usize = 2080;
+const V7_DIAGNOSTIC_BYTES: usize = 2344;
 const BOOT_PHASE_NAMES: [&str; 12] = [
     "watchdog-armed",
     "filesystem-init-start",
@@ -119,6 +121,77 @@ const SERIAL_INIT_CHECKPOINT_REQUIRED_BITMAPS: [u64; 18] = [
 const SERIAL_INIT_ENTERED_BITMAP: u64 = 1 << 2;
 const SERIAL_INIT_RETURNED_BITMAP: u64 = 1 << 3;
 const SERIAL_RUNTIMES_PUBLISHED_BITMAP: u64 = 1 << 12;
+const FILESYSTEM_INIT_CHECKPOINT_NAMES: [&str; 32] = [
+    "filesystem-runtime-adapter-installed",
+    "filesystem-block-devices-drained",
+    "filesystem-block-groups-drained",
+    "filesystem-runtime-install-entered",
+    "filesystem-direct-device-loop-entered",
+    "filesystem-direct-device-loop-returned",
+    "filesystem-first-group-controller-entered",
+    "filesystem-first-group-controller-returned",
+    "filesystem-first-group-member-bootstrap-entered",
+    "filesystem-first-group-member-bootstrap-returned",
+    "filesystem-first-group-irq-setup-entered",
+    "filesystem-first-group-irq-setup-returned",
+    "filesystem-first-group-member-ready-entered",
+    "filesystem-first-group-member-ready-returned",
+    "filesystem-runtime-published",
+    "filesystem-root-init-entered",
+    "filesystem-disk-collection-entered",
+    "filesystem-first-volume-scan-entered",
+    "filesystem-first-volume-scan-returned",
+    "filesystem-root-candidate-selected",
+    "filesystem-root-mounted",
+    "filesystem-additional-mounts-returned",
+    "filesystem-root-init-returned",
+    "filesystem-first-block-worker-spawn-entered",
+    "filesystem-first-block-worker-spawn-returned",
+    "filesystem-first-block-worker-entered",
+    "filesystem-first-block-worker-affinity-returned",
+    "filesystem-window-timer-irq-entered",
+    "filesystem-window-scheduler-clock-returned",
+    "filesystem-window-task-timer-entered",
+    "filesystem-window-task-timer-returned",
+    "filesystem-window-next-timer-programmed",
+];
+const FILESYSTEM_INIT_CHECKPOINT_REQUIRED_BITMAPS: [u64; 32] = [
+    0,
+    0x0000_0001,
+    0x0000_0003,
+    0x0000_0007,
+    0x0000_000f,
+    0x0000_001f,
+    0x0000_003f,
+    0x0000_007f,
+    0x0000_00ff,
+    0x0000_01ff,
+    0x0000_03ff,
+    0x0000_07ff,
+    0x0000_0fff,
+    0x0000_1fff,
+    0x0000_003f,
+    0x0000_403f,
+    0x0000_c03f,
+    0x0001_c03f,
+    0x0003_c03f,
+    0x0007_c03f,
+    0x000f_c03f,
+    0x001f_c03f,
+    0x003f_c03f,
+    0x0000_001f,
+    0x0080_001f,
+    0x0080_001f,
+    0x0280_001f,
+    0,
+    0x0800_0000,
+    0x1800_0000,
+    0x3800_0000,
+    0x7800_0000,
+];
+const FILESYSTEM_INIT_REQUIRED_PHASE_SEQUENCE: u64 = 2;
+const FILESYSTEM_RUNTIME_PUBLISHED_BITMAP: u64 = 1 << 14;
+const FILESYSTEM_ROOT_INIT_RETURNED_BITMAP: u64 = 1 << 22;
 const WATCHDOG_MARKER_PREFIX: &str = "STARRY_KERNEL_WATCHDOG version=1 state=armed ";
 const GUEST_START_MARKER_PREFIX: &str = "KERNDIFF_GUEST_START version=1 run_id=";
 pub(crate) const BOOT_PROBE_SUCCESS_REGEX: &str =
@@ -526,6 +599,7 @@ fn decode_diagnostic_page(encoded: &[u8]) -> anyhow::Result<serde_json::Value> {
         DIAGNOSTIC_VERSION_V4 => V4_DIAGNOSTIC_BYTES,
         DIAGNOSTIC_VERSION_V5 => V5_DIAGNOSTIC_BYTES,
         DIAGNOSTIC_VERSION_V6 => V6_DIAGNOSTIC_BYTES,
+        DIAGNOSTIC_VERSION_V7 => V7_DIAGNOSTIC_BYTES,
         _ => usize::MAX,
     };
     if magic != DIAGNOSTIC_MAGIC
@@ -572,6 +646,7 @@ fn decode_diagnostic_page(encoded: &[u8]) -> anyhow::Result<serde_json::Value> {
             | DIAGNOSTIC_VERSION_V4
             | DIAGNOSTIC_VERSION_V5
             | DIAGNOSTIC_VERSION_V6
+            | DIAGNOSTIC_VERSION_V7
     ) {
         let reached = read_u64(encoded, V1_DIAGNOSTIC_BYTES)?;
         let last_phase = read_u32(encoded, V1_DIAGNOSTIC_BYTES + 8)?;
@@ -612,6 +687,7 @@ fn decode_diagnostic_page(encoded: &[u8]) -> anyhow::Result<serde_json::Value> {
             | DIAGNOSTIC_VERSION_V4
             | DIAGNOSTIC_VERSION_V5
             | DIAGNOSTIC_VERSION_V6
+            | DIAGNOSTIC_VERSION_V7
     ) {
         let reached = read_u64(encoded, V2_DIAGNOSTIC_BYTES)?;
         bootstrap_checkpoints = reached;
@@ -640,7 +716,10 @@ fn decode_diagnostic_page(encoded: &[u8]) -> anyhow::Result<serde_json::Value> {
     let mut bootstrap_followup_checkpoints = 0;
     if matches!(
         version,
-        DIAGNOSTIC_VERSION_V4 | DIAGNOSTIC_VERSION_V5 | DIAGNOSTIC_VERSION_V6
+        DIAGNOSTIC_VERSION_V4
+            | DIAGNOSTIC_VERSION_V5
+            | DIAGNOSTIC_VERSION_V6
+            | DIAGNOSTIC_VERSION_V7
     ) {
         let reached = read_u64(encoded, V3_DIAGNOSTIC_BYTES)?;
         bootstrap_followup_checkpoints = reached;
@@ -666,7 +745,10 @@ fn decode_diagnostic_page(encoded: &[u8]) -> anyhow::Result<serde_json::Value> {
             elapsed.into(),
         );
     }
-    if matches!(version, DIAGNOSTIC_VERSION_V5 | DIAGNOSTIC_VERSION_V6) {
+    if matches!(
+        version,
+        DIAGNOSTIC_VERSION_V5 | DIAGNOSTIC_VERSION_V6 | DIAGNOSTIC_VERSION_V7
+    ) {
         let reached = read_u64(encoded, V4_DIAGNOSTIC_BYTES)?;
         validate_init_task_checkpoints(boot_phase_sequence, reached)?;
         let mut elapsed = serde_json::Map::new();
@@ -690,7 +772,7 @@ fn decode_diagnostic_page(encoded: &[u8]) -> anyhow::Result<serde_json::Value> {
             elapsed.into(),
         );
     }
-    if version == DIAGNOSTIC_VERSION_V6 {
+    if matches!(version, DIAGNOSTIC_VERSION_V6 | DIAGNOSTIC_VERSION_V7) {
         let reached = read_u64(encoded, V5_DIAGNOSTIC_BYTES)?;
         validate_serial_init_checkpoints(bootstrap_followup_checkpoints, reached)?;
         let mut elapsed = serde_json::Map::new();
@@ -711,6 +793,30 @@ fn decode_diagnostic_page(encoded: &[u8]) -> anyhow::Result<serde_json::Value> {
         );
         object.insert(
             "serial_init_checkpoint_elapsed_ns".to_string(),
+            elapsed.into(),
+        );
+    }
+    if version == DIAGNOSTIC_VERSION_V7 {
+        let reached = read_u64(encoded, V6_DIAGNOSTIC_BYTES)?;
+        validate_filesystem_init_checkpoints(boot_phase_sequence, reached)?;
+        let mut elapsed = serde_json::Map::new();
+        for (checkpoint, name) in FILESYSTEM_INIT_CHECKPOINT_NAMES.iter().enumerate() {
+            if reached & (1u64 << checkpoint) != 0 {
+                elapsed.insert(
+                    (*name).to_string(),
+                    read_u64(encoded, V6_DIAGNOSTIC_BYTES + 8 + checkpoint * 8)?.into(),
+                );
+            }
+        }
+        let object = diagnostic
+            .as_object_mut()
+            .expect("diagnostic JSON must be an object");
+        object.insert(
+            "filesystem_init_checkpoint_bitmap".to_string(),
+            format!("{reached:#x}").into(),
+        );
+        object.insert(
+            "filesystem_init_checkpoint_elapsed_ns".to_string(),
             elapsed.into(),
         );
     }
@@ -846,6 +952,53 @@ fn validate_serial_init_checkpoints(followup: u64, reached: u64) -> anyhow::Resu
                  bitmap={reached:#x} checkpoint={}",
                 SERIAL_INIT_CHECKPOINT_NAMES[checkpoint]
             )
+        }
+    }
+    Ok(())
+}
+
+fn validate_filesystem_init_checkpoints(phase_sequence: u64, reached: u64) -> anyhow::Result<()> {
+    let valid_bitmap = u32::MAX as u64;
+    if reached & !valid_bitmap != 0 {
+        bail!("watchdog diagnostic filesystem-init checkpoint bitmap is invalid: {reached:#x}")
+    }
+    if reached != 0 && phase_sequence < FILESYSTEM_INIT_REQUIRED_PHASE_SEQUENCE {
+        bail!(
+            "watchdog diagnostic filesystem-init checkpoints precede filesystem-init: \
+             phase_sequence={phase_sequence} bitmap={reached:#x}"
+        )
+    }
+    if phase_sequence > FILESYSTEM_INIT_REQUIRED_PHASE_SEQUENCE
+        && reached & FILESYSTEM_ROOT_INIT_RETURNED_BITMAP == 0
+    {
+        bail!(
+            "watchdog diagnostic filesystem-init-ready precedes root-init return: \
+             phase_sequence={phase_sequence} bitmap={reached:#x}"
+        )
+    }
+    for (checkpoint, required) in FILESYSTEM_INIT_CHECKPOINT_REQUIRED_BITMAPS
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        let bit = 1u64 << checkpoint;
+        if reached & bit != 0 && reached & required != required {
+            bail!(
+                "watchdog diagnostic filesystem-init checkpoint dependencies are invalid: \
+                 bitmap={reached:#x} checkpoint={}",
+                FILESYSTEM_INIT_CHECKPOINT_NAMES[checkpoint]
+            )
+        }
+    }
+    if reached & FILESYSTEM_RUNTIME_PUBLISHED_BITMAP != 0 {
+        for (entered, returned) in [(6usize, 7usize), (8, 9), (10, 11), (12, 13)] {
+            if reached & (1u64 << entered) != 0 && reached & (1u64 << returned) == 0 {
+                bail!(
+                    "watchdog diagnostic filesystem-init group branch is incomplete: \
+                     bitmap={reached:#x} checkpoint={}",
+                    FILESYSTEM_INIT_CHECKPOINT_NAMES[entered]
+                )
+            }
         }
     }
     Ok(())
@@ -1149,6 +1302,79 @@ mod tests {
 
         page[V5_DIAGNOSTIC_BYTES..V5_DIAGNOSTIC_BYTES + 8]
             .copy_from_slice(&(1u64 << 18).to_le_bytes());
+        assert!(decode_diagnostic_page(&page).is_err());
+    }
+
+    #[test]
+    fn decodes_v7_filesystem_init_checkpoints_and_rejects_invalid_state() {
+        let mut page = diagnostic_page(DIAGNOSTIC_VERSION_V7);
+        page[V1_DIAGNOSTIC_BYTES..V1_DIAGNOSTIC_BYTES + 8]
+            .copy_from_slice(&(0b111u64).to_le_bytes());
+        page[V1_DIAGNOSTIC_BYTES + 8..V1_DIAGNOSTIC_BYTES + 12]
+            .copy_from_slice(&(2u32).to_le_bytes());
+        page[V1_DIAGNOSTIC_BYTES + 16..V1_DIAGNOSTIC_BYTES + 24]
+            .copy_from_slice(&(3u64).to_le_bytes());
+        page[V2_DIAGNOSTIC_BYTES..V2_DIAGNOSTIC_BYTES + 8]
+            .copy_from_slice(&(0b00_0111u64).to_le_bytes());
+        page[V3_DIAGNOSTIC_BYTES..V3_DIAGNOSTIC_BYTES + 8].copy_from_slice(&(0u64).to_le_bytes());
+        page[V6_DIAGNOSTIC_BYTES..V6_DIAGNOSTIC_BYTES + 8]
+            .copy_from_slice(&(u32::MAX as u64).to_le_bytes());
+        for checkpoint in 0..32 {
+            let offset = V6_DIAGNOSTIC_BYTES + 8 + checkpoint * 8;
+            page[offset..offset + 8].copy_from_slice(&(1001u64 + checkpoint as u64).to_le_bytes());
+        }
+
+        let diagnostic = decode_diagnostic_page(&page).unwrap();
+        assert_eq!(diagnostic["schema_version"], 7);
+        assert_eq!(
+            diagnostic["filesystem_init_checkpoint_bitmap"],
+            "0xffffffff"
+        );
+        assert_eq!(
+            diagnostic["filesystem_init_checkpoint_elapsed_ns"]
+                ["filesystem-runtime-adapter-installed"],
+            1001
+        );
+        assert_eq!(
+            diagnostic["filesystem_init_checkpoint_elapsed_ns"]
+                ["filesystem-window-next-timer-programmed"],
+            1032
+        );
+
+        page[V6_DIAGNOSTIC_BYTES..V6_DIAGNOSTIC_BYTES + 8]
+            .copy_from_slice(&(1u64 << 32).to_le_bytes());
+        assert!(decode_diagnostic_page(&page).is_err());
+
+        page[V1_DIAGNOSTIC_BYTES..V1_DIAGNOSTIC_BYTES + 8]
+            .copy_from_slice(&(0b11u64).to_le_bytes());
+        page[V1_DIAGNOSTIC_BYTES + 8..V1_DIAGNOSTIC_BYTES + 12]
+            .copy_from_slice(&(1u32).to_le_bytes());
+        page[V1_DIAGNOSTIC_BYTES + 16..V1_DIAGNOSTIC_BYTES + 24]
+            .copy_from_slice(&(2u64).to_le_bytes());
+        page[V6_DIAGNOSTIC_BYTES..V6_DIAGNOSTIC_BYTES + 8]
+            .copy_from_slice(&(0x0000_407fu64).to_le_bytes());
+        assert!(decode_diagnostic_page(&page).is_err());
+
+        page[V6_DIAGNOSTIC_BYTES..V6_DIAGNOSTIC_BYTES + 8]
+            .copy_from_slice(&(1u64 << 22).to_le_bytes());
+        assert!(decode_diagnostic_page(&page).is_err());
+
+        page[V1_DIAGNOSTIC_BYTES..V1_DIAGNOSTIC_BYTES + 8].copy_from_slice(&(1u64).to_le_bytes());
+        page[V1_DIAGNOSTIC_BYTES + 8..V1_DIAGNOSTIC_BYTES + 12]
+            .copy_from_slice(&(0u32).to_le_bytes());
+        page[V1_DIAGNOSTIC_BYTES + 16..V1_DIAGNOSTIC_BYTES + 24]
+            .copy_from_slice(&(1u64).to_le_bytes());
+        page[V6_DIAGNOSTIC_BYTES..V6_DIAGNOSTIC_BYTES + 8].copy_from_slice(&(1u64).to_le_bytes());
+        assert!(decode_diagnostic_page(&page).is_err());
+
+        page[V1_DIAGNOSTIC_BYTES..V1_DIAGNOSTIC_BYTES + 8]
+            .copy_from_slice(&(0b111u64).to_le_bytes());
+        page[V1_DIAGNOSTIC_BYTES + 8..V1_DIAGNOSTIC_BYTES + 12]
+            .copy_from_slice(&(2u32).to_le_bytes());
+        page[V1_DIAGNOSTIC_BYTES + 16..V1_DIAGNOSTIC_BYTES + 24]
+            .copy_from_slice(&(3u64).to_le_bytes());
+        page[V6_DIAGNOSTIC_BYTES..V6_DIAGNOSTIC_BYTES + 8]
+            .copy_from_slice(&(0x003f_ffffu64).to_le_bytes());
         assert!(decode_diagnostic_page(&page).is_err());
     }
 

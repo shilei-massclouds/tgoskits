@@ -40,13 +40,15 @@ pub const DIAGNOSTIC_PAGE_BYTES: usize = 4096;
 const TIMER_TICKS: u32 = (WATCHDOG_TIMEOUT_SECONDS as u32) << 9;
 const MAX_CPUS: usize = 64;
 const DIAGNOSTIC_MAGIC: u32 = 0x4b44_5744;
-const DIAGNOSTIC_VERSION: u32 = 6;
+const DIAGNOSTIC_VERSION: u32 = 7;
 pub const BOOT_PHASE_COUNT: usize = 12;
 const BOOTSTRAP_CHECKPOINT_COUNT: usize = 6;
 const BOOTSTRAP_FOLLOWUP_CHECKPOINT_COUNT: usize = 6;
 const INIT_TASK_CHECKPOINT_COUNT: usize = 14;
 const SERIAL_INIT_CHECKPOINT_COUNT: usize = 18;
+const FILESYSTEM_INIT_CHECKPOINT_COUNT: usize = 32;
 const INIT_TASK_REQUIRED_PHASE_SEQUENCE: u64 = 11;
+const FILESYSTEM_INIT_PHASE_SEQUENCE: u64 = 2;
 
 static WATCHDOG_MMIO: AtomicUsize = AtomicUsize::new(0);
 static WATCHDOG_CONFIG_ADDRESS: AtomicU32 = AtomicU32::new(0);
@@ -101,6 +103,8 @@ struct DiagnosticPage {
     init_task_checkpoint_elapsed_ns: [AtomicU64; INIT_TASK_CHECKPOINT_COUNT],
     serial_init_checkpoint_bitmap: AtomicU64,
     serial_init_checkpoint_elapsed_ns: [AtomicU64; SERIAL_INIT_CHECKPOINT_COUNT],
+    filesystem_init_checkpoint_bitmap: AtomicU64,
+    filesystem_init_checkpoint_elapsed_ns: [AtomicU64; FILESYSTEM_INIT_CHECKPOINT_COUNT],
 }
 
 impl DiagnosticPage {
@@ -133,6 +137,9 @@ impl DiagnosticPage {
             serial_init_checkpoint_bitmap: AtomicU64::new(0),
             serial_init_checkpoint_elapsed_ns: [const { AtomicU64::new(0) };
                 SERIAL_INIT_CHECKPOINT_COUNT],
+            filesystem_init_checkpoint_bitmap: AtomicU64::new(0),
+            filesystem_init_checkpoint_elapsed_ns: [const { AtomicU64::new(0) };
+                FILESYSTEM_INIT_CHECKPOINT_COUNT],
         }
     }
 }
@@ -327,6 +334,150 @@ impl SerialInitCheckpoint {
             Self::TaskTimerEntered => 0x06000,
             Self::TaskTimerReturned => 0x0e000,
             Self::NextTimerProgrammed => 0x1e000,
+        }
+    }
+}
+
+/// A persistent boundary inside filesystem initialization or its first worker/IRQ.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum FilesystemInitCheckpoint {
+    /// All filesystem OS capability adapters were installed.
+    RuntimeAdapterInstalled = 0,
+    /// Direct RDIF block-device collection returned.
+    BlockDevicesDrained = 1,
+    /// RDIF block-group collection returned.
+    BlockGroupsDrained  = 2,
+    /// Block-runtime construction and installation is about to begin.
+    RuntimeInstallEntered = 3,
+    /// The direct-device controller loop is about to begin.
+    DirectDeviceLoopEntered = 4,
+    /// The complete direct-device loop returned.
+    DirectDeviceLoopReturned = 5,
+    /// The first observed group controller is about to start.
+    FirstGroupControllerEntered = 6,
+    /// The first observed group-controller start returned success or error.
+    FirstGroupControllerReturned = 7,
+    /// The first observed group member is about to bootstrap.
+    FirstGroupMemberBootstrapEntered = 8,
+    /// The first observed group-member bootstrap returned success or error.
+    FirstGroupMemberBootstrapReturned = 9,
+    /// The first observed group IRQ setup branch is about to begin.
+    FirstGroupIrqSetupEntered = 10,
+    /// The first observed group IRQ setup returned success or error.
+    FirstGroupIrqSetupReturned = 11,
+    /// The first observed bootstrapped group member is about to become ready.
+    FirstGroupMemberReadyEntered = 12,
+    /// The first observed group-member ready operation returned success or error.
+    FirstGroupMemberReadyReturned = 13,
+    /// The complete direct/group runtime was published.
+    RuntimePublished    = 14,
+    /// Root discovery and mounting is about to begin.
+    RootInitEntered     = 15,
+    /// Discovered-disk collection is about to begin.
+    DiskCollectionEntered = 16,
+    /// The first observed disk volume scan is about to begin.
+    FirstVolumeScanEntered = 17,
+    /// The first observed disk volume scan returned success or error.
+    FirstVolumeScanReturned = 18,
+    /// Root selection returned a concrete disk and optional partition.
+    RootCandidateSelected = 19,
+    /// Root filesystem construction and mount publication returned.
+    RootMounted         = 20,
+    /// Every additional partition mount attempt returned.
+    AdditionalMountsReturned = 21,
+    /// The complete root-initialization entry point returned.
+    RootInitReturned    = 22,
+    /// The first block maintenance task is about to be inserted.
+    FirstBlockWorkerSpawnEntered = 23,
+    /// The first block maintenance task insertion returned.
+    FirstBlockWorkerSpawnReturned = 24,
+    /// The first observed block worker began its entry closure.
+    FirstBlockWorkerEntered = 25,
+    /// The first observed block worker's affinity operation returned.
+    FirstBlockWorkerAffinityReturned = 26,
+    /// The first timer IRQ in the filesystem window began.
+    TimerIrqEntered     = 27,
+    /// Scheduler-clock publication in that timer IRQ returned.
+    SchedulerClockReturned = 28,
+    /// Periodic advancement returned and task-timer dispatch is about to begin.
+    TaskTimerEntered    = 29,
+    /// Task-timer dispatch returned.
+    TaskTimerReturned   = 30,
+    /// One-shot timer reprogramming returned.
+    NextTimerProgrammed = 31,
+}
+
+impl FilesystemInitCheckpoint {
+    const fn required_bitmap(self) -> u64 {
+        match self {
+            Self::RuntimeAdapterInstalled | Self::TimerIrqEntered => 0,
+            Self::BlockDevicesDrained => 0x0000_0001,
+            Self::BlockGroupsDrained => 0x0000_0003,
+            Self::RuntimeInstallEntered => 0x0000_0007,
+            Self::DirectDeviceLoopEntered => 0x0000_000f,
+            Self::DirectDeviceLoopReturned => 0x0000_001f,
+            Self::FirstGroupControllerEntered => 0x0000_003f,
+            Self::FirstGroupControllerReturned => 0x0000_007f,
+            Self::FirstGroupMemberBootstrapEntered => 0x0000_00ff,
+            Self::FirstGroupMemberBootstrapReturned => 0x0000_01ff,
+            Self::FirstGroupIrqSetupEntered => 0x0000_03ff,
+            Self::FirstGroupIrqSetupReturned => 0x0000_07ff,
+            Self::FirstGroupMemberReadyEntered => 0x0000_0fff,
+            Self::FirstGroupMemberReadyReturned => 0x0000_1fff,
+            Self::RuntimePublished => 0x0000_003f,
+            Self::RootInitEntered => 0x0000_403f,
+            Self::DiskCollectionEntered => 0x0000_c03f,
+            Self::FirstVolumeScanEntered => 0x0001_c03f,
+            Self::FirstVolumeScanReturned => 0x0003_c03f,
+            Self::RootCandidateSelected => 0x0007_c03f,
+            Self::RootMounted => 0x000f_c03f,
+            Self::AdditionalMountsReturned => 0x001f_c03f,
+            Self::RootInitReturned => 0x003f_c03f,
+            Self::FirstBlockWorkerSpawnEntered => 0x0000_001f,
+            Self::FirstBlockWorkerSpawnReturned | Self::FirstBlockWorkerEntered => 0x0080_001f,
+            Self::FirstBlockWorkerAffinityReturned => 0x0280_001f,
+            Self::SchedulerClockReturned => 0x0800_0000,
+            Self::TaskTimerEntered => 0x1800_0000,
+            Self::TaskTimerReturned => 0x3800_0000,
+            Self::NextTimerProgrammed => 0x7800_0000,
+        }
+    }
+}
+
+/// A timer-IRQ boundary routed to the active early-boot diagnostic window.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EarlyBootTimerCheckpoint {
+    /// The timer IRQ began.
+    TimerIrqEntered,
+    /// Scheduler-clock publication returned.
+    SchedulerClockReturned,
+    /// Task-timer dispatch is about to begin.
+    TaskTimerEntered,
+    /// Task-timer dispatch returned.
+    TaskTimerReturned,
+    /// One-shot timer reprogramming returned.
+    NextTimerProgrammed,
+}
+
+impl EarlyBootTimerCheckpoint {
+    const fn serial_checkpoint(self) -> SerialInitCheckpoint {
+        match self {
+            Self::TimerIrqEntered => SerialInitCheckpoint::TimerIrqEntered,
+            Self::SchedulerClockReturned => SerialInitCheckpoint::SchedulerClockReturned,
+            Self::TaskTimerEntered => SerialInitCheckpoint::TaskTimerEntered,
+            Self::TaskTimerReturned => SerialInitCheckpoint::TaskTimerReturned,
+            Self::NextTimerProgrammed => SerialInitCheckpoint::NextTimerProgrammed,
+        }
+    }
+
+    const fn filesystem_checkpoint(self) -> FilesystemInitCheckpoint {
+        match self {
+            Self::TimerIrqEntered => FilesystemInitCheckpoint::TimerIrqEntered,
+            Self::SchedulerClockReturned => FilesystemInitCheckpoint::SchedulerClockReturned,
+            Self::TaskTimerEntered => FilesystemInitCheckpoint::TaskTimerEntered,
+            Self::TaskTimerReturned => FilesystemInitCheckpoint::TaskTimerReturned,
+            Self::NextTimerProgrammed => FilesystemInitCheckpoint::NextTimerProgrammed,
         }
     }
 }
@@ -802,6 +953,125 @@ fn record_serial_init_checkpoint_in(
     Some(elapsed_ns)
 }
 
+/// Records one filesystem-init, worker, or overlapping timer boundary.
+///
+/// The clock callback is evaluated only while the watchdog is armed, phase
+/// sequence two is active, dependencies are complete, and the checkpoint has
+/// not already been published.
+pub fn record_filesystem_init_checkpoint(
+    checkpoint: FilesystemInitCheckpoint,
+    read_now_ns: impl FnOnce() -> u64,
+) -> Option<u64> {
+    record_filesystem_init_checkpoint_in(
+        &DIAGNOSTIC,
+        WATCHDOG_ARMED.load(Ordering::Acquire),
+        checkpoint,
+        read_now_ns,
+    )
+}
+
+fn record_filesystem_init_checkpoint_in(
+    diagnostic: &DiagnosticPage,
+    watchdog_armed: bool,
+    checkpoint: FilesystemInitCheckpoint,
+    read_now_ns: impl FnOnce() -> u64,
+) -> Option<u64> {
+    if !watchdog_armed
+        || diagnostic.phase_sequence.load(Ordering::Acquire) != FILESYSTEM_INIT_PHASE_SEQUENCE
+    {
+        return None;
+    }
+    let bit = 1u64 << checkpoint as usize;
+    let observed = diagnostic
+        .filesystem_init_checkpoint_bitmap
+        .load(Ordering::Acquire);
+    let required = checkpoint.required_bitmap();
+    if observed & bit != 0
+        || observed & required != required
+        || (checkpoint == FilesystemInitCheckpoint::RuntimePublished
+            && !filesystem_group_branches_complete(observed))
+    {
+        return None;
+    }
+    let now_ns = read_now_ns();
+    let elapsed_ns = now_ns.saturating_sub(diagnostic.boot_epoch.load(Ordering::Acquire));
+    diagnostic.filesystem_init_checkpoint_elapsed_ns[checkpoint as usize]
+        .store(elapsed_ns, Ordering::Relaxed);
+    diagnostic
+        .filesystem_init_checkpoint_bitmap
+        .fetch_or(bit, Ordering::Release);
+    Some(elapsed_ns)
+}
+
+fn filesystem_group_branches_complete(observed: u64) -> bool {
+    [
+        (
+            FilesystemInitCheckpoint::FirstGroupControllerEntered,
+            FilesystemInitCheckpoint::FirstGroupControllerReturned,
+        ),
+        (
+            FilesystemInitCheckpoint::FirstGroupMemberBootstrapEntered,
+            FilesystemInitCheckpoint::FirstGroupMemberBootstrapReturned,
+        ),
+        (
+            FilesystemInitCheckpoint::FirstGroupIrqSetupEntered,
+            FilesystemInitCheckpoint::FirstGroupIrqSetupReturned,
+        ),
+        (
+            FilesystemInitCheckpoint::FirstGroupMemberReadyEntered,
+            FilesystemInitCheckpoint::FirstGroupMemberReadyReturned,
+        ),
+    ]
+    .into_iter()
+    .all(|(entered, returned)| {
+        let entered = 1u64 << entered as usize;
+        let returned = 1u64 << returned as usize;
+        observed & entered == 0 || observed & returned != 0
+    })
+}
+
+/// Records a timer boundary in the active serial or filesystem boot window.
+///
+/// Phase sequence one routes to the retained v6 serial writer, phase sequence
+/// two routes to v7, and every other phase performs no diagnostic write.
+pub fn record_early_boot_timer_checkpoint(
+    checkpoint: EarlyBootTimerCheckpoint,
+    read_now_ns: impl FnOnce() -> u64,
+) -> Option<u64> {
+    record_early_boot_timer_checkpoint_in(
+        &DIAGNOSTIC,
+        WATCHDOG_ARMED.load(Ordering::Acquire),
+        checkpoint,
+        read_now_ns,
+    )
+}
+
+fn record_early_boot_timer_checkpoint_in(
+    diagnostic: &DiagnosticPage,
+    watchdog_armed: bool,
+    checkpoint: EarlyBootTimerCheckpoint,
+    read_now_ns: impl FnOnce() -> u64,
+) -> Option<u64> {
+    if !watchdog_armed {
+        return None;
+    }
+    match diagnostic.phase_sequence.load(Ordering::Acquire) {
+        1 => record_serial_init_checkpoint_in(
+            diagnostic,
+            true,
+            checkpoint.serial_checkpoint(),
+            read_now_ns,
+        ),
+        FILESYSTEM_INIT_PHASE_SEQUENCE => record_filesystem_init_checkpoint_in(
+            diagnostic,
+            true,
+            checkpoint.filesystem_checkpoint(),
+            read_now_ns,
+        ),
+        _ => None,
+    }
+}
+
 fn reset_diagnostic_page(diagnostic: &DiagnosticPage, boot_epoch: u64, online_mask: u64) {
     BOOTSTRAP_FEEDER_TASK_ID.store(0, Ordering::Release);
     INIT_TASK_ID.store(0, Ordering::Release);
@@ -841,6 +1111,12 @@ fn reset_diagnostic_page(diagnostic: &DiagnosticPage, boot_epoch: u64, online_ma
         .serial_init_checkpoint_bitmap
         .store(0, Ordering::Release);
     for elapsed in &diagnostic.serial_init_checkpoint_elapsed_ns {
+        elapsed.store(0, Ordering::Relaxed);
+    }
+    diagnostic
+        .filesystem_init_checkpoint_bitmap
+        .store(0, Ordering::Release);
+    for elapsed in &diagnostic.filesystem_init_checkpoint_elapsed_ns {
         elapsed.store(0, Ordering::Relaxed);
     }
 }
@@ -1156,7 +1432,7 @@ mod tests {
     fn diagnostic_layout_fits_one_qmp_memsave_page() {
         assert!(size_of::<DiagnosticPage>() <= DIAGNOSTIC_PAGE_BYTES);
         assert_eq!(DIAGNOSTIC.magic, DIAGNOSTIC_MAGIC);
-        assert_eq!(DIAGNOSTIC.version, 6);
+        assert_eq!(DIAGNOSTIC.version, 7);
         assert_eq!(size_of::<DiagnosticPage>(), 4096);
         assert_eq!(
             core::mem::offset_of!(DiagnosticPage, reached_phase_bitmap),
@@ -1198,6 +1474,257 @@ mod tests {
             core::mem::offset_of!(DiagnosticPage, serial_init_checkpoint_elapsed_ns),
             1936
         );
+        assert_eq!(
+            core::mem::offset_of!(DiagnosticPage, filesystem_init_checkpoint_bitmap),
+            2080
+        );
+        assert_eq!(
+            core::mem::offset_of!(DiagnosticPage, filesystem_init_checkpoint_elapsed_ns),
+            2088
+        );
+        assert_eq!(
+            core::mem::offset_of!(DiagnosticPage, filesystem_init_checkpoint_elapsed_ns)
+                + FILESYSTEM_INIT_CHECKPOINT_COUNT * size_of::<u64>(),
+            2344
+        );
+    }
+
+    #[test]
+    fn filesystem_init_checkpoints_are_lazy_and_phase_limited() {
+        let diagnostic = DiagnosticPage::new();
+        diagnostic.boot_epoch.store(100, Ordering::Release);
+        let clock_reads = core::cell::Cell::new(0);
+        let read_clock = || {
+            clock_reads.set(clock_reads.get() + 1);
+            150
+        };
+
+        diagnostic.phase_sequence.store(2, Ordering::Release);
+        assert_eq!(
+            record_filesystem_init_checkpoint_in(
+                &diagnostic,
+                false,
+                FilesystemInitCheckpoint::RuntimeAdapterInstalled,
+                read_clock,
+            ),
+            None
+        );
+        assert_eq!(clock_reads.get(), 0);
+
+        diagnostic.phase_sequence.store(1, Ordering::Release);
+        assert_eq!(
+            record_filesystem_init_checkpoint_in(
+                &diagnostic,
+                true,
+                FilesystemInitCheckpoint::RuntimeAdapterInstalled,
+                read_clock,
+            ),
+            None
+        );
+        diagnostic.phase_sequence.store(3, Ordering::Release);
+        assert_eq!(
+            record_filesystem_init_checkpoint_in(
+                &diagnostic,
+                true,
+                FilesystemInitCheckpoint::RuntimeAdapterInstalled,
+                read_clock,
+            ),
+            None
+        );
+        assert_eq!(clock_reads.get(), 0);
+
+        diagnostic.phase_sequence.store(2, Ordering::Release);
+        assert_eq!(
+            record_filesystem_init_checkpoint_in(
+                &diagnostic,
+                true,
+                FilesystemInitCheckpoint::BlockDevicesDrained,
+                read_clock,
+            ),
+            None
+        );
+        assert_eq!(clock_reads.get(), 0);
+        assert_eq!(
+            record_filesystem_init_checkpoint_in(
+                &diagnostic,
+                true,
+                FilesystemInitCheckpoint::RuntimeAdapterInstalled,
+                read_clock,
+            ),
+            Some(50)
+        );
+        assert_eq!(
+            record_filesystem_init_checkpoint_in(
+                &diagnostic,
+                true,
+                FilesystemInitCheckpoint::RuntimeAdapterInstalled,
+                read_clock,
+            ),
+            None
+        );
+        assert_eq!(clock_reads.get(), 1);
+    }
+
+    #[test]
+    fn filesystem_main_chain_accepts_direct_group_success_and_error_branches() {
+        let direct = eligible_filesystem_diagnostic();
+        record_filesystem_checkpoints(
+            &direct,
+            &[
+                FilesystemInitCheckpoint::RuntimeAdapterInstalled,
+                FilesystemInitCheckpoint::BlockDevicesDrained,
+                FilesystemInitCheckpoint::BlockGroupsDrained,
+                FilesystemInitCheckpoint::RuntimeInstallEntered,
+                FilesystemInitCheckpoint::DirectDeviceLoopEntered,
+                FilesystemInitCheckpoint::DirectDeviceLoopReturned,
+                FilesystemInitCheckpoint::RuntimePublished,
+                FilesystemInitCheckpoint::RootInitEntered,
+                FilesystemInitCheckpoint::DiskCollectionEntered,
+                FilesystemInitCheckpoint::FirstVolumeScanEntered,
+                FilesystemInitCheckpoint::FirstVolumeScanReturned,
+                FilesystemInitCheckpoint::RootCandidateSelected,
+                FilesystemInitCheckpoint::RootMounted,
+                FilesystemInitCheckpoint::AdditionalMountsReturned,
+                FilesystemInitCheckpoint::RootInitReturned,
+            ],
+        );
+
+        let group_success = eligible_filesystem_diagnostic();
+        record_filesystem_checkpoints(
+            &group_success,
+            &[
+                FilesystemInitCheckpoint::RuntimeAdapterInstalled,
+                FilesystemInitCheckpoint::BlockDevicesDrained,
+                FilesystemInitCheckpoint::BlockGroupsDrained,
+                FilesystemInitCheckpoint::RuntimeInstallEntered,
+                FilesystemInitCheckpoint::DirectDeviceLoopEntered,
+                FilesystemInitCheckpoint::DirectDeviceLoopReturned,
+                FilesystemInitCheckpoint::FirstGroupControllerEntered,
+                FilesystemInitCheckpoint::FirstGroupControllerReturned,
+                FilesystemInitCheckpoint::FirstGroupMemberBootstrapEntered,
+                FilesystemInitCheckpoint::FirstGroupMemberBootstrapReturned,
+                FilesystemInitCheckpoint::FirstGroupIrqSetupEntered,
+                FilesystemInitCheckpoint::FirstGroupIrqSetupReturned,
+                FilesystemInitCheckpoint::FirstGroupMemberReadyEntered,
+                FilesystemInitCheckpoint::FirstGroupMemberReadyReturned,
+                FilesystemInitCheckpoint::RuntimePublished,
+            ],
+        );
+
+        let group_error = eligible_filesystem_diagnostic();
+        record_filesystem_checkpoints(
+            &group_error,
+            &[
+                FilesystemInitCheckpoint::RuntimeAdapterInstalled,
+                FilesystemInitCheckpoint::BlockDevicesDrained,
+                FilesystemInitCheckpoint::BlockGroupsDrained,
+                FilesystemInitCheckpoint::RuntimeInstallEntered,
+                FilesystemInitCheckpoint::DirectDeviceLoopEntered,
+                FilesystemInitCheckpoint::DirectDeviceLoopReturned,
+                FilesystemInitCheckpoint::FirstGroupControllerEntered,
+                FilesystemInitCheckpoint::FirstGroupControllerReturned,
+                FilesystemInitCheckpoint::RuntimePublished,
+            ],
+        );
+
+        let incomplete_group = eligible_filesystem_diagnostic();
+        record_filesystem_checkpoints(
+            &incomplete_group,
+            &[
+                FilesystemInitCheckpoint::RuntimeAdapterInstalled,
+                FilesystemInitCheckpoint::BlockDevicesDrained,
+                FilesystemInitCheckpoint::BlockGroupsDrained,
+                FilesystemInitCheckpoint::RuntimeInstallEntered,
+                FilesystemInitCheckpoint::DirectDeviceLoopEntered,
+                FilesystemInitCheckpoint::DirectDeviceLoopReturned,
+                FilesystemInitCheckpoint::FirstGroupControllerEntered,
+            ],
+        );
+        assert_eq!(
+            record_filesystem_init_checkpoint_in(
+                &incomplete_group,
+                true,
+                FilesystemInitCheckpoint::RuntimePublished,
+                || 1,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn filesystem_worker_entry_may_precede_spawn_return() {
+        let diagnostic = eligible_filesystem_diagnostic();
+        record_filesystem_checkpoints(
+            &diagnostic,
+            &[
+                FilesystemInitCheckpoint::RuntimeAdapterInstalled,
+                FilesystemInitCheckpoint::BlockDevicesDrained,
+                FilesystemInitCheckpoint::BlockGroupsDrained,
+                FilesystemInitCheckpoint::RuntimeInstallEntered,
+                FilesystemInitCheckpoint::DirectDeviceLoopEntered,
+                FilesystemInitCheckpoint::FirstBlockWorkerSpawnEntered,
+                FilesystemInitCheckpoint::FirstBlockWorkerEntered,
+                FilesystemInitCheckpoint::FirstBlockWorkerAffinityReturned,
+                FilesystemInitCheckpoint::FirstBlockWorkerSpawnReturned,
+            ],
+        );
+    }
+
+    #[test]
+    fn early_boot_timer_router_selects_serial_filesystem_or_no_window() {
+        let serial = DiagnosticPage::new();
+        serial.phase_sequence.store(1, Ordering::Release);
+        serial.bootstrap_followup_checkpoint_bitmap.store(
+            1 << BootstrapFollowupCheckpoint::SerialInitEntered as usize,
+            Ordering::Release,
+        );
+        assert!(
+            record_early_boot_timer_checkpoint_in(
+                &serial,
+                true,
+                EarlyBootTimerCheckpoint::TimerIrqEntered,
+                || 1,
+            )
+            .is_some()
+        );
+        assert_eq!(
+            serial.serial_init_checkpoint_bitmap.load(Ordering::Acquire),
+            1 << SerialInitCheckpoint::TimerIrqEntered as usize
+        );
+
+        let filesystem = eligible_filesystem_diagnostic();
+        assert!(
+            record_early_boot_timer_checkpoint_in(
+                &filesystem,
+                true,
+                EarlyBootTimerCheckpoint::TimerIrqEntered,
+                || 1,
+            )
+            .is_some()
+        );
+        assert_eq!(
+            filesystem
+                .filesystem_init_checkpoint_bitmap
+                .load(Ordering::Acquire),
+            1 << FilesystemInitCheckpoint::TimerIrqEntered as usize
+        );
+
+        let outside = DiagnosticPage::new();
+        outside.phase_sequence.store(3, Ordering::Release);
+        let clock_reads = core::cell::Cell::new(0);
+        assert_eq!(
+            record_early_boot_timer_checkpoint_in(
+                &outside,
+                true,
+                EarlyBootTimerCheckpoint::TimerIrqEntered,
+                || {
+                    clock_reads.set(clock_reads.get() + 1);
+                    1
+                },
+            ),
+            None
+        );
+        assert_eq!(clock_reads.get(), 0);
     }
 
     #[test]
@@ -1800,6 +2327,10 @@ mod tests {
             .serial_init_checkpoint_bitmap
             .store(1, Ordering::Release);
         diagnostic.serial_init_checkpoint_elapsed_ns[0].store(50, Ordering::Release);
+        diagnostic
+            .filesystem_init_checkpoint_bitmap
+            .store(1, Ordering::Release);
+        diagnostic.filesystem_init_checkpoint_elapsed_ns[0].store(60, Ordering::Release);
 
         reset_diagnostic_page(&diagnostic, 500, 1);
 
@@ -1854,6 +2385,36 @@ mod tests {
                 .iter()
                 .all(|elapsed| elapsed.load(Ordering::Acquire) == 0)
         );
+        assert_eq!(
+            diagnostic
+                .filesystem_init_checkpoint_bitmap
+                .load(Ordering::Acquire),
+            0
+        );
+        assert!(
+            diagnostic
+                .filesystem_init_checkpoint_elapsed_ns
+                .iter()
+                .all(|elapsed| elapsed.load(Ordering::Acquire) == 0)
+        );
+    }
+
+    fn eligible_filesystem_diagnostic() -> DiagnosticPage {
+        let diagnostic = DiagnosticPage::new();
+        diagnostic.phase_sequence.store(2, Ordering::Release);
+        diagnostic
+    }
+
+    fn record_filesystem_checkpoints(
+        diagnostic: &DiagnosticPage,
+        checkpoints: &[FilesystemInitCheckpoint],
+    ) {
+        for checkpoint in checkpoints {
+            assert!(
+                record_filesystem_init_checkpoint_in(diagnostic, true, *checkpoint, || 1).is_some(),
+                "checkpoint {checkpoint:?} was rejected"
+            );
+        }
     }
 
     #[test]
