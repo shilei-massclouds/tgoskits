@@ -1,8 +1,7 @@
 # Starry serial-init diagnostics v6
 
-Status: implemented; static gates and the non-QEMU release build passed,
-2026-08-22. Normal QEMU acceptance and natural-recurrence decoding remain
-pending.
+Status: implemented; static gates, the non-QEMU release build, and normal QEMU
+acceptance passed, 2026-08-22. Natural-recurrence decoding remains pending.
 
 This compatibly extends
 [Starry init-task diagnostics v5](starry-init-task-diagnostics-v5.md). The
@@ -179,3 +178,19 @@ and `git diff --check` passed. A non-QEMU x86_64 release build using the
 `d925a72eadcf34bfadd4a77ff0eaae0e1c639e625dd2dc5b5db6029c01d73fa2`.
 This build result proves compilation and linkage only; it is not normal-boot or
 fault-path acceptance.
+
+Normal QEMU acceptance passed in KernDiff session
+`run-pipe-smoke-20260822T035602Z-5bf8c48e` against the clean TGOSKits commit
+`028af0d6921de011bd5cbb561bb4b1100dff4b5e`. The coverage-instrumented target
+ELF SHA-256 was
+`c4e986ef94c175863b58fd9fba2c5965e02db02248cf9f643d821b77c9c6f9c7`.
+The single execution published all twelve ordered phases, reached
+`shell-ready` at 2,604,424,261 ns, published guest start, exited the application
+and guest with status zero, and produced fresh coverage. QEMU reported normal
+`SHUTDOWN` at 19,410 ms; no validation fault was configured. KernDiff reported
+`status=match`, `exit=0`, and `target_status=completed`.
+`diagnostic_complete=false` is expected on this success path because axbuild
+only saves and decodes the page for an authoritative WATCHDOG event. This
+acceptance establishes absence of a normal-boot, semantic, and coverage
+regression for one pipe-smoke execution. It does not exercise v6 fault-page
+decoding, estimate the natural hang rate, or resolve defect-0001.
