@@ -74,6 +74,35 @@ mtime, and extended attributes. It hard-linked 12 duplicate paths, released
 verification again. Original evidence JSON was not edited and no managed-data
 purge was run.
 
+## Post-cleanup acceptance
+
+After the temporary probe module, compile-time environment variable, clock
+reads, one-shot state, widening call, and probe-only tests were removed, the
+production code revision
+`79778179040065b2722b78105769b28ae2417115` passed the complete offline
+regression and a new operator-run pipe smoke. Its target ELF SHA-256 was
+`78202840787f49042897006c00e3d4f50dafaaf692145c6abc6f7676876d1d81`.
+The boot completed all 12 phases, reached guest start, completed the
+application, produced fresh coverage, and ended with QMP `SHUTDOWN` at 19,078
+ms. The session was not continued or reused.
+
+The terminal session is retained separately from the frozen intervention
+archive at:
+
+```text
+/home/cloud/gitArceOS/KernDiff-evidence/defect-0001-irq-route-reentry-final-797781790/
+```
+
+Its manifest covers 45 original files and 345,630,739 logical bytes and has
+SHA-256
+`3cbb1f5452fd89cbca37782e44ec0043da0e96db9c8bfe07cf84ce964c305963`.
+All entries matched before and after relocation. The same strict hard-link
+deduplication policy linked two paths, released 73,728 physical bytes, and
+passed the full manifest again. The target-result SHA-256 is
+`0789626108ad0c48afd0be975a5153a7d62c842bc89d1af02e9dc01e7b578270`;
+the guest-log SHA-256 is
+`a57556704112239f7822f93c1b4c9cae5c21dfda8f450db6befddaf614a126df`.
+
 ## Interpretation and production state
 
 Commit `1ab948f772639a0437f3f8482fb85df219f8a1d6` changed `IRQ_ROUTES` from a
