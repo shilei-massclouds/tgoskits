@@ -88,133 +88,6 @@ static LOONGARCH_EIOINTC_DOMAIN_SLOT: AtomicU16 = AtomicU16::new(INVALID_IRQ_DOM
 static LOONGARCH_PCH_PIC_DOMAIN_SLOT: AtomicU16 = AtomicU16::new(INVALID_IRQ_DOMAIN);
 static LOONGARCH_LIOINTC_DOMAIN_SLOT: AtomicU16 = AtomicU16::new(INVALID_IRQ_DOMAIN);
 
-#[cfg(target_arch = "x86_64")]
-mod route_read_reentry_probe {
-    use core::{
-        hint::spin_loop,
-        sync::atomic::{AtomicBool, Ordering},
-    };
-
-    use super::{HwIrq, IrqDomainId, IrqDomainKind, IrqId, domain_by_kind_fast};
-
-    const SERIAL_GSI: HwIrq = HwIrq(4);
-    const NVME_SMP_FIRST_NEW_LEAF: HwIrq = HwIrq(2);
-    const HOLD_TICK_DIVISOR: u64 = 20;
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(super) enum Target {
-        Disabled,
-        Serial,
-        NvmeSmp,
-    }
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(super) struct Domains {
-        ioapic: Option<IrqDomainId>,
-        msi: Option<IrqDomainId>,
-    }
-
-    impl Domains {
-        fn current() -> Self {
-            Self {
-                ioapic: domain_by_kind_fast(IrqDomainKind::X86IoApic),
-                msi: domain_by_kind_fast(IrqDomainKind::X86Msi),
-            }
-        }
-
-        #[cfg(test)]
-        pub(super) const fn new(ioapic: IrqDomainId, msi: IrqDomainId) -> Self {
-            Self {
-                ioapic: Some(ioapic),
-                msi: Some(msi),
-            }
-        }
-    }
-
-    const fn equals_bytes(value: &str, expected: &[u8]) -> bool {
-        let value = value.as_bytes();
-        if value.len() != expected.len() {
-            return false;
-        }
-        let mut index = 0;
-        while index < value.len() {
-            if value[index] != expected[index] {
-                return false;
-            }
-            index += 1;
-        }
-        true
-    }
-
-    pub(super) const fn parse_target(value: Option<&str>) -> Target {
-        let Some(value) = value else {
-            return Target::Disabled;
-        };
-        if equals_bytes(value, b"serial") {
-            Target::Serial
-        } else if equals_bytes(value, b"nvme-smp") {
-            Target::NvmeSmp
-        } else {
-            panic!("KERNDIFF_IRQ_ROUTE_REENTRY_PROBE must be unset, serial, or nvme-smp")
-        }
-    }
-
-    const TARGET: Target = parse_target(option_env!("KERNDIFF_IRQ_ROUTE_REENTRY_PROBE"));
-    static CLAIMED: AtomicBool = AtomicBool::new(false);
-
-    fn target_matches(
-        target: Target,
-        leaf: IrqId,
-        parent: Option<IrqId>,
-        domains: Domains,
-    ) -> bool {
-        match target {
-            Target::Disabled => false,
-            Target::Serial => domains.ioapic == Some(leaf.domain) && leaf.hwirq == SERIAL_GSI,
-            Target::NvmeSmp => {
-                leaf.hwirq == NVME_SMP_FIRST_NEW_LEAF
-                    && parent.is_some_and(|parent| domains.msi == Some(parent.domain))
-            }
-        }
-    }
-
-    pub(super) fn claim(
-        claimed: &AtomicBool,
-        target: Target,
-        cpu: Option<usize>,
-        leaf: IrqId,
-        parent: Option<IrqId>,
-        domains: Domains,
-    ) -> bool {
-        cpu == Some(0)
-            && target_matches(target, leaf, parent, domains)
-            && claimed
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-    }
-
-    pub(super) fn widen_if_configured(leaf: IrqId, parent: Option<IrqId>) {
-        if TARGET == Target::Disabled
-            || !claim(
-                &CLAIMED,
-                TARGET,
-                crate::cpu::current_cpu_idx(),
-                leaf,
-                parent,
-                Domains::current(),
-            )
-        {
-            return;
-        }
-
-        let hold_ticks = (someboot::timer::freq() as u64 / HOLD_TICK_DIVISOR).max(1);
-        let started = someboot::timer::ticks() as u64;
-        while (someboot::timer::ticks() as u64).wrapping_sub(started) < hold_ticks {
-            spin_loop();
-        }
-    }
-}
-
 pub fn alloc_irq_domain(owner: DeviceId, kind: IrqDomainKind) -> Result<IrqDomainId, IrqError> {
     register_irq_domain(owner, None, kind)
 }
@@ -521,15 +394,10 @@ pub fn resolve_irq_route(parent: IrqId) -> IrqId {
 }
 
 pub fn parent_irq_for_leaf(leaf: IrqId) -> Option<IrqId> {
-    let routes = irq_routes_read();
-    let parent = routes
+    irq_routes_read()
         .iter()
         .find(|route| route.leaf == leaf)
-        .map(|route| route.parent);
-    #[cfg(target_arch = "x86_64")]
-    route_read_reentry_probe::widen_if_configured(leaf, parent);
-    drop(routes);
-    parent
+        .map(|route| route.parent)
 }
 
 /// Target specification for one inter-processor interrupt delivery.
@@ -917,85 +785,6 @@ mod tests {
             "an IRQ route read must exclude same-CPU hard-IRQ re-entry"
         );
         assert_eq!(restored_state, 1, "the read guard must restore local IRQs");
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn route_read_probe_accepts_only_documented_targets() {
-        use super::route_read_reentry_probe::{Target, parse_target};
-
-        assert_eq!(parse_target(None), Target::Disabled);
-        assert_eq!(parse_target(Some("serial")), Target::Serial);
-        assert_eq!(parse_target(Some("nvme-smp")), Target::NvmeSmp);
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    #[should_panic(
-        expected = "KERNDIFF_IRQ_ROUTE_REENTRY_PROBE must be unset, serial, or nvme-smp"
-    )]
-    fn route_read_probe_rejects_unknown_target() {
-        super::route_read_reentry_probe::parse_target(Some("typo"));
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn route_read_probe_is_cpu_zero_targeted_and_one_shot() {
-        use core::sync::atomic::AtomicBool;
-
-        use super::route_read_reentry_probe::{Domains, Target, claim};
-
-        let ioapic = IrqDomainId(7);
-        let msi = IrqDomainId(8);
-        let msix = IrqDomainId(9);
-        let domains = Domains::new(ioapic, msi);
-        let serial = IrqId::new(ioapic, HwIrq(4));
-        let nvme_smp = IrqId::new(msix, HwIrq(2));
-        let nvme_parent = Some(IrqId::new(msi, HwIrq(0x82)));
-
-        let serial_claimed = AtomicBool::new(false);
-        assert!(!claim(
-            &serial_claimed,
-            Target::Serial,
-            Some(1),
-            serial,
-            None,
-            domains
-        ));
-        assert!(claim(
-            &serial_claimed,
-            Target::Serial,
-            Some(0),
-            serial,
-            None,
-            domains
-        ));
-        assert!(!claim(
-            &serial_claimed,
-            Target::Serial,
-            Some(0),
-            serial,
-            None,
-            domains
-        ));
-
-        let nvme_claimed = AtomicBool::new(false);
-        assert!(!claim(
-            &nvme_claimed,
-            Target::NvmeSmp,
-            Some(0),
-            IrqId::new(msix, HwIrq(1)),
-            nvme_parent,
-            domains
-        ));
-        assert!(claim(
-            &nvme_claimed,
-            Target::NvmeSmp,
-            Some(0),
-            nvme_smp,
-            nvme_parent,
-            domains
-        ));
     }
 
     #[test]

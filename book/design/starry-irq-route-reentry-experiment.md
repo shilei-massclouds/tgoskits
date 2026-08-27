@@ -2,6 +2,11 @@
 
 ## Status and scope
 
+The controlled run completed on 2026-08-27 and satisfied the predeclared
+forced-overlap comparison for both locations. The temporary probe was then
+removed. See [the retained result record](starry-irq-route-reentry-experiment-results.md)
+for the evidence identities and limits of the conclusion.
+
 This document defines a temporary, opt-in experiment for KernDiff defect
 `defect-0001`. It does not declare the defect root cause and is not a production
 diagnostic facility. The probe must be removed after the controlled runs have
