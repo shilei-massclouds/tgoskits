@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU16, Ordering};
 
-use ax_sync::{RawSpinLockGuard, SpinLock, SpinLockGuard, SpinLockIrqSaveGuard};
+use ax_sync::{RawSpinLockGuard, SpinLock, SpinLockIrqSaveGuard};
 pub use rdif_intc;
 use rdif_intc::Intc;
 pub type ControllerIrqId = irq_framework::IrqId;
@@ -77,8 +77,8 @@ fn irq_routes() -> SpinLockIrqSaveGuard<'static, Vec<IrqRoute>> {
     IRQ_ROUTES.lock_irqsave()
 }
 
-fn irq_routes_read() -> SpinLockGuard<'static, Vec<IrqRoute>> {
-    IRQ_ROUTES.lock()
+fn irq_routes_read() -> SpinLockIrqSaveGuard<'static, Vec<IrqRoute>> {
+    IRQ_ROUTES.lock_irqsave()
 }
 static X86_IOAPIC_DOMAIN_SLOT: AtomicU16 = AtomicU16::new(INVALID_IRQ_DOMAIN);
 static X86_MSI_DOMAIN_SLOT: AtomicU16 = AtomicU16::new(INVALID_IRQ_DOMAIN);
@@ -898,6 +898,25 @@ mod tests {
             ),
             Err(IrqError::InvalidIrq)
         );
+    }
+
+    #[test]
+    fn irq_route_read_guard_disables_and_restores_local_irqs() {
+        let _test_guard = TEST_LOCK.lock();
+        let routes = irq_routes_read();
+
+        let nested_state = ax_sync::irq_save_and_disable();
+        unsafe { ax_sync::irq_restore(nested_state) };
+        drop(routes);
+
+        let restored_state = ax_sync::irq_save_and_disable();
+        unsafe { ax_sync::irq_restore(restored_state) };
+
+        assert_eq!(
+            nested_state, 0,
+            "an IRQ route read must exclude same-CPU hard-IRQ re-entry"
+        );
+        assert_eq!(restored_state, 1, "the read guard must restore local IRQs");
     }
 
     #[cfg(target_arch = "x86_64")]
