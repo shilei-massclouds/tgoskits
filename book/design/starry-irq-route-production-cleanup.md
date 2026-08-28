@@ -1,7 +1,7 @@
 # Starry IRQ-route production cleanup
 
-Status: implemented; non-QEMU and operator QEMU acceptance passed, with bounded
-production-only natural regression pending, 2026-08-28.
+Status: implemented; non-QEMU, operator QEMU, and bounded production-only
+natural regression acceptance passed, 2026-08-28.
 
 ## Decision
 
@@ -89,3 +89,21 @@ Its 45-file manifest SHA-256 is
 `1028410188a5b7de5745747b5a05c7bc410174571ed5d3df50a334afd87cf182`.
 `diagnostic_complete=false` is expected on this successful run because the v1/v2
 page is extracted only for an authoritative watchdog event.
+
+The frozen production-only regression then completed seeds 30--36: seven
+synchronous pipe cohorts of 15 executions each, for 105/105 successful target
+boots and zero hangs. Every result used clean documentation-only successor
+revision `933e2d276f7fe2d21bbeab4b4023184103eb2319`, retained the same production
+code as this cleanup revision, published all 12 phases, produced fresh coverage,
+exited target, guest, and application with status zero, and ended with QMP
+`SHUTDOWN`. No execution was continued or reused and no infrastructure failure
+was recovered. The QMP elapsed range was 18,257--27,910 ms.
+
+The regression confirms that removing v3--v7 checkpoints did not expose a boot,
+coverage, or pipe-semantic regression in the frozen 105-execution sample. Along
+with the preceding 405-execution fixed-observer sample, the candidate has 510
+successful natural target executions without a hang. This remains negative
+candidate evidence rather than direct attribution of the historical natural
+overlap. `defect-0001` therefore remains open and unresolved pending an explicit
+causal-scope and closure-policy decision; no further checkpoint expansion is
+scheduled by this cleanup.
