@@ -594,13 +594,6 @@ impl Thread {
 #[extern_trait]
 impl TaskExt for Box<Thread> {
     fn on_enter(&self) {
-        #[cfg(feature = "kerndiff-fault-observer")]
-        if self.tid() == 1 {
-            let _ = ax_driver::kerndiff_fault::record_init_task_checkpoint(
-                ax_driver::kerndiff_fault::InitTaskCheckpoint::TaskExtEntered,
-                ax_hal::time::monotonic_time_nanos(),
-            );
-        }
         let scope = unsafe { self.scope.read_for_context_switch() };
         unsafe { ActiveScope::set(&scope) };
         core::mem::forget(scope);
@@ -609,13 +602,6 @@ impl TaskExt for Box<Thread> {
         // no per-task perf event exists anywhere.
         #[cfg(target_arch = "aarch64")]
         crate::perf::task::perf_sched_in(self);
-        #[cfg(feature = "kerndiff-fault-observer")]
-        if self.tid() == 1 {
-            let _ = ax_driver::kerndiff_fault::record_init_task_checkpoint(
-                ax_driver::kerndiff_fault::InitTaskCheckpoint::TaskExtReturned,
-                ax_hal::time::monotonic_time_nanos(),
-            );
-        }
     }
 
     fn on_leave(&self) {

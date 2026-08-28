@@ -13,9 +13,7 @@ use crate::{
     mm::{copy_from_kernel, load_user_app, new_user_aspace_empty},
     pseudofs::{self, dev::tty},
     sync::{Mutex, PreemptIrqSaveGuard, RwLock},
-    task::{
-        ProcessData, ProcessImage, Thread, add_task_to_table, new_init_user_task, spawn_alarm_task,
-    },
+    task::{ProcessData, ProcessImage, Thread, add_task_to_table, new_user_task, spawn_alarm_task},
     tracepoint::tracepoint_init,
 };
 
@@ -63,12 +61,10 @@ pub fn init(args: &[String], envs: &[String]) {
     let (entry_vaddr, ustack_top, auxv) = load_user_app(&mut uspace, loc, &args[0], args, envs)
         .unwrap_or_else(|e| panic!("Failed to load user app: {}", e));
     ax_runtime::publish_kerndiff_boot_phase(ax_runtime::KernDiffBootPhase::UserspaceInit);
-    record_init_task_checkpoint(InitTaskSetupCheckpoint::TaskCreateRequested);
 
     let uctx = UserContext::new(entry_vaddr.into(), ustack_top, 0);
-    let mut task = new_init_user_task(&name, uctx);
+    let mut task = new_user_task(&name, uctx, 0);
     task.ctx_mut().set_page_table_root(uspace.page_table_root());
-    record_init_task_checkpoint(InitTaskSetupCheckpoint::TaskConstructed);
 
     // PID 1 must really be 1: the init process is the root of the process
     // hierarchy and userspace (e.g. systemd's `getpid() == 1` system-manager
@@ -114,24 +110,15 @@ pub fn init(args: &[String], envs: &[String]) {
 
     let thr = Thread::new(pid, proc, None, starry_signal::SignalSet::default(), scope);
     *task.task_ext_mut() = Some(AxTaskExt::from_impl(thr));
-    record_init_task_checkpoint(InitTaskSetupCheckpoint::ProcessReady);
 
-    record_init_task_checkpoint(InitTaskSetupCheckpoint::SpawnRequested);
     let task = {
         let _guard = PreemptIrqSaveGuard::new();
-        let task = spawn_task_with(task, |task| {
-            record_init_task_checkpoint(InitTaskSetupCheckpoint::TaskInitialized);
-            register_init_task(task.id().as_u64());
-            add_task_to_table(task);
-        });
-        record_init_task_checkpoint(InitTaskSetupCheckpoint::SpawnReturned);
+        let task = spawn_task_with(task, add_task_to_table);
         tty::arm_console_irq();
-        record_init_task_checkpoint(InitTaskSetupCheckpoint::ConsoleIrqArmed);
         task
     };
 
     // TODO: wait for all processes to finish
-    record_init_task_checkpoint(InitTaskSetupCheckpoint::JoinEntered);
     let exit_code = task.join();
     info!("Init process exited with code: {exit_code:?}");
 
@@ -149,65 +136,6 @@ pub fn init(args: &[String], envs: &[String]) {
         .filesystem()
         .flush()
         .expect("Failed to flush rootfs");
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum InitTaskSetupCheckpoint {
-    TaskCreateRequested,
-    TaskConstructed,
-    ProcessReady,
-    SpawnRequested,
-    TaskInitialized,
-    SpawnReturned,
-    ConsoleIrqArmed,
-    JoinEntered,
-}
-
-fn record_init_task_checkpoint(checkpoint: InitTaskSetupCheckpoint) {
-    #[cfg(feature = "kerndiff-fault-observer")]
-    let checkpoint = match checkpoint {
-        InitTaskSetupCheckpoint::TaskCreateRequested => {
-            ax_driver::kerndiff_fault::InitTaskCheckpoint::TaskCreateRequested
-        }
-        InitTaskSetupCheckpoint::TaskConstructed => {
-            ax_driver::kerndiff_fault::InitTaskCheckpoint::TaskConstructed
-        }
-        InitTaskSetupCheckpoint::ProcessReady => {
-            ax_driver::kerndiff_fault::InitTaskCheckpoint::ProcessReady
-        }
-        InitTaskSetupCheckpoint::SpawnRequested => {
-            ax_driver::kerndiff_fault::InitTaskCheckpoint::SpawnRequested
-        }
-        InitTaskSetupCheckpoint::TaskInitialized => {
-            ax_driver::kerndiff_fault::InitTaskCheckpoint::TaskInitialized
-        }
-        InitTaskSetupCheckpoint::SpawnReturned => {
-            ax_driver::kerndiff_fault::InitTaskCheckpoint::SpawnReturned
-        }
-        InitTaskSetupCheckpoint::ConsoleIrqArmed => {
-            ax_driver::kerndiff_fault::InitTaskCheckpoint::ConsoleIrqArmed
-        }
-        InitTaskSetupCheckpoint::JoinEntered => {
-            ax_driver::kerndiff_fault::InitTaskCheckpoint::JoinEntered
-        }
-    };
-
-    #[cfg(feature = "kerndiff-fault-observer")]
-    let _ = ax_driver::kerndiff_fault::record_init_task_checkpoint(
-        checkpoint,
-        ax_hal::time::monotonic_time_nanos(),
-    );
-
-    #[cfg(not(feature = "kerndiff-fault-observer"))]
-    let _ = checkpoint;
-}
-
-fn register_init_task(task_id: u64) {
-    #[cfg(feature = "kerndiff-fault-observer")]
-    let _ = ax_driver::kerndiff_fault::register_init_task(task_id);
-
-    #[cfg(not(feature = "kerndiff-fault-observer"))]
-    let _ = task_id;
 }
 
 /// Run the one-shot DVFS OPP calibration sweep (gated by the driver's `CALIBRATE`

@@ -10,14 +10,6 @@ use core::{
     time::Duration,
 };
 
-#[cfg(feature = "fs")]
-use ax_driver::kerndiff_fault::FilesystemInitCheckpoint;
-#[cfg(feature = "serial")]
-use ax_driver::kerndiff_fault::SerialInitCheckpoint;
-use ax_driver::kerndiff_fault::{
-    BootstrapCheckpoint, BootstrapFollowupCheckpoint, EarlyBootTimerCheckpoint,
-};
-
 use crate::KernDiffBootPhase;
 
 const PERIOD: Duration = Duration::from_secs(5);
@@ -139,17 +131,11 @@ pub(super) fn start_bootstrap() {
         diagnostic_page,
         boot_epoch,
     );
-    record_bootstrap_checkpoint(BootstrapCheckpoint::FeederSpawnRequested);
-    let task = ax_task::TaskInner::new(
+    ax_task::spawn_raw(
         bootstrap_loop,
         String::from("kerndiff-watchdog-bootstrap"),
         ax_task::default_task_stack_size(),
     );
-    ax_task::spawn_task_with(task, |task| {
-        record_bootstrap_checkpoint(BootstrapCheckpoint::FeederTaskInitialized);
-        let _ = ax_driver::kerndiff_fault::register_bootstrap_feeder_task(task.id().as_u64());
-    });
-    record_bootstrap_checkpoint(BootstrapCheckpoint::FeederSpawnReturned);
 }
 
 pub(super) fn publish_boot_phase(phase: KernDiffBootPhase) {
@@ -229,58 +215,16 @@ pub(super) fn handoff_to_percpu() {
 }
 
 fn bootstrap_loop() {
-    record_bootstrap_checkpoint(BootstrapCheckpoint::FeederEntered);
-    let affinity_ready = ax_task::set_current_affinity(ax_task::AxCpuMask::one_shot(0));
-    record_bootstrap_checkpoint(BootstrapCheckpoint::FeederAffinityReady);
-    if !affinity_ready {
+    if !ax_task::set_current_affinity(ax_task::AxCpuMask::one_shot(0)) {
         warn!("KernDiff bootstrap feeder could not pin itself to CPU0");
         return;
     }
     let mut epoch = 0u64;
-    let mut first_poll_complete = false;
     while PHASE.load(Ordering::Acquire) == PHASE_BOOTSTRAP {
         epoch = epoch.wrapping_add(1);
         ax_driver::kerndiff_fault::bootstrap_poll(epoch, ax_hal::time::monotonic_time_nanos());
-        if !first_poll_complete {
-            record_bootstrap_checkpoint(BootstrapCheckpoint::FeederFirstPollComplete);
-            first_poll_complete = true;
-        }
         ax_task::sleep(PERIOD);
     }
-}
-
-fn record_bootstrap_checkpoint(checkpoint: BootstrapCheckpoint) {
-    let _ = ax_driver::kerndiff_fault::record_bootstrap_checkpoint(
-        checkpoint,
-        ax_hal::time::monotonic_time_nanos(),
-    );
-}
-
-pub(super) fn record_bootstrap_followup_checkpoint(checkpoint: BootstrapFollowupCheckpoint) {
-    let _ = ax_driver::kerndiff_fault::record_bootstrap_followup_checkpoint(
-        checkpoint,
-        ax_hal::time::monotonic_time_nanos(),
-    );
-}
-
-#[cfg(feature = "serial")]
-pub(super) fn record_serial_init_checkpoint(checkpoint: SerialInitCheckpoint) {
-    let _ = ax_driver::kerndiff_fault::record_serial_init_checkpoint(checkpoint, || {
-        ax_hal::time::monotonic_time_nanos()
-    });
-}
-
-#[cfg(feature = "fs")]
-pub(super) fn record_filesystem_init_checkpoint(checkpoint: FilesystemInitCheckpoint) {
-    let _ = ax_driver::kerndiff_fault::record_filesystem_init_checkpoint(checkpoint, || {
-        ax_hal::time::monotonic_time_nanos()
-    });
-}
-
-pub(super) fn record_early_boot_timer_checkpoint(checkpoint: EarlyBootTimerCheckpoint) {
-    let _ = ax_driver::kerndiff_fault::record_early_boot_timer_checkpoint(checkpoint, || {
-        ax_hal::time::monotonic_time_nanos()
-    });
 }
 
 fn liveness_loop(cpu: usize) {

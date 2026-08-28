@@ -41,11 +41,6 @@ struct SchedTracepointImpl;
 #[ax_crate_interface::impl_interface]
 impl SchedTracepoint for SchedTracepointImpl {
     fn on_sched_switch(prev_tid: u64, next_tid: u64, prev_state: u32) {
-        #[cfg(feature = "kerndiff-fault-observer")]
-        let _ = ax_driver::kerndiff_fault::record_scheduler_selection(
-            next_tid,
-            ax_hal::time::monotonic_time_nanos,
-        );
         trace_sched_switch(prev_tid, next_tid, prev_state);
     }
 }

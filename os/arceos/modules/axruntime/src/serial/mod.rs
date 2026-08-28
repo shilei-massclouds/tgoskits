@@ -394,45 +394,18 @@ pub fn runtimes() -> &'static [SerialRuntimeHandle] {
 
 pub(crate) fn init(primary_cpu: usize) {
     let mut handles = Vec::new();
-    #[cfg(feature = "kerndiff-fault-observer")]
-    crate::kerndiff_fault::record_serial_init_checkpoint(
-        ax_driver::kerndiff_fault::SerialInitCheckpoint::DeviceDrainEntered,
-    );
-    let serial_devices = ax_driver::serial::take_serial_devices();
-    #[cfg(feature = "kerndiff-fault-observer")]
-    crate::kerndiff_fault::record_serial_init_checkpoint(
-        ax_driver::kerndiff_fault::SerialInitCheckpoint::DeviceDrainReturned,
-    );
-    for (device_index, serial) in serial_devices.into_iter().enumerate() {
-        #[cfg(feature = "kerndiff-fault-observer")]
-        if device_index == 0 {
-            crate::kerndiff_fault::record_serial_init_checkpoint(
-                ax_driver::kerndiff_fault::SerialInitCheckpoint::FirstRuntimeBuildEntered,
-            );
-        }
-        let result = build_runtime(handles.len(), primary_cpu, device_index == 0, serial);
-        #[cfg(feature = "kerndiff-fault-observer")]
-        if device_index == 0 {
-            crate::kerndiff_fault::record_serial_init_checkpoint(
-                ax_driver::kerndiff_fault::SerialInitCheckpoint::FirstRuntimeBuildReturned,
-            );
-        }
-        match result {
+    for serial in ax_driver::serial::take_serial_devices() {
+        match build_runtime(handles.len(), primary_cpu, serial) {
             Ok(handle) => handles.push(handle),
             Err(err) => warn!("failed to initialize serial runtime: {err:?}"),
         }
     }
     SERIAL_RUNTIMES.call_once(|| handles.into_boxed_slice());
-    #[cfg(feature = "kerndiff-fault-observer")]
-    crate::kerndiff_fault::record_serial_init_checkpoint(
-        ax_driver::kerndiff_fault::SerialInitCheckpoint::RuntimesPublished,
-    );
 }
 
 fn build_runtime(
     index: usize,
     primary_cpu: usize,
-    _diagnose_first: bool,
     serial: SerialDevice,
 ) -> AxResult<SerialRuntimeHandle> {
     let SerialDevice {
@@ -440,22 +413,7 @@ fn build_runtime(
         mut port,
         mut irq,
     } = serial;
-    #[cfg(feature = "kerndiff-fault-observer")]
-    if _diagnose_first {
-        crate::kerndiff_fault::record_serial_init_checkpoint(
-            ax_driver::kerndiff_fault::SerialInitCheckpoint::FirstPortMaskEntered,
-        );
-    }
     port.mask_all();
-    #[cfg(feature = "kerndiff-fault-observer")]
-    if _diagnose_first {
-        crate::kerndiff_fault::record_serial_init_checkpoint(
-            ax_driver::kerndiff_fault::SerialInitCheckpoint::FirstPortMaskReturned,
-        );
-        crate::kerndiff_fault::record_serial_init_checkpoint(
-            ax_driver::kerndiff_fault::SerialInitCheckpoint::FirstRuntimeAllocationEntered,
-        );
-    }
 
     let polling = info.irq.is_none();
     let bridge = Arc::new(RuntimeIrqBridge::new());
@@ -488,16 +446,6 @@ fn build_runtime(
         ax_task::default_task_stack_size(),
     );
     task.set_cpumask(AxCpuMask::one_shot(primary_cpu));
-
-    #[cfg(feature = "kerndiff-fault-observer")]
-    if _diagnose_first {
-        crate::kerndiff_fault::record_serial_init_checkpoint(
-            ax_driver::kerndiff_fault::SerialInitCheckpoint::FirstRuntimeAllocationReturned,
-        );
-        crate::kerndiff_fault::record_serial_init_checkpoint(
-            ax_driver::kerndiff_fault::SerialInitCheckpoint::FirstIrqSetupEntered,
-        );
-    }
 
     if let Some(binding) = shared.info.irq.clone() {
         let irq_id = crate::irq::resolve_binding_irq(binding).map_err(|err| {
@@ -537,23 +485,7 @@ fn build_runtime(
         shared.irq_handle.call_once(|| handle);
     }
 
-    #[cfg(feature = "kerndiff-fault-observer")]
-    if _diagnose_first {
-        crate::kerndiff_fault::record_serial_init_checkpoint(
-            ax_driver::kerndiff_fault::SerialInitCheckpoint::FirstIrqSetupReturned,
-        );
-        crate::kerndiff_fault::record_serial_init_checkpoint(
-            ax_driver::kerndiff_fault::SerialInitCheckpoint::FirstWorkerSpawnEntered,
-        );
-    }
-
     ax_task::spawn_task(task);
-    #[cfg(feature = "kerndiff-fault-observer")]
-    if _diagnose_first {
-        crate::kerndiff_fault::record_serial_init_checkpoint(
-            ax_driver::kerndiff_fault::SerialInitCheckpoint::FirstWorkerSpawnReturned,
-        );
-    }
     info!(
         "serial runtime {} ready: cpu={}, irq={:?}, polling={}",
         shared.info.name, shared.owner_cpu, shared.info.irq, shared.polling
