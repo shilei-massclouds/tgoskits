@@ -1,7 +1,7 @@
 # Starry IRQ-route production cleanup
 
-Status: implemented; non-QEMU acceptance passed and operator QEMU acceptance
-pending, 2026-08-28.
+Status: implemented; non-QEMU and operator QEMU acceptance passed, with bounded
+production-only natural regression pending, 2026-08-28.
 
 ## Decision
 
@@ -58,8 +58,8 @@ Before operator-controlled QEMU execution, the cleanup must pass:
 
 After that smoke, a bounded natural regression runs against this production-only
 candidate.  A natural hang remains authoritative evidence and does not justify
-restoring checkpoints in the same run.  Until the cleanup smoke and regression
-complete, `defect-0001` remains open and unresolved.
+restoring checkpoints in the same run.  Until that regression completes,
+`defect-0001` remains open and unresolved.
 
 Non-QEMU acceptance passed with 35 ax-driver observer tests, 53 somehal library
 tests including the IRQ-route guard-state regression, 78 ax-fs-ng tests, and six
@@ -70,3 +70,22 @@ x86_64 release build using the `qemu/kerndiff` build configuration produced a
 17,551,016-byte target ELF with SHA-256
 `479b49bcbdb5219457c9feab92bfb009b2e514f3989696082efe2083f1ce09c2`.
 This proves compilation and linkage only; it is not normal-boot acceptance.
+
+Operator QEMU acceptance passed in the fresh, non-reused KernDiff session
+`run-pipe-smoke-irqsave-production-65b836c86` against clean commit
+`65b836c869a1cafee8859dfb6018a2ac055cd953`.  The coverage-instrumented target
+ELF SHA-256 was
+`e1e096e2eb5aab39ee2579bb359b2cab76637cd71ad9b826fcfb9ca861a92b16`.
+The single execution published all 12 ordered phases, reached
+`filesystem-init-ready` at 616,298,125 ns and `shell-ready` at 2,385,174,975
+ns, published guest and application markers, and exited both with status zero.
+It produced a fresh 27,963,816-byte profraw with SHA-256
+`b8b78d6505e6a4c869b5536a75f1d42316b92096f4114f902582d7f607c28b03`.
+QEMU reported normal `SHUTDOWN` at 19,094 ms; no validation fault was configured
+and KernDiff required no retry or infrastructure recovery.  The complete
+session is retained at
+`/home/cloud/gitArceOS/KernDiff-evidence/defect-0001-irqsave-production-smoke-65b836c86/`.
+Its 45-file manifest SHA-256 is
+`1028410188a5b7de5745747b5a05c7bc410174571ed5d3df50a334afd87cf182`.
+`diagnostic_complete=false` is expected on this successful run because the v1/v2
+page is extracted only for an authoritative watchdog event.
