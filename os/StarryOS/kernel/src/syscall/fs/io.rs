@@ -465,10 +465,12 @@ pub fn sys_fadvise64(
 }
 
 pub fn sys_pread64(fd: c_int, buf: *mut u8, len: usize, offset: __kernel_off_t) -> AxResult<isize> {
-    let f = file_or_espipe(fd)?;
+    // Linux validates the signed offset before resolving the descriptor.  In
+    // particular, pread64(-1, ..., -1) returns EINVAL rather than EBADF.
     if offset < 0 {
         return Err(AxError::InvalidInput);
     }
+    let f = file_or_espipe(fd)?;
     let read = f.inner().read_at(VmBytesMut::new(buf, len), offset as _)?;
     Ok(read as _)
 }
