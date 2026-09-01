@@ -289,15 +289,24 @@ pub fn sys_socketpair(
     let (sock1, sock2) = match ty {
         SOCK_STREAM => {
             let (sock1, sock2) = StreamTransport::new_pair(pid);
-            (UnixSocket::new(sock1), UnixSocket::new(sock2))
+            (
+                UnixSocket::new_connected(sock1),
+                UnixSocket::new_connected(sock2),
+            )
         }
         SOCK_DGRAM => {
             let (sock1, sock2) = DgramTransport::new_pair(pid);
-            (UnixSocket::new(sock1), UnixSocket::new(sock2))
+            (
+                UnixSocket::new_connected(sock1),
+                UnixSocket::new_connected(sock2),
+            )
         }
         SOCK_SEQPACKET => {
             let (sock1, sock2) = DgramTransport::new_pair_seqpacket(pid);
-            (UnixSocket::new(sock1), UnixSocket::new(sock2))
+            (
+                UnixSocket::new_connected(sock1),
+                UnixSocket::new_connected(sock2),
+            )
         }
         _ => {
             warn!("Unsupported socketpair type: {ty}");
