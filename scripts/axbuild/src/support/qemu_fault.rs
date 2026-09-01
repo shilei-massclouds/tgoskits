@@ -18,6 +18,7 @@ use ostool::run::qemu::QemuConfig;
 
 const QMP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const QMP_IO_POLL: Duration = Duration::from_millis(250);
+const PVPANIC_DIAGNOSTIC_DRAIN: Duration = Duration::from_millis(250);
 const MAX_GUEST_OUTPUT_LINE_BYTES: usize = 4096;
 const DIAGNOSTIC_PAGE_BYTES: usize = 4096;
 const DIAGNOSTIC_MAGIC: u32 = 0x4b44_5744;
@@ -261,6 +262,7 @@ fn capture_events(
             continue;
         };
         let terminal = matches!(event.event.as_str(), "WATCHDOG" | "GUEST_PANICKED");
+        let diagnostic_drain = terminal_event_diagnostic_drain(&event);
         if event.event == "WATCHDOG" {
             match capture_watchdog_diagnostic(&mut stream, &mut reader, socket, stop) {
                 Ok(diagnostic) => event.diagnostic = Some(diagnostic),
@@ -269,6 +271,13 @@ fn capture_events(
         }
         events.push(event);
         if terminal {
+            // The KernDiff QEMU profile configures panic=none so the panic
+            // handler can print its stable marker after raising pvpanic. Give
+            // the independent serial observer one bounded interval to drain
+            // that output before terminating the VM.
+            if !diagnostic_drain.is_zero() {
+                std::thread::sleep(diagnostic_drain);
+            }
             // WATCHDOG uses action=pause, and pvpanic may also leave QEMU
             // running. Quit only after the authoritative event is captured.
             let _ = write_qmp_command(&mut stream, "quit");
@@ -276,6 +285,14 @@ fn capture_events(
         }
     }
     Ok(events)
+}
+
+fn terminal_event_diagnostic_drain(event: &CapturedEvent) -> Duration {
+    if event.event == "GUEST_PANICKED" {
+        PVPANIC_DIAGNOSTIC_DRAIN
+    } else {
+        Duration::ZERO
+    }
 }
 
 const fn should_quit_boot_probe(enabled: bool, guest_started: bool) -> bool {
@@ -617,6 +634,32 @@ mod tests {
             assert_eq!(event["case"], "kerndiff-case");
             assert_eq!(event["event"], name);
         }
+    }
+
+    #[test]
+    fn guest_panic_gets_a_bounded_serial_drain_window() {
+        let panic = CapturedEvent {
+            case: "kerndiff".to_string(),
+            elapsed_ms: 1,
+            event: "GUEST_PANICKED".to_string(),
+            action: Some("none".to_string()),
+            diagnostic: None,
+            raw_error: None,
+        };
+        let watchdog = CapturedEvent {
+            case: "kerndiff".to_string(),
+            elapsed_ms: 1,
+            event: "WATCHDOG".to_string(),
+            action: Some("pause".to_string()),
+            diagnostic: None,
+            raw_error: None,
+        };
+
+        assert_eq!(
+            terminal_event_diagnostic_drain(&panic),
+            PVPANIC_DIAGNOSTIC_DRAIN
+        );
+        assert_eq!(terminal_event_diagnostic_drain(&watchdog), Duration::ZERO);
     }
 
     #[test]
