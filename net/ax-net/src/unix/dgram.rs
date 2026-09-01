@@ -450,17 +450,20 @@ impl TransportOps for DgramTransport {
             *self.connected.write() = Some(client_chan);
             return Ok(Some(accept_poll));
         }
+        // Copy the peer channel before taking `connected`'s spin lock.  The
+        // bind-slot mutex may sleep, so nesting it below the spin lock would
+        // enter `might_sleep()` with preemption disabled.
+        let channel = slot
+            .dgram
+            .lock()
+            .as_ref()
+            .ok_or(AxError::NotConnected)?
+            .connect();
         let mut guard = self.connected.write();
         if guard.is_some() {
             return Err(AxError::AlreadyConnected);
         }
-        *guard = Some(
-            slot.dgram
-                .lock()
-                .as_ref()
-                .ok_or(AxError::NotConnected)?
-                .connect(),
-        );
+        *guard = Some(channel);
         Ok(None)
     }
 

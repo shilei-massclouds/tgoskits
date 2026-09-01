@@ -358,6 +358,22 @@ mod tests {
     }
 
     #[test]
+    fn dgram_connect_takes_sleeping_bind_lock_before_spin_state_lock() {
+        let address = UnixSocketAddr::Abstract(Arc::from(&b"lock-order"[..]));
+        let slot = BindSlot::default();
+        let server = DgramTransport::new(1);
+        server.bind(&slot, &address).unwrap();
+
+        let client = DgramTransport::new(2);
+        assert!(
+            client
+                .connect(&slot, &UnixSocketAddr::Unnamed)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn stream_receive_peer_address_uses_logical_remote() {
         let receiver = UnixSocket {
             transport: StreamTransport::new(1).into(),
