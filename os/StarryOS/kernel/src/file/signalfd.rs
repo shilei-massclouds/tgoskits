@@ -155,8 +155,9 @@ impl FileLike for Signalfd {
     }
 
     fn write(&self, _src: &mut IoSrc) -> AxResult<usize> {
-        // signalfd is read-only
-        Err(AxError::BadFileDescriptor)
+        // Linux signalfd descriptors reject write(2) through the file
+        // operation with EINVAL, rather than treating the live fd as bad.
+        Err(AxError::InvalidInput)
     }
 
     fn nonblocking(&self) -> bool {
