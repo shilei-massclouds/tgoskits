@@ -231,15 +231,25 @@ impl WaitQueue {
     /// Serializes a FUTEX_WAKE_OP user RMW with both futex wait queues.
     pub fn wake_op(
         &self,
+        source_order: usize,
         wake_count: usize,
         target: &WaitQueue,
+        target_order: usize,
         wake2_count: usize,
         condition: impl FnOnce() -> AxResult<bool>,
     ) -> AxResult<usize> {
         let mut condition = Some(condition);
         let mut wakers = Vec::new();
 
-        match core::ptr::from_ref(self).cmp(&core::ptr::from_ref(target)) {
+        // Use the stable futex addresses for lock ordering.  Ordering queues
+        // by their heap addresses makes coverage and lock acquisition depend
+        // on allocator layout across otherwise identical runs.
+        let ordering = if core::ptr::eq(self, target) {
+            Ordering::Equal
+        } else {
+            source_order.cmp(&target_order)
+        };
+        match ordering {
             Ordering::Less => {
                 let mut src = self.inner.lock();
                 let mut dst = target.inner.lock_nested(NESTED_WAIT_QUEUE_LOCK_SUBCLASS);
@@ -317,19 +327,30 @@ impl WaitQueue {
 
     /// Serializes a condition check with waking and requeueing waiters from
     /// this queue to `target`.
+    #[allow(clippy::too_many_arguments)]
     pub fn wake_requeue_if(
         &self,
+        source_order: usize,
         wake_count: usize,
         wake_mask: u32,
         requeue_count: usize,
         target_cleanup: FutexWaitCleanup,
         target: &WaitQueue,
+        target_order: usize,
         condition: impl FnOnce() -> AxResult<bool>,
     ) -> AxResult<Option<usize>> {
         let mut condition = Some(condition);
         let mut wakers = Vec::new();
 
-        let count = match core::ptr::from_ref(self).cmp(&core::ptr::from_ref(target)) {
+        // See `wake_op`: user futex addresses provide a deterministic order,
+        // while pointer equality preserves the single-queue fast path for
+        // aliased/shared futex keys.
+        let ordering = if core::ptr::eq(self, target) {
+            Ordering::Equal
+        } else {
+            source_order.cmp(&target_order)
+        };
+        let count = match ordering {
             Ordering::Less => {
                 let mut src = self.inner.lock();
                 let mut dst = target.inner.lock_nested(NESTED_WAIT_QUEUE_LOCK_SUBCLASS);
